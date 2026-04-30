@@ -1,74 +1,46 @@
-newUser.Close();
-                    dirEntry.Close();
-                    newUser.Dispose();
-                    dirEntry.Dispose();
-                }
-                catch (Exception ex)
+        private bool SetMofficeTab(string displayName, string tabnumber)
+        {
+            bool done = false;
+            try {
+                using (DirectoryEntry entry = new DirectoryEntry("LDAP://DC=moffice,DC=akbars,DC=ru",set.MofficeUser,set.MofficePass))
                 {
-                    LogWrite(ex.Message + ex.StackTrace);
-                }
+                    using (DirectorySearcher search = new DirectorySearcher(entry))
+                    {
+                        search.Filter = "(&(objectClass=User)(displayName=" + displayName + "))";
 
-                vm.ListChanged.Add("Готово");
-                vm.ListChanged.Add("Ищем созданного пользователя");
-                LogWrite("Готово");
-                LogWrite("Ищем созданного пользователя ");
-                 
-                    if (user.SamAccountName!= null)
-                    {
-                    Thread.Sleep(3000);
-                    LogWrite("Ищем созданного пользователя "+user.UserName +" в домене "+user.Domain+ " по пути "+user.LDAPpatch);
-                        int k = 0;
-                    do
-                    {
-                        k++;
-                        LogWrite("повторная проверка");
-                        Thread.Sleep(3000);
-                        using (PrincipalContext principalContext = new PrincipalContext(ContextType.Domain, user.Domain, user.LDAPpatch))
+                        SearchResult result = search.FindOne();
+                        DirectoryEntry user = result.GetDirectoryEntry();
+                        if (user.Properties.Contains("wWWHomePage"))
                         {
-                            using (UserPrincipal userPrincipal = UserPrincipal.FindByIdentity(principalContext, user.SamAccountName))
-                            {
-                                if (userPrincipal == null)
-                                {
-                                    founded = false;
-                                    LogWrite("Не нашел пользователя " + user.SamAccountName);
-                                }
-                                else
-                                {
-                                    LogWrite("Найден созданный пользователь UserPrincipal= " + user.SamAccountName);
-                                    userPrincipal.Enabled = true;
-                                    userPrincipal.PasswordNotRequired = false;
-                                    userPrincipal.ExpirePasswordNow();
-                                    userPrincipal.Save();
-                                    founded = true;
-                                    LogWrite("Cозданный пользователь разблокирован " + user.SamAccountName);
-                                    //  Thread.Sleep(1000);
-                                    break;
-                                }
-                            }
+
+                            LogWrite("wWWHomePage " + tabnumber);
+                            user.Properties["wWWHomePage"].Value = tabnumber;
+                            Thread.Sleep(100);
+                        }
+                        else
+                        {
+                            LogWrite("employeeID " + tabnumber);
+
+                            user.Properties["employeeID"].Add(tabnumber);
+                        }
+                        if (user.Properties.Contains("employeeID"))
+                        {
+                            LogWrite("employeeID " + tabnumber);
+                            user.Properties["employeeID"].Value = tabnumber;
+                            Thread.Sleep(100);
+                        }
+                        else
+                        {
+                            LogWrite("employeeID " + tabnumber);
+
+                            user.Properties["employeeID"].Add(tabnumber);
                         }
                     }
-                      while (!founded && k < 10);
-                     }
-                if (founded)
-                {
-                    user.RobotObrab = true;
-                    user.RobotIspoln = true;
-                    user.RobotResolution = "Учетная запись успешно заведена " + user.SamAccountName + ResolutionText;
-                    user.RobotObrabTime = DateTime.Now;
-                }
-                else
-                {
-                    user.RobotObrab = false;
-                    vm.ListChanged.Add("имя пользователя не опеределено " + user.SamAccountName);
-                    LogWrite("имя пользователя не опеределено " + user.SamAccountName);
                 }
             }
-            else
+            catch(Exception ex)
             {
-                if (user.UserName == null && user.DisplayName == null)
-                {
-                    LogWrite("Имя пользователя пустое " + user.UserName);
-                    user.RobotObrab = false;
-                }
-                else
-                {
+                LogWrite(ex.Message);
+            }
+                        return done;
+        }
