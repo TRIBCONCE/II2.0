@@ -1,109 +1,74 @@
-if (user.email.Contains("@"))
+newUser.Close();
+                    dirEntry.Close();
+                    newUser.Dispose();
+                    dirEntry.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    LogWrite(ex.Message + ex.StackTrace);
+                }
+
+                vm.ListChanged.Add("Готово");
+                vm.ListChanged.Add("Ищем созданного пользователя");
+                LogWrite("Готово");
+                LogWrite("Ищем созданного пользователя ");
+                 
+                    if (user.SamAccountName!= null)
                     {
-                        try
-                        {
-                            if (user.email.Contains("@"))
-                                if (newUser.Properties.Contains("mail"))
-                                {
-                                    vm.ListChanged.Add("mail " + user.email);
-                                    LogWrite("mail " + user.email);
-
-                                    newUser.Properties["mail"].Value = user.email;
-                                    newUser.CommitChanges();
-                                    Thread.Sleep(100);
-                                }
-                                else
-                                {
-                                    vm.ListChanged.Add("mailelse " + user.email);
-                                    LogWrite("mail " + user.email);
-
-                                    newUser.Properties["mail"].Add(user.email);
-                                    newUser.CommitChanges();
-                                    Thread.Sleep(100);
-                                }
-                        }
-                        catch (Exception ex) { LogWrite(ex.Message + ex.StackTrace); }
-                    }
-                    else
+                    Thread.Sleep(3000);
+                    LogWrite("Ищем созданного пользователя "+user.UserName +" в домене "+user.Domain+ " по пути "+user.LDAPpatch);
+                        int k = 0;
+                    do
                     {
-                        try
+                        k++;
+                        LogWrite("повторная проверка");
+                        Thread.Sleep(3000);
+                        using (PrincipalContext principalContext = new PrincipalContext(ContextType.Domain, user.Domain, user.LDAPpatch))
                         {
-                            Thread.Sleep(30000);
-                            if (user.Department.ToLower().Contains("управление развития ит") || user.Department.ToLower().Contains("проектный офис ит"))
-                            { user.email = null;
-                            SendMessageIfUrit ("Учетная запись успешно заведена  для сотрудника АБЦТ" + @"\" + user.SamAccountName + " " + user.DisplayName + " по служебке №" + user.SZNumber, "Учетная запись успешно заведена в ABB-WIN " + user.SZNumber + " Почта пользователя не заполнена");
-
-                            }// user.SamAccountName + "@akbarsdigital.ru"; setmail = false; }
-                            else
-                            { user.email = user.SamAccountName + "@akbars.ru"; setmail = true; }
-                            user.email = searchInAllMails(user.email); 
-
-
-                            if (user.email != null)
+                            using (UserPrincipal userPrincipal = UserPrincipal.FindByIdentity(principalContext, user.SamAccountName))
                             {
-                                if (newUser.Properties.Contains("mail"))
+                                if (userPrincipal == null)
                                 {
-                                    vm.ListChanged.Add("mail " + user.email);
-                                    LogWrite("mail " + user.email);
-
-                                    newUser.Properties["mail"].Value = user.email;
-                                    newUser.CommitChanges();
-                                    Thread.Sleep(100);
+                                    founded = false;
+                                    LogWrite("Не нашел пользователя " + user.SamAccountName);
                                 }
                                 else
                                 {
-                                    vm.ListChanged.Add("mailelse " + user.email);
-                                    LogWrite("mail " + user.email);
-
-                                    newUser.Properties["mail"].Add(user.email);
-                                    newUser.CommitChanges();
-                                    Thread.Sleep(100);
-                                }
-                                Exchange MailBox = new Exchange();
-                                string mailResult = MailBox.CreateMailBox(user.SamAccountName, user.UserFIOFamily + " " + user.UserFIOName + " " + user.UserFIOOth, user.email, user.UserFIOName, user.UserFIOFamily, user.Domain, user.Department);
-                                LogWrite(mailResult);
-                                if (setmail && mailResult!=null)
-                                {
-                                    string connectionstring = set.Stringconnect;
-                                    using (SqlConnection ConnectToEqUsers = new SqlConnection(@connectionstring))
-                                    {
-                                        try
-                                        {
-                                            ConnectToEqUsers.Open();
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            LogWrite(ex.Message + ex.StackTrace);
-                                        }
-                                        using (SqlCommand SqlCmd = new SqlCommand())
-                                        {
-                                            try
-                                            {
-
-                                                SqlCmd.Connection = ConnectToEqUsers;
-                                                SqlCmd.CommandText = "UPDATE ADUsers SET UserMailEx = @MailEx, UserMail = @Mail  WHERE SZNumber = @ZNumber";
-                                                SqlCmd.Parameters.AddWithValue("@MailEx", user.UserprincipalName);
-                                                SqlCmd.Parameters.AddWithValue("@Mail", user.email);
-                                                SqlCmd.Parameters.AddWithValue("@ZNumber", user.SZNumber);
-
-                                                int k = SqlCmd.ExecuteNonQuery();
-                                                if (k > 0)
-                                                {
-                                                    LogWrite("Почта записана в таблицу UserMailEx=" + user.UserprincipalName + " UserMail=" + user.email);
-
-                                                }
-                                                addUsertoGroup("Intune App Protection", user.SamAccountName, user.Domain);
-                                            }
-                                            catch (Exception ex)
-                                            {
-                                                LogWrite("Ошибка при записи почты " + user.UserprincipalName + " " + user.email + " " + user.SZNumber + " " + ex.Message + " " + ex.StackTrace);
-                                            }
-                                        }
-                                    }
+                                    LogWrite("Найден созданный пользователь UserPrincipal= " + user.SamAccountName);
+                                    userPrincipal.Enabled = true;
+                                    userPrincipal.PasswordNotRequired = false;
+                                    userPrincipal.ExpirePasswordNow();
+                                    userPrincipal.Save();
+                                    founded = true;
+                                    LogWrite("Cозданный пользователь разблокирован " + user.SamAccountName);
+                                    //  Thread.Sleep(1000);
+                                    break;
                                 }
                             }
-                            
-
                         }
-                        catch (Exception ex) { LogWrite(ex.Message + ex.StackTrace); }
                     }
+                      while (!founded && k < 10);
+                     }
+                if (founded)
+                {
+                    user.RobotObrab = true;
+                    user.RobotIspoln = true;
+                    user.RobotResolution = "Учетная запись успешно заведена " + user.SamAccountName + ResolutionText;
+                    user.RobotObrabTime = DateTime.Now;
+                }
+                else
+                {
+                    user.RobotObrab = false;
+                    vm.ListChanged.Add("имя пользователя не опеределено " + user.SamAccountName);
+                    LogWrite("имя пользователя не опеределено " + user.SamAccountName);
+                }
+            }
+            else
+            {
+                if (user.UserName == null && user.DisplayName == null)
+                {
+                    LogWrite("Имя пользователя пустое " + user.UserName);
+                    user.RobotObrab = false;
+                }
+                else
+                {
