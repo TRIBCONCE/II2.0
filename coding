@@ -1,62 +1,109 @@
-private UserClass CreateUser(UserClass user)
-        {
-            string Result = "";
-            bool founded = false;
-            bool setmail = false;
-            user = searchUser(user);
-            string ResolutionText = " \n Для коммуникаций с сотрудниками банка используется Контур Толк. \n Варианты входа: \n - Запустите интернет - браузер Google Chrome или Microsoft Edge, в адресной строке введите https://abb.ktalk.ru/, необходимо ввести логин/пароль. \n После авторизации можете самостоятельно установить приложение Контур.Толк на свой рабочий компьютер. \n - Через мобильные устройства. После скачивания приложения «Контур.Толк», необходимо выбрать метод «Вход с корпортивной учетной записью(SSO)» и указать пространство abb.ktalk.ru.";
-            string LDAP = "LDAP://"+user.Domain+"/"+ user.OUString + ","+ user.LDAPpatch;        /*  //" " // + user.OUString + "," + user.LDAPpatch;*/
-            string CreatePath = user.OUString + "," + user.LDAPpatch;
-            string ouString = user.OUString;
-            vm.ListChanged.Add("Создание пользователя " +user.Description + " " + user.DisplayName + user.Domain + user.LDAPpatch + user.OUString + user.UserFIOFamily + user.UserName +" "+ user.SamAccountName);
-            LogWrite("Создание пользователя " + user.Description + " " + user.DisplayName + user.Domain + user.LDAPpatch + user.OUString + user.UserFIOFamily + user.UserName + " " + user.SamAccountName);
-            LogWrite("Создание пользователя "+ LDAP);
-            string path = (System.IO.Path.Combine(@"\\P-fsglo-gl08.abb-win.akbars.ru\PersonalDisks$\", user.SamAccountName));
-            if (user.UserName != null && user.DisplayName != null)
-            {
-                if (user.DisplayName.Length > 35) user.DisplayName = user.DisplayName.Substring(0, 34);
-                user.UserprincipalName = user.UserName + "@" + user.DomainString;
-                user.SamAccountName = user.UserName;
-                try
-                {
-                    
-                    DirectoryEntry dirEntry = new DirectoryEntry(LDAP);
-                    string userString = "CN=" + user.DisplayName;
-                    DirectoryEntry newUser = dirEntry.Children.Add(userString, "user");
-                    LogWrite("newUser " + user.UserprincipalName);
-                    LogWrite("CommitChanges " + user.UserprincipalName);
-                     Thread.Sleep(100);
-                    try
+if (user.email.Contains("@"))
                     {
-                        if (newUser.Properties.Contains("SAMAccountName"))
+                        try
                         {
-                            vm.ListChanged.Add("SAMAccountName " + user.SamAccountName);
-                            LogWrite("SAMAccountName " + user.SamAccountName);
-                            newUser.Properties["SAMAccountName"].Value = user.SamAccountName;
-                             Thread.Sleep(100);
-                        }
-                        else
-                        {
-                            vm.ListChanged.Add("SAMAccountNameelse " + user.SamAccountName);
-                            LogWrite("SAMAccountNameelse " + user.SamAccountName);
+                            if (user.email.Contains("@"))
+                                if (newUser.Properties.Contains("mail"))
+                                {
+                                    vm.ListChanged.Add("mail " + user.email);
+                                    LogWrite("mail " + user.email);
 
-                            newUser.Properties["SAMAccountName"].Add(user.SamAccountName);
-                         }
-                        if (newUser.Properties.Contains("displayName"))
-                        {
-                            vm.ListChanged.Add("displayName " + user.DisplayName);
-                            LogWrite("DisplayName " + user.DisplayName);
-                            newUser.Properties["displayName"].Value = user.DisplayName;
+                                    newUser.Properties["mail"].Value = user.email;
+                                    newUser.CommitChanges();
+                                    Thread.Sleep(100);
+                                }
+                                else
+                                {
+                                    vm.ListChanged.Add("mailelse " + user.email);
+                                    LogWrite("mail " + user.email);
 
-                            Thread.Sleep(100);
+                                    newUser.Properties["mail"].Add(user.email);
+                                    newUser.CommitChanges();
+                                    Thread.Sleep(100);
+                                }
                         }
-                        else
-                        {
-                            vm.ListChanged.Add("displayNameelse " + user.DisplayName);
-                            LogWrite("DisplayNameelse " + user.DisplayName);
-                            newUser.Properties["displayName"].Add(user.DisplayName);
-                           
-                            Thread.Sleep(100);
-                        }
+                        catch (Exception ex) { LogWrite(ex.Message + ex.StackTrace); }
                     }
-                    catch (Exception ex) { LogWrite(ex.Message + ex.StackTrace); }
+                    else
+                    {
+                        try
+                        {
+                            Thread.Sleep(30000);
+                            if (user.Department.ToLower().Contains("управление развития ит") || user.Department.ToLower().Contains("проектный офис ит"))
+                            { user.email = null;
+                            SendMessageIfUrit ("Учетная запись успешно заведена  для сотрудника АБЦТ" + @"\" + user.SamAccountName + " " + user.DisplayName + " по служебке №" + user.SZNumber, "Учетная запись успешно заведена в ABB-WIN " + user.SZNumber + " Почта пользователя не заполнена");
+
+                            }// user.SamAccountName + "@akbarsdigital.ru"; setmail = false; }
+                            else
+                            { user.email = user.SamAccountName + "@akbars.ru"; setmail = true; }
+                            user.email = searchInAllMails(user.email); 
+
+
+                            if (user.email != null)
+                            {
+                                if (newUser.Properties.Contains("mail"))
+                                {
+                                    vm.ListChanged.Add("mail " + user.email);
+                                    LogWrite("mail " + user.email);
+
+                                    newUser.Properties["mail"].Value = user.email;
+                                    newUser.CommitChanges();
+                                    Thread.Sleep(100);
+                                }
+                                else
+                                {
+                                    vm.ListChanged.Add("mailelse " + user.email);
+                                    LogWrite("mail " + user.email);
+
+                                    newUser.Properties["mail"].Add(user.email);
+                                    newUser.CommitChanges();
+                                    Thread.Sleep(100);
+                                }
+                                Exchange MailBox = new Exchange();
+                                string mailResult = MailBox.CreateMailBox(user.SamAccountName, user.UserFIOFamily + " " + user.UserFIOName + " " + user.UserFIOOth, user.email, user.UserFIOName, user.UserFIOFamily, user.Domain, user.Department);
+                                LogWrite(mailResult);
+                                if (setmail && mailResult!=null)
+                                {
+                                    string connectionstring = set.Stringconnect;
+                                    using (SqlConnection ConnectToEqUsers = new SqlConnection(@connectionstring))
+                                    {
+                                        try
+                                        {
+                                            ConnectToEqUsers.Open();
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            LogWrite(ex.Message + ex.StackTrace);
+                                        }
+                                        using (SqlCommand SqlCmd = new SqlCommand())
+                                        {
+                                            try
+                                            {
+
+                                                SqlCmd.Connection = ConnectToEqUsers;
+                                                SqlCmd.CommandText = "UPDATE ADUsers SET UserMailEx = @MailEx, UserMail = @Mail  WHERE SZNumber = @ZNumber";
+                                                SqlCmd.Parameters.AddWithValue("@MailEx", user.UserprincipalName);
+                                                SqlCmd.Parameters.AddWithValue("@Mail", user.email);
+                                                SqlCmd.Parameters.AddWithValue("@ZNumber", user.SZNumber);
+
+                                                int k = SqlCmd.ExecuteNonQuery();
+                                                if (k > 0)
+                                                {
+                                                    LogWrite("Почта записана в таблицу UserMailEx=" + user.UserprincipalName + " UserMail=" + user.email);
+
+                                                }
+                                                addUsertoGroup("Intune App Protection", user.SamAccountName, user.Domain);
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                LogWrite("Ошибка при записи почты " + user.UserprincipalName + " " + user.email + " " + user.SZNumber + " " + ex.Message + " " + ex.StackTrace);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+
+                        }
+                        catch (Exception ex) { LogWrite(ex.Message + ex.StackTrace); }
+                    }
