@@ -1,46 +1,81 @@
-        private bool SetMofficeTab(string displayName, string tabnumber)
+private void InsertDB(string login, string phone, string description, int passexp, string Org, string mail, string keyword)
         {
-            bool done = false;
-            try {
-                using (DirectoryEntry entry = new DirectoryEntry("LDAP://DC=moffice,DC=akbars,DC=ru",set.MofficeUser,set.MofficePass))
+            System.Data.DataTable table = new System.Data.DataTable();
+            bool update = false;
+            int kol = 0;
+            string connectionstring = @"Data Source=XDPASS;Initial Catalog=CitrixRemoteAuthentication;User Id=Citrix;Password=P@ssw0rd1;";
+            using (SqlConnection ConnectToUsers = new SqlConnection(@connectionstring))
+            {
+                try
                 {
-                    using (DirectorySearcher search = new DirectorySearcher(entry))
+                    ConnectToUsers.Open();
+                }
+                catch (Exception ex)
+                {
+                    LogWrite(ex.Message + ex.StackTrace);
+                }
+                try
+                {
+                    using (SqlDataAdapter adapter = new SqlDataAdapter("select * from dbo.Users where Login  = '" + login + "'", ConnectToUsers))
                     {
-                        search.Filter = "(&(objectClass=User)(displayName=" + displayName + "))";
-
-                        SearchResult result = search.FindOne();
-                        DirectoryEntry user = result.GetDirectoryEntry();
-                        if (user.Properties.Contains("wWWHomePage"))
+                        adapter.Fill(table);
+                        if (table.Rows.Count > 0)
                         {
-
-                            LogWrite("wWWHomePage " + tabnumber);
-                            user.Properties["wWWHomePage"].Value = tabnumber;
-                            Thread.Sleep(100);
-                        }
-                        else
-                        {
-                            LogWrite("employeeID " + tabnumber);
-
-                            user.Properties["employeeID"].Add(tabnumber);
-                        }
-                        if (user.Properties.Contains("employeeID"))
-                        {
-                            LogWrite("employeeID " + tabnumber);
-                            user.Properties["employeeID"].Value = tabnumber;
-                            Thread.Sleep(100);
-                        }
-                        else
-                        {
-                            LogWrite("employeeID " + tabnumber);
-
-                            user.Properties["employeeID"].Add(tabnumber);
+                            update = true;
+                            LogWrite("Учетная запись уже есть в базе. Обновляем." + login);
                         }
                     }
+
                 }
+                catch (Exception ex)
+                {
+                    LogWrite(ex.Message + ex.StackTrace);
+                }
+                if (!update)
+                {
+                    try
+                    {
+                        using (SqlCommand SqlCmd2 = new SqlCommand())
+                        {
+                            SqlCmd2.Connection = ConnectToUsers;
+                            SqlCmd2.CommandText = "insert into dbo.Users (Login, Phone, Description, PasswordExpirationInMinutes,Org,email,Keyword) VALUES ( @Login, @phone, @description, @passexp, @Org, @mail, @keyword)";
+                            SqlCmd2.Parameters.AddWithValue("@Login", login.Replace(" ", ""));
+                            SqlCmd2.Parameters.AddWithValue("@phone", phone);
+                            SqlCmd2.Parameters.AddWithValue("@description", description);
+                            SqlCmd2.Parameters.AddWithValue("@passexp", passexp);
+                            SqlCmd2.Parameters.AddWithValue("@Org", Org);
+                            SqlCmd2.Parameters.AddWithValue("@mail", mail);
+                            SqlCmd2.Parameters.AddWithValue("@keyword", keyword);
+                            kol = SqlCmd2.ExecuteNonQuery();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogWrite(ex.Message + ex.StackTrace);
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        using (SqlCommand SqlCmd3 = new SqlCommand())
+                        {
+                            SqlCmd3.Connection = ConnectToUsers;
+                            SqlCmd3.CommandText = "update dbo.Users set Phone=@phone, Description=@description, PasswordExpirationInMinutes = @passexp,Org = @Org where Login= @Login";
+                            SqlCmd3.Parameters.AddWithValue("@Login", login);
+                            SqlCmd3.Parameters.AddWithValue("@phone", phone);
+                            SqlCmd3.Parameters.AddWithValue("@description", description);
+                            SqlCmd3.Parameters.AddWithValue("@passexp", passexp);
+                            SqlCmd3.Parameters.AddWithValue("@Org", Org);
+                            kol = SqlCmd3.ExecuteNonQuery();
+                        }
+
+                    }
+                    catch (Exception ex)
+                    {
+                        LogWrite(ex.Message + ex.StackTrace);
+                    }
+                }
+
             }
-            catch(Exception ex)
-            {
-                LogWrite(ex.Message);
-            }
-                        return done;
         }
