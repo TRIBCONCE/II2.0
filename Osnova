@@ -1,1 +1,47 @@
+# Фиксируем время начала
+$timestart = Get-Date
 
+# Получаем всех пользователей с атрибутом division
+$AllUsers = Get-ADUser -Filter * -Properties division
+
+# Создаём хэш-таблицу для быстрого подсчёта уникальных значений
+$DivisionCount = @{}
+
+# Проходим по пользователям и считаем
+foreach ($User in $AllUsers) {
+    $div = $User.division
+    if ($div) {
+        # Если division не пустой, увеличиваем счётчик
+        if ($DivisionCount.ContainsKey($div)) {
+            $DivisionCount[$div]++
+        } else {
+            $DivisionCount[$div] = 1
+        }
+    } else {
+        # Считаем пользователей без division
+        $emptyKey = "(не указано)"
+        if ($DivisionCount.ContainsKey($emptyKey)) {
+            $DivisionCount[$emptyKey]++
+        } else {
+            $DivisionCount[$emptyKey] = 1
+        }
+    }
+}
+
+# Сортируем по значению (или по алфавиту — как удобнее) и выводим
+Write-Host "`n=== Статистика по подразделениям (division) ===" -ForegroundColor Green
+Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+
+$DivisionCount.GetEnumerator() | 
+    Sort-Object Value -Descending | 
+    Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50}, 
+                 @{Label="Кол-во пользователей"; Expression={$_.Value}; Width=20}, 
+                 @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $AllUsers.Count)}; Width=10} -AutoSize
+
+# Выводим итоговое общее количество пользователей
+Write-Host "Всего пользователей в AD: $($AllUsers.Count)" -ForegroundColor Yellow
+
+# Подсчитываем время выполнения
+$timestop = Get-Date
+$TimeSum = $timestop - $timestart
+Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
