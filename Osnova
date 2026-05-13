@@ -1,11 +1,14 @@
 # Фиксируем время начала
 $timestart = Get-Date
 
-# Получаем всех активных пользователей с атрибутами division и samaccountname
+# Получаем всех активных пользователей с нужными атрибутами
 $AllUsersOn = Get-ADUser -Filter { enabled -eq $true } -Properties division, samaccountname, DistinguishedName, name
 
-# Создаём хэш-таблицу для быстрого подсчёта уникальных значений
+# Создаём хэш-таблицу для подсчёта уникальных значений division
 $DivisionCount = @{}
+
+# Массив для пользователей без division — сохраняем DistinguishedName целиком
+$UsersWithoutDivision = [System.Collections.Generic.List[PSObject]]::new()
 
 # Счётчик исключённых
 $ExcludedCount = 0
@@ -31,7 +34,7 @@ foreach ($User in $AllUsersOn) {
         continue
     }
     
-    # Считаем division для "живых" пользователей
+    # Считаем division
     $div = $User.division
     if ($div) {
         if ($DivisionCount.ContainsKey($div)) {
@@ -40,6 +43,13 @@ foreach ($User in $AllUsersOn) {
             $DivisionCount[$div] = 1
         }
     } else {
+        # Сохраняем пользователя без division
+        $UsersWithoutDivision.Add([PSCustomObject]@{
+            Name             = $name
+            SamAccountName   = $sam
+            DistinguishedName = $dn
+        })
+        
         $emptyKey = "(не указано)"
         if ($DivisionCount.ContainsKey($emptyKey)) {
             $DivisionCount[$emptyKey]++
@@ -66,6 +76,15 @@ $DivisionCount.GetEnumerator() |
 Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
 Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
 Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
+
+# Выводим пользователей без division
+if ($UsersWithoutDivision.Count -gt 0) {
+    Write-Host "`n=== Пользователи без указанного division ($($UsersWithoutDivision.Count) шт.) ===" -ForegroundColor Red
+    $UsersWithoutDivision | 
+        Sort-Object Name | 
+        Format-Table Name, SamAccountName, 
+                      @{Label="DistinguishedName"; Expression={$_.DistinguishedName}; Width=120} -AutoSize
+}
 
 # Время выполнения
 $timestop = Get-Date
