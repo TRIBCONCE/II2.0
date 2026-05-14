@@ -1,239 +1,46 @@
-
-# =========================================================================================================================
-# Раздел 1: Инициализация и фиксация времени
-# =========================================================================================================================
-
-# Очищаем экран консоли для удобства, если скрипт запускается вручную.
-cls
-
-# Фиксируем текущее время начала работы скрипта. Это нужно для подсчета общего времени выполнения в конце.
-$timestart = Get-Date
-
-# Формируем строку с текущей датой в формате ДД.ММ.ГГГГ (например, 12.05.2026).
-$today = Get-Date -Format dd.MM.yyyy
-
-# Формируем строку с датой и временем начала выполнения для записи в итоговый JSON-отчет.
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
-
-# Вычисляем начало и конец предыдущего дня. Это нужно для поиска объектов, созданных "вчера".
-# $lastday: Дата вчерашнего дня с временем 00:00:00.
-$lastday = (Get-Date).AddDays(-1).Date
-# $lastdayStart: Начало вчерашнего дня (аналогично $lastday).
-$lastdayStart = $lastday
-# $lastdayStop: Конец вчерашнего дня (23:59:59).
-$lastdayStop = $lastday + "23:59:59"
-
-# =========================================================================================================================
-# Раздел 2: Сбор данных из Active Directory
-# =========================================================================================================================
-
-# 2.1 Объекты
-# Получаем вообще все объекты AD (пользователи, компьютеры, группы, контакты и т.д.).
-$AllObjects = Get-ADObject -Filter *
-
-# 2.2 Пользователи
-# Получаем всех пользователей AD, сразу запрашивая дополнительные свойства: дату создания, веб-страницу (таб. номер) и ID сотрудника.
-$AllUsers = Get-ADUser -Filter * -Properties whencreated, wWWHomePage, employeeID
-
-# --- Фильтрация пользователей ---
-# Активные (включенные) пользователи.
-$AllUsersOn = $AllUsers | Where-Object { $_.enabled -eq $true }
-
-# Из активных выделяем сервисные учетные записи по маске имени входа (s-*, sl-*, *test* и т.д.) или по имени "Сервисная*".
-$AllUsersOnS = $AllUsersOn | Where-Object {
-    $_.samaccountname -like "s-*" -or $_.samaccountname -like "sl-*" -or
-    $_.samaccountname -like "*test*" -or $_.samaccountname -like "Health*" -or
-    $_.samaccountname -like "room*" -or $_.samaccountname -like "sp-*" -or
-    $_.samaccountname -like "st-*" -or $_.samaccountname -like "audit*" -or
-    $_.samaccountname -like "temp*" -or $_.samaccountname -like "esas*" -or
-    $_.name -like "Сервисная*"
-}
-
-# Административные учетные записи с префиксом "a-".
-$AllUsersOnA = $AllUsersOn | Where-Object { $_.samaccountname -like "a-*" }
-
-# Административные записи с префиксом "z-" (возможно, для администраторов ИБ).
-$AllUsersOnZ = $AllUsersOn | Where-Object { $_.samaccountname -like "z-*" }
-
-# Пользователи-вендоры (сторонние). Их OU содержит слово "сторон".
-$AllUsersOnU = $AllUsersOn | Where-Object { $_.DistinguishedName -like "*сторон*" }
-
-# --- Поиск "проблемных" пользователей (аудит) ---
-
-# Пользователи, у которых поле "Веб-страница" (wWWHomePage, используется как табельный номер) не совпадает с "ID сотрудника" (employeeID).
-$AllUsersOnErrorTN = $AllUsersOn | Where-Object { $_.wWWHomePage -ne $_.employeeID }
-
-# Активные пользователи, у которых есть табельный номер (wWWHomePage не пусто) и имя оканчивается на "_" (вероятно, признак уволенного, но не отключенного).
-$AllUsersOnErrorDN = $AllUsersOn | Where-Object { $_.wWWHomePage -like "*" -and $_.Name -like "*_" }
-
-# Активные пользователи, которые находятся в OU "Отключенные" (или "Уволенные сотрудники"). Критическая ошибка аудита.
-$AllUsersOnErrorOU = $AllUsersOn | Where-Object { $_.DistinguishedName -like "*Отключенные*" }
-
-# Активные пользователи, в имени которых есть цифры, но которые не являются сервисными (исключаем те же маски, что для сервисных).
-# Примечание: Логика "Сервисная*" в этом фильтре выглядит странно (используется -like без отрицания в родительском условии).
-$AllUsersOnErrorNum = $AllUsersOn | Where-Object {
-    $_.name -match '\d' -and
-    (
-        $_.samaccountname -notlike "s-*" -and $_.samaccountname -notlike "sl-*" -and
-        $_.samaccountname -notlike "*test*" -and $_.samaccountname -notlike "room*" -and
-        $_.samaccountname -notlike "Health*" -and $_.samaccountname -notlike "sp-*" -and
-        $_.samaccountname -notlike "st-*" -and $_.samaccountname -notlike "audit*" -and
-        $_.samaccountname -notlike "temp*" -and $_.samaccountname -notlike "esas*" -and
-        $_.name -like "Сервисная*"
-    )
-}
-
-# Новые пользователи, созданные за вчерашний день, исключая административные (z-*) и сервисные (s-*, sl-*, *test*).
-$AllUsersNewU = $AllUsersOn | Where-Object {
-    $_.whencreated -ge $lastdayStart -and $_.whencreated -le $lastdayStop -and
-    $_.SamAccountName -notlike 'z-*' -and $_.SamAccountName -notlike 's-*' -and
-    $_.SamAccountName -notlike '*test*' -and $_.SamAccountName -notlike 'sl-*'
-}
-
-# 2.3 Группы
-# Получаем все группы AD вместе с их членами (Members).
-$AllGroup = Get-ADGroup -Filter * -Properties Members
-# Находим пустые группы (без членов).
-$GroupEmpty = $AllGroup | Where-Object { $_.members.Count -eq 0 }
-
-# 2.4 Компьютеры
-# Получаем все компьютеры с их ОС и датой создания.
-$AllComputers = Get-ADComputer -Filter * -Properties operatingSystem, whenCreated
-
-# Активные (включенные) компьютеры.
-$ComputersOn = $AllComputers | Where-Object { $_.enabled -eq $true }
-
-# --- Распределение компьютеров по типу ОС ---
-$ComputersOnWSrv = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server*" }
-$ComputersOnWSrv2019 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server 2019*" }
-$ComputersOnWSrv2016 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server 2016*" }
-$ComputersOnWSrv2012 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server 2012*" }
-$ComputersOnWSrv2008 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server 2008*" }
-$ComputersOnW11 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows 11*" }
-$ComputersOnW10 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows 10*" }
-$ComputersOnW8 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows 8*" }
-$ComputersOnW7 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows 7*" }
-$ComputersOnWXP = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows XP*" }
-
-# --- Распределение по географическим/функциональным площадкам (филиалам) ---
-# Исключаем серверы из выборок по локациям, проверяя, что в ОС нет "Windows Server".
-$ComputersOnURM = $ComputersOn | Where-Object { $_.samaccountname -like "URM-*" -and $_.operatingSystem -notlike "Windows Server*" }
-$ComputersOnMRM = $ComputersOn | Where-Object { $_.samaccountname -like "MRM-*" -and $_.operatingSystem -notlike "Windows Server*" }
-$ComputersOnKOV = $ComputersOn | Where-Object { $_.samaccountname -like "kov*" -and $_.operatingSystem -notlike "Windows Server*" }
-$ComputersOnSUO = $ComputersOn | Where-Object { $_.samaccountname -like "suo*" -and $_.operatingSystem -notlike "Windows Server*" }
-$ComputersOnGO = $ComputersOn | Where-Object { $_.samaccountname -like "GO-*" -and $_.operatingSystem -notlike "Windows Server*" }
-
-# Компьютеры региональной сети (Филиалы: AL, AR, BA и т.д.).
-$ComputersOnFIL = $ComputersOn | Where-Object {
-    $_.operatingSystem -notlike "Windows Server*" -and
-    (
-        $_.samaccountname -like "AL-*" -or $_.samaccountname -like "AR-*" -or
-        $_.samaccountname -like "BA-*" -or $_.samaccountname -like "EK-*" -or
-        # ... и так далее по всем маскам филиалов ...
-        $_.samaccountname -like "MS-*" -or $_.samaccountname -like "CR-*"
-    )
-}
-
-# Новые рабочие станции (не серверы), созданные за вчерашний день.
-$ComputersOnNew = $ComputersOn | Where-Object {
-    $_.operatingSystem -like "Windows*" -and
-    $_.operatingSystem -notlike "Windows Server*" -and
-    $_.whencreated -ge $lastdayStart -and
-    $_.whencreated -le $lastdayStop
-}
-
-# =========================================================================================================================
-# Раздел 3: Сбор и обработка данных из 1С
-# =========================================================================================================================
-
-# Читаем CSV-файл выгрузки из 1С (разделитель ";"). Файл находится на сетевом ресурсе.
-# Берем только тех, кто не в декрете (decret == "0") и не уволен (date_uv пустая).
-$Users1C = Import-Csv -Delimiter ";" -Path "\\abb-win.akbars.ru\departments\AppDS\1CKadryIntegration\Список.txt" |
-    Where-Object { $_.decret -eq "0" -and $_.date_uv -eq "" }
-
-# Разделяем всех активных сотрудников по типу занятости.
-$Users1Comr = $Users1C | Where-Object { $_.vid_zan -eq "Основное место работы" }     # Основные сотрудники
-$Users1Cins = $Users1C | Where-Object { $_.vid_zan -eq "Внешнее совместительство" }   # Внешние совместители
-$Users1Couts = $Users1C | Where-Object { $_.vid_zan -eq "Внутреннее совместительство" } # Внутренние совместители
-
-# Отдельно получаем сотрудников в декрете (decret == "1") и не уволенных.
-$Users1Cdecret = Import-Csv -Delimiter ";" -Path "\\abb-win.akbars.ru\departments\AppDS\1CKadryIntegration\Список.txt" |
-    Where-Object { $_.decret -eq "1" -and $_.date_uv -eq "" }
-
-# =========================================================================================================================
-# Раздел 4: Формирование итогового JSON-объекта
-# =========================================================================================================================
-
-# Собираем все полученные количества в единый хэш-таблицу (словарь) для дальнейшей конвертации в JSON.
 $ADData = @{
-    # Данные из 1С
-    Users1Comr               = ($Users1Comr | Measure-Object).count
-    Users1Cins               = ($Users1Cins | Measure-Object).count
-    Users1Couts              = ($Users1Couts | Measure-Object).count
-    Users1Cdecret            = ($Users1Cdecret | Measure-Object).count
-
-    # Статистика по AD
-    AllObjects               = ($AllObjects | Measure-Object).count
-    AllUsers                 = ($AllUsers | Measure-Object).count
-    AllUsersOn               = ($AllUsersOn | Measure-Object).count
-    AllUsersOnS              = ($AllUsersOnS | Measure-Object).count
-    AllUsersOnA              = ($AllUsersOnA | Measure-Object).count
-    AllUsersOnZ              = ($AllUsersOnZ | Measure-Object).count
-    AllUsersOnU              = ($AllUsersOnU | Measure-Object).count
-    AllUsersNewU             = ($AllUsersNewU | Measure-Object).Count
-    AllUsersOnErrorNum       = ($AllUsersOnErrorNum | Measure-Object).Count
-    AllUsersOnErrorOU        = ($AllUsersOnErrorOU | Measure-Object).count
-    AllUsersOnErrorDN        = ($AllUsersOnErrorDN | Measure-Object).Count
-    AllUsersOnErrorTN        = ($AllUsersOnErrorTN | Measure-Object).Count
-    AllGroup                 = ($AllGroup | Measure-Object).count
-    GroupEmpty               = ($GroupEmpty | Measure-Object).count
-    AllComputers             = ($AllComputers | Measure-Object).count
-    ComputersOn              = ($ComputersOn | Measure-Object).count
-    ComputersOnWSrv          = ($ComputersOnWSrv | Measure-Object).count
-    ComputersOnWSrv2019      = ($ComputersOnWSrv2019 | Measure-Object).count
-    ComputersOnWSrv2016      = ($ComputersOnWSrv2016 | Measure-Object).count
-    ComputersOnWSrv2012      = ($ComputersOnWSrv2012 | Measure-Object).count
-    ComputersOnWSrv2008      = ($ComputersOnWSrv2008 | Measure-Object).count
-    ComputersOnW11           = ($ComputersOnW11 | Measure-Object).count
-    ComputersOnW10           = ($ComputersOnW10 | Measure-Object).count
-    ComputersOnW8            = ($ComputersOnW8 | Measure-Object).count
-    ComputersOnW7            = ($ComputersOnW7 | Measure-Object).count
-    ComputersOnWXP           = ($ComputersOnWXP | Measure-Object).count
-    ComputersOnURM           = ($ComputersOnURM | Measure-Object).count
-    ComputersOnMRM           = ($ComputersOnMRM | Measure-Object).count
-    ComputersOnSUO           = ($ComputersOnSUO | Measure-Object).count
-    ComputersOnKOV           = ($ComputersOnKOV | Measure-Object).count
-    ComputersOnFIL           = ($ComputersOnFIL | Measure-Object).count
-    ComputersOnGO            = ($ComputersOnGO | Measure-Object).count
-    ComputersOnNew           = ($ComputersOnNew | Measure-Object).count
-
-    # Время запуска скрипта для отчета
-    Timestart                = $time
+    AllUsersOnDopOffices               = $AllUsersOnDopOffices
+    AllUsersOnInfTechBlock             = $AllUsersOnInfTechBlock
+    AllUsersOnOperationalBlock         = $AllUsersOnOperationalBlock
+    AllUsersOnRetailBlock              = $AllUsersOnRetailBlock
+    AllUsersOnCorporateBlock           = $AllUsersOnCorporateBlock
+    AllUsersOnBlockRisks               = $AllUsersOnBlockRisks
+    AllUsersOnFinancialBlock           = $AllUsersOnFinancialBlock
+    AllUsersOnAdminHousBlock           = $AllUsersOnAdminHousBlock
+    AllUsersOnDepartmentSecurity       = $AllUsersOnDepartmentSecurity
+    AllUsersOnHRBlock                  = $AllUsersOnHRBlock
+    AllUsersOnDirectorateLegalSupport  = $AllUsersOnDirectorateLegalSupport
+    AllUsersOnBlockInfSecurity         = $AllUsersOnBlockInfSecurity
+    AllUsersOnStrategManag             = $AllUsersOnStrategManag
+    AllUsersOnInvestBlock              = $AllUsersOnInvestBlock
+    AllUsersOnInternalControlService   = $AllUsersOnInternalControlService
+    AllUsersOnDepartmentInternalAudit  = $AllUsersOnDepartmentInternalAudit
+    AllUsersOnBoardStaff               = $AllUsersOnBoardStaff
+    AllUsersOnBlockDistressedAssets    = $AllUsersOnBlockDistressedAssets
+    AllUsersOnNotDivision              = $AllUsersOnNotDivision
+    Timestart                          = $time
 }
 
-# Конвертируем хэш-таблицу с данными в формат JSON.
-$JSONdata = $ADData | ConvertTo-Json
-
-# Записываем JSON в файл. Этот файл, судя по пути, будет читать Zabbix Agent для отправки метрик на сервер мониторинга.
-$JSONdata | Out-File -FilePath "C:\Program Files\Zabbix Agent\scripts\AD\ADData.txt" -Encoding default
-
-# Альтернатива для отладки: вывод JSON напрямую в консоль. Закомментировано в рабочей версии.
-# Write-Output $JSONdata
-
-# =========================================================================================================================
-# Раздел 5: Подсчет времени выполнения скрипта и вывод в консоль
-# =========================================================================================================================
-
-# Фиксируем время завершения работы.
-$timestop = Get-Date
-
-# Вычисляем разницу во времени между стартом и финишем.
-$TimeSum = $timestop - $timestart
-
-# Извлекаем часы, минуты, секунды из полученной разницы для удобочитаемого вывода.
-$TimeSumH = $TimeSum.Hours
-$TimeSumM = $TimeSum.Minutes
-$TimeSumS = $TimeSum.Seconds
-
-# Выводим сообщение о времени выполнения в консоль.
-Write-Host "Время формирования отчета составило: " $TimeSumH "ч " $TimeSumM "м " $TimeSumS "с"
+а файл сформировался вот таким
+{
+    "AllUsersOnRetailBlock":  567,
+    "AllUsersOnBlockDistressedAssets":  23,
+    "AllUsersOnBlockInfSecurity":  77,
+    "AllUsersOnInternalControlService":  54,
+    "AllUsersOnFinancialBlock":  161,
+    "AllUsersOnDopOffices":  1287,
+    "AllUsersOnDepartmentSecurity":  107,
+    "AllUsersOnDepartmentInternalAudit":  31,
+    "AllUsersOnBlockRisks":  304,
+    "AllUsersOnInfTechBlock":  975,
+    "AllUsersOnHRBlock":  96,
+    "AllUsersOnOperationalBlock":  618,
+    "AllUsersOnDirectorateLegalSupport":  80,
+    "AllUsersOnCorporateBlock":  548,
+    "AllUsersOnInvestBlock":  65,
+    "AllUsersOnAdminHousBlock":  141,
+    "AllUsersOnStrategManag":  67,
+    "Timestart":  "14.05.2026 11:00",
+    "AllUsersOnBoardStaff":  30,
+    "AllUsersOnNotDivision":  1
+}
