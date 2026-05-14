@@ -1,16 +1,42 @@
-# Фиксируем время начала
+# =========================================================================================================================
+# Раздел 1: Инициализация и фиксация времени
+# =========================================================================================================================
+
+cls
+
 $timestart = Get-Date
+$today = Get-Date -Format dd.MM.yyyy
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+
+# =========================================================================================================================
+# Раздел 2: Сбор данных из Active Directory
+# =========================================================================================================================
 
 # Получаем всех активных пользователей с нужными атрибутами
 $AllUsersOn = Get-ADUser -Filter { enabled -eq $true } -Properties division, samaccountname, DistinguishedName, name
 
-# Создаём хэш-таблицу для подсчёта уникальных значений division
-$DivisionCount = @{}
+# Инициализируем счётчики для каждого блока
+$AllUsersOnDopOffices = 0
+$AllUsersOnInfTechBlock = 0
+$AllUsersOnOperationalBlock = 0
+$AllUsersOnRetailBlock = 0
+$AllUsersOnCorporateBlock = 0
+$AllUsersOnBlockRisks = 0
+$AllUsersOnFinancialBlock = 0
+$AllUsersOnAdminHousBlock = 0
+$AllUsersOnDepartmentSecurity = 0
+$AllUsersOnHRBlock = 0
+$AllUsersOnDirectorateLegalSupport = 0
+$AllUsersOnBlockInfSecurity = 0
+$AllUsersOnStrategManag = 0
+$AllUsersOnInvestBlock = 0
+$AllUsersOnInternalControlService = 0
+$AllUsersOnDepartmentInternalAudit = 0
+$AllUsersOnBoardStaff = 0
+$AllUsersOnBlockDistressedAssets = 0
+$AllUsersOnNotDivision = 0
 
-# Массив для пользователей без division — сохраняем DistinguishedName целиком
-$UsersWithoutDivision = [System.Collections.Generic.List[PSObject]]::new()
-
-# Счётчик исключённых
+# Счётчик исключённых (для информации)
 $ExcludedCount = 0
 
 # Проходим по пользователям, фильтруем и считаем
@@ -18,7 +44,7 @@ foreach ($User in $AllUsersOn) {
     $sam = $User.samaccountname
     $name = $User.name
     $dn = $User.DistinguishedName
-    
+
     # Исключаем сервисные, административные и вендорские учётки
     if (
         $sam -like "s-*" -or $sam -like "sl-*" -or
@@ -27,66 +53,89 @@ foreach ($User in $AllUsersOn) {
         $sam -like "st-*" -or $sam -like "audit*" -or
         $sam -like "temp*" -or $sam -like "esas*" -or
         $name -like "Сервисная*" -or
-        $sam -like "a-*" -or $sam -like "z-*" -or
+        $sam -like "a-*" -or 
+        $sam -like "z-*" -or
+        $name -like "*`$*" -or
+        $name -like "*sadmin*" -or
+        $name -like "*Администратор*" -or
+        $name -like "Оператор" -or
+        $name -like "*СУЗ*" -or
+        $name -like "*Тестовая*" -or
+        $dn -like "*Сервисные учетные записи*" -or
+        $dn -like "*Отключенные пользователи*" -or
         $dn -like "*сторон*"
     ) {
         $ExcludedCount++
         continue
     }
-    
-    # Считаем division
+
+    # Распределяем по блокам на основе поля division
     $div = $User.division
-    if ($div) {
-        if ($DivisionCount.ContainsKey($div)) {
-            $DivisionCount[$div]++
-        } else {
-            $DivisionCount[$div] = 1
-        }
-    } else {
-        # Сохраняем пользователя без division
-        $UsersWithoutDivision.Add([PSCustomObject]@{
-            Name             = $name
-            SamAccountName   = $sam
-            DistinguishedName = $dn
-        })
-        
-        $emptyKey = "(не указано)"
-        if ($DivisionCount.ContainsKey($emptyKey)) {
-            $DivisionCount[$emptyKey]++
-        } else {
-            $DivisionCount[$emptyKey] = 1
-        }
+
+    switch -Wildcard ($div) {
+        "Дополнительные офисы"              { $AllUsersOnDopOffices++ }
+        "Информационно-технологический блок" { $AllUsersOnInfTechBlock++ }
+        "Операционный блок"                 { $AllUsersOnOperationalBlock++ }
+        "Розничный блок"                    { $AllUsersOnRetailBlock++ }
+        "Корпоративный блок"                { $AllUsersOnCorporateBlock++ }
+        "Блок Риски"                        { $AllUsersOnBlockRisks++ }
+        "Финансовый блок"                   { $AllUsersOnFinancialBlock++ }
+        "Административно-хозяйственный блок" { $AllUsersOnAdminHousBlock++ }
+        "Департамент безопасности"          { $AllUsersOnDepartmentSecurity++ }
+        "HR-блок"                           { $AllUsersOnHRBlock++ }
+        "Дирекция правового сопровождения"  { $AllUsersOnDirectorateLegalSupport++ }
+        "Блок информационной безопасности"  { $AllUsersOnBlockInfSecurity++ }
+        "Блок стратегического управления"   { $AllUsersOnStrategManag++ }
+        "Инвестиционный блок"               { $AllUsersOnInvestBlock++ }
+        "Служба внутреннего контроля"       { $AllUsersOnInternalControlService++ }
+        "Департамент внутреннего аудита"    { $AllUsersOnDepartmentInternalAudit++ }
+        "Аппарат правления"                 { $AllUsersOnBoardStaff++ }
+        "Блок Проблемные активы"            { $AllUsersOnBlockDistressedAssets++ }
+        default                             { $AllUsersOnNotDivision++ }
     }
 }
 
-# Считаем итоговое количество "живых" пользователей
-$RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+# =========================================================================================================================
+# Раздел 3: Формирование итогового JSON-объекта
+# =========================================================================================================================
 
-# Выводим статистику
-Write-Host "`n=== Статистика по подразделениям (division) — реальные пользователи ===" -ForegroundColor Green
-Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
-
-$DivisionCount.GetEnumerator() | 
-    Sort-Object Value -Descending | 
-    Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50}, 
-                 @{Label="Кол-во пользователей"; Expression={$_.Value}; Width=20}, 
-                 @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
-
-# Итоговые количества
-Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
-Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
-Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
-
-# Выводим пользователей без division
-if ($UsersWithoutDivision.Count -gt 0) {
-    Write-Host "`n=== Пользователи без указанного division ($($UsersWithoutDivision.Count) шт.) ===" -ForegroundColor Red
-    $UsersWithoutDivision | 
-        Sort-Object Name | 
-        Format-Table Name, SamAccountName, 
-                      @{Label="DistinguishedName"; Expression={$_.DistinguishedName}; Width=120} -AutoSize
+$ADData = @{
+    AllUsersOnDopOffices               = $AllUsersOnDopOffices
+    AllUsersOnInfTechBlock             = $AllUsersOnInfTechBlock
+    AllUsersOnOperationalBlock         = $AllUsersOnOperationalBlock
+    AllUsersOnRetailBlock              = $AllUsersOnRetailBlock
+    AllUsersOnCorporateBlock           = $AllUsersOnCorporateBlock
+    AllUsersOnBlockRisks               = $AllUsersOnBlockRisks
+    AllUsersOnFinancialBlock           = $AllUsersOnFinancialBlock
+    AllUsersOnAdminHousBlock           = $AllUsersOnAdminHousBlock
+    AllUsersOnDepartmentSecurity       = $AllUsersOnDepartmentSecurity
+    AllUsersOnHRBlock                  = $AllUsersOnHRBlock
+    AllUsersOnDirectorateLegalSupport  = $AllUsersOnDirectorateLegalSupport
+    AllUsersOnBlockInfSecurity         = $AllUsersOnBlockInfSecurity
+    AllUsersOnStrategManag             = $AllUsersOnStrategManag
+    AllUsersOnInvestBlock              = $AllUsersOnInvestBlock
+    AllUsersOnInternalControlService   = $AllUsersOnInternalControlService
+    AllUsersOnDepartmentInternalAudit  = $AllUsersOnDepartmentInternalAudit
+    AllUsersOnBoardStaff               = $AllUsersOnBoardStaff
+    AllUsersOnBlockDistressedAssets    = $AllUsersOnBlockDistressedAssets
+    AllUsersOnNotDivision              = $AllUsersOnNotDivision
+    Timestart                          = $time
 }
 
-# Время выполнения
+# Конвертируем в JSON
+$JSONdata = $ADData | ConvertTo-Json
+
+# Записываем JSON в файл для Zabbix
+$JSONdata | Out-File -FilePath "C:\Program Files\Zabbix Agent\scripts\AD\ADData.txt" -Encoding default
+
+# =========================================================================================================================
+# Раздел 4: Подсчет времени выполнения скрипта и вывод в консоль
+# =========================================================================================================================
+
 $timestop = Get-Date
 $TimeSum = $timestop - $timestart
-Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+$TimeSumH = $TimeSum.Hours
+$TimeSumM = $TimeSum.Minutes
+$TimeSumS = $TimeSum.Seconds
+
+Write-Host "Время формирования отчета составило: " $TimeSumH "ч " $TimeSumM "м " $TimeSumS "с"
