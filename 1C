@@ -1,285 +1,140 @@
+# ad_division_attr.py
+import os, sys, csv, smtplib, traceback, socket, logging, time
+from datetime import datetime
+from collections import Counter
+from email.mime.text import MIMEText
+from email.header import Header
+import pyodbc
+from openpyxl import load_workbook
+from ldap3 import Server, Connection, ALL, SUBTREE
+from cryptography.fernet import Fernet
 
-    except Exception:
-        fatal("Недоступна БД DWDATA_ODS", traceback.format_exc())
-    cur = cn.cursor()
-    cur.execute(f"""
-        SELECT Tab_Numb, fio, UvDate, department, dep, dep1, dokko
-        FROM {SQL_DATABASE}.{SQL_VIEW}
-    """)
-    today = datetime.now().date()
-    out = []
-    for r in cur.fetchall():
-        uv = r.UvDate
-        if uv is not None:
-            try:
-                if uv.date() <= today: continue
-            except AttributeError:
-                pass
-        tab = norm_tab(r.Tab_Numb)
-        if not tab: continue
-        out.append({"tab": tab, "fio": r.fio or "",
-                    "department": r.department, "dep": r.dep, "dep1": r.dep1,
-                    "dokko": r.dokko})
-    cn.close()
-    return out
+DRY_RUN = False
 
-def connect_ad(ad_user, ad_pwd):
+BASE_DIR   = r"C:\Scripts\AD_Division_Attr"
+KEYS_DIR   = r"C:\Scripts\AD_Division_Attr\keys"
+KEY_PATH   = os.path.join(KEYS_DIR, "ad_sync.key")
+
+XLSX_PATH  = os.path.join(BASE_DIR, "Справочник.xlsx")
+EXCL_PATH  = os.path.join(BASE_DIR, "excluded_tabs.txt")
+LOG_DIR    = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_RETENTION_DAYS = 100
+
+SQL_SERVER   = "p-knot-db01"
+SQL_DATABASE = "DWDATA_ODS"
+SQL_VIEW     = "IC.v_Empl_info"
+
+AD_SERVER    = "abb-win.akbars.ru"
+AD_BASE_DN   = "DC=abb-win,DC=akbars,DC=ru"
+
+SQL_USER_ENC     = ""
+SQL_PASSWORD_ENC = ""
+AD_USER_ENC      = ""
+AD_PASSWORD_ENC  = ""
+
+DEFAULT_BLOCK = "Дополнительные офисы"
+UNKNOWN_BLOCK = "Неизвестно"
+OPS_BLOCK     = "Операционный блок"
+
+UAC_DISABLED = 0x2
+EXCLUDED_OU_MARKERS = ("отключенные пользователи", "отключенные объекты")
+
+SMTP_HOST    = "p-ln-smtp.abb-win.akbars.ru"
+SMTP_PORT    = 25
+SENDER_EMAIL = "ADRobot@akbars.ru"
+SENDER_NAME  = "Робот для оповещений - ДИТ"
+ALERT_TO     = "RashidovAR@akbars.ru"
+
+TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+MODE_TAG = "DRY" if DRY_RUN else "PROD"
+LOG_CSV  = os.path.join(LOG_DIR, f"division_sync_{MODE_TAG}_{TS}.csv")
+LOG_FILE = os.path.join(LOG_DIR, f"run_{MODE_TAG}_{TS}.log")
+
+logger = logging.getLogger("ad_div_sync")
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh.setFormatter(_fmt)
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_fmt)
+logger.addHandler(_fh)
+logger.addHandler(_sh)
+
+def load_secrets():
+    if not os.path.exists(KEY_PATH):
+        raise FileNotFoundError(f"Нет ключа шифрования: {KEY_PATH}")
+    with open(KEY_PATH, "rb") as f:
+        fer = Fernet(f.read())
+    def dec(tok):
+        return fer.decrypt(tok.encode("ascii")).decode("utf-8")
+    return (dec(SQL_USER_ENC), dec(SQL_PASSWORD_ENC),
+            dec(AD_USER_ENC),  dec(AD_PASSWORD_ENC))
+
+def send_alert(subject, body):
     try:
-        srv = Server(AD_SERVER, get_info=ALL)
-        c = Connection(srv, user=ad_user, password=ad_pwd,
-                       authentication="SIMPLE", auto_bind=True)
-        return c
-    except Exception:
-        fatal("Не удалось подключиться к AD", traceback.format_exc())
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = Header(subject, "utf-8")
+        msg["From"] = f"{Header(SENDER_NAME,'utf-8').encode()} <{SENDER_EMAIL}>"
+        msg["To"] = ALERT_TO
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.sendmail(SENDER_EMAIL, [ALERT_TO], msg.as_string())
+    except Exception as e:
+        logger.error(f"[ALERT FAIL] {e}")
 
-def load_ad_users(conn):
-    flt = ("(&(objectClass=user)(objectCategory=person)(wWWHomePage=*)"
-           "(!(sAMAccountName=z-*))(!(sAMAccountName=a-*))(!(sAMAccountName=s-*))"
-           "(!(employeeType=vendor))(!(employeeType=service)))")
-    attrs = ["sAMAccountName", "distinguishedName", "division",
-             "wWWHomePage", "userAccountControl",
-             "physicalDeliveryOfficeName", "streetAddress"]
-    index = {}
-    disabled_index = {}
-    total = 0
-    skipped_disabled_ou = 0
-    for entry in conn.extend.standard.paged_search(
-            search_base=AD_BASE_DN, search_filter=flt,
-            search_scope=SUBTREE, attributes=attrs,
-            paged_size=500, generator=True):
-        if entry.get("type") != "searchResEntry":
+def fatal(subject, err):
+    body = f"Хост: {socket.gethostname()}\nСкрипт: {sys.argv[0]}\nDRY_RUN: {DRY_RUN}\n\n{err}"
+    logger.error(f"[FATAL] {subject}\n{body}")
+    send_alert(f"[AD Division Sync] {subject}", body)
+    sys.exit(1)
+
+def cleanup_old_logs():
+    cutoff = time.time() - LOG_RETENTION_DAYS * 86400
+    removed = 0
+    for name in os.listdir(LOG_DIR):
+        if not (name.endswith(".log") or name.endswith(".csv")):
             continue
-        a = entry["attributes"]
-        dn = entry["dn"]
-        uac = a.get("userAccountControl") or 0
+        full = os.path.join(LOG_DIR, name)
         try:
-            uac = int(uac)
-        except (TypeError, ValueError):
-            uac = 0
-        is_disabled = bool(uac & UAC_DISABLED)
+            if os.path.isfile(full) and os.path.getmtime(full) < cutoff:
+                os.remove(full)
+                removed += 1
+        except Exception as e:
+            logger.warning(f"не смог удалить {full}: {e}")
+    if removed:
+        logger.info(f"Удалено старых файлов логов (>{LOG_RETENTION_DAYS} дн.): {removed}")
 
-        tab = norm_tab(a.get("wWWHomePage"))
-        if not tab:
-            continue
+def norm_tab(v):
+    if v is None: return None
+    s = "".join(ch for ch in str(v).strip() if ch.isdigit())
+    if not s: return None
+    return s.zfill(10)
 
-        if is_disabled and any(m in dn.lower() for m in EXCLUDED_OU_MARKERS):
-            skipped_disabled_ou += 1
-            disabled_index.setdefault(tab, []).append(a.get("sAMAccountName") or "")
-            continue
+def is_empty(v):
+    return v is None or not str(v).strip()
 
-        index.setdefault(tab, []).append({
-            "sam": a.get("sAMAccountName") or "",
-            "dn":  dn,
-            "division": a.get("division") or "",
-            "disabled": is_disabled,
-            "office": a.get("physicalDeliveryOfficeName") or "",
-            "street": a.get("streetAddress") or "",
-        })
-        total += 1
-        if total % 1000 == 0:
-            logger.info(f"  AD загружено: {total}")
-    logger.info(f"  AD итого записей: {total}, уникальных табельников: {len(index)}, "
-                f"пропущено отключенных в спец-OU: {skipped_disabled_ou}")
-    return index, disabled_index
+def load_excluded():
+    if not os.path.exists(EXCL_PATH): return set()
+    with open(EXCL_PATH, "r", encoding="utf-8") as f:
+        return {norm_tab(x) for x in f if norm_tab(x)}
 
-def main():
-    logger.info(f"=== START (DRY_RUN={DRY_RUN}) host={socket.gethostname()} ===")
-    cleanup_old_logs()
-
-    try:
-        sql_user, sql_pwd, ad_user, ad_pwd = load_secrets()
-    except Exception:
-        fatal("Ошибка расшифровки секретов", traceback.format_exc())
-
-    try:
-        logger.info("[1/4] Загружаю исключения и справочник...")
-        excluded = load_excluded()
-        dic = load_dictionary()
-
-        logger.info(f"[2/4] Тяну сотрудников из БД {SQL_SERVER}...")
-        employees = fetch_employees(sql_user, sql_pwd)
-        logger.info(f"     получено активных: {len(employees)}")
-
-        logger.info("[3/4] Подключаюсь к AD и тяну юзеров...")
-        ad = connect_ad(ad_user, ad_pwd)
-        ad_index, disabled_index = load_ad_users(ad)
-
-        logger.info("[4/4] Старт обработки")
-    except SystemExit:
-        raise
-    except Exception:
-        fatal("Ошибка инициализации", traceback.format_exc())
-
-    stats = {"total":0,"skipped_excl":0,"need_update":0,"already_ok":0,
-             "not_found":0,"not_found_no_data":0,"disabled_only":0,"multi":0,
-             "unknown_dict":0,"no_data":0,
-             "errors":0,"updated":0}
-    block_counter = Counter()
-    unknown_rows = []
-
-    with open(LOG_CSV, "w", encoding="utf-8-sig", newline="", buffering=1) as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow(["timestamp","tab_numb","fio","sam","status","reason",
-                    "current_division","new_division","dry_run"])
-
-        for i, emp in enumerate(employees, 1):
-            if i % 500 == 0:
-                logger.info(f"  обработано {i}/{len(employees)}")
-
-            stats["total"] += 1
-            tab, fio = emp["tab"], emp["fio"]
-
-            if tab in excluded:
-                stats["skipped_excl"] += 1
-                w.writerow([datetime.now(),tab,fio,"","SKIPPED","in_exclusion_list","","",DRY_RUN])
-                continue
-
-            new_block, reason, action = resolve_block(emp, dic)
-
-            if action == "unknown":
-                stats["unknown_dict"] += 1
-                unknown_rows.append({
-                    "tab": tab, "fio": fio,
-                    "department": emp.get("department") or "",
-                    "dep": emp.get("dep") or "",
-                    "dep1": emp.get("dep1") or "",
-                    "reason": reason,
-                })
-                w.writerow([datetime.now(),tab,fio,"","UNKNOWN_DICT",reason,"","",DRY_RUN])
-                continue
-
-            if action == "stats":
-                ad_users = ad_index.get(tab, [])
-
-                office_hit = any("дополнительный" in (u["office"] or "").lower()
-                                 for u in ad_users)
-                if office_hit:
-                    new_block = DEFAULT_BLOCK
-                    reason = "default_by_ad_office"
-                    action = "update"
-                else:
-                    matched_block = None
-                    matched_src = None
-                    for u in ad_users:
-                        parts = [p.strip().lower() for p in (u["street"] or "").split("%") if p.strip()]
-                        if not parts:
-                            continue
-                        for sheet in ("department", "dep", "dep1"):
-                            for name_low, block in dic[sheet].items():
-                                if name_low in parts:
-                                    matched_block = block
-                                    matched_src = sheet
-                                    break
-                            if matched_block:
-                                break
-                        if matched_block:
-                            break
-
-                    if matched_block:
-                        new_block = matched_block
-                        reason = f"matched_by_ad_street:{matched_src}"
-                        action = "update"
-                    else:
-                        esc_hit = any("единый сервисный центр" in (u["street"] or "").lower()
-                                      for u in ad_users)
-                        if esc_hit:
-                            new_block = OPS_BLOCK
-                            reason = "matched_by_ad_street_esc"
-                            action = "update"
-                        elif not ad_users:
-                            stats["not_found_no_data"] += 1
-                            w.writerow([datetime.now(),tab,fio,"","NOT_FOUND_NO_DATA",
-                                        "no_user_in_ad_and_no_source_data","","",DRY_RUN])
-                            continue
-                        else:
-                            stats["no_data"] += 1
-                            block_counter[UNKNOWN_BLOCK] += 1
-                            w.writerow([datetime.now(),tab,fio,"","NO_DATA",
-                                        reason,"",UNKNOWN_BLOCK,DRY_RUN])
-                            continue
-
-            block_counter[new_block] += 1
-
-            users = ad_index.get(tab, [])
-            if not users:
-                if tab in disabled_index:
-                    stats["disabled_only"] += 1
-                    sams = ",".join(disabled_index[tab])
-                    w.writerow([datetime.now(),tab,fio,sams,"DISABLED",
-                                "ad_user_disabled_in_excluded_ou","",new_block,DRY_RUN])
-                else:
-                    stats["not_found"] += 1
-                    w.writerow([datetime.now(),tab,fio,"","NOT_FOUND",
-                                "no_user_in_ad","",new_block,DRY_RUN])
-                continue
-
-            if len(users) > 1:
-                active = [u for u in users if not u["disabled"]]
-                if len(active) == 1:
-                    users = active
-                else:
-                    stats["multi"] += 1
-                    sams = ",".join(u["sam"] for u in users)
-                    w.writerow([datetime.now(),tab,fio,sams,"MULTI",
-                                f"multiple_ad_users:active={len(active)}","",new_block,DRY_RUN])
-                    continue
-
-            u = users[0]
-            sam, cur_div, dn = u["sam"], u["division"], u["dn"]
-            if cur_div == new_block:
-                stats["already_ok"] += 1
-                w.writerow([datetime.now(),tab,fio,sam,"OK","already_set",cur_div,new_block,DRY_RUN])
-                continue
-
-            stats["need_update"] += 1
-            try:
-                ad.modify(dn, {"division":[("MODIFY_REPLACE",[new_block])]})
-                if ad.result["result"] == 0:
-                    stats["updated"] += 1
-                    w.writerow([datetime.now(),tab,fio,sam,"UPDATED",reason,cur_div,new_block,DRY_RUN])
-                else:
-                    stats["errors"] += 1
-                    w.writerow([datetime.now(),tab,fio,sam,"ERROR",f"ad_modify:{ad.result}",cur_div,new_block,DRY_RUN])
-            except Exception as e:
-                stats["errors"] += 1
-                w.writerow([datetime.now(),tab,fio,sam,"ERROR",f"ad_modify_exc:{e}",cur_div,new_block,DRY_RUN])
-
-    ad.unbind()
-
-    logger.info("===== ИТОГИ =====")
-    logger.info(f"CSV-лог: {LOG_CSV}")
-    for k, v in stats.items():
-        logger.info(f"  {k}: {v}")
-
-    logger.info("===== СВОДКА ПО БЛОКАМ =====")
-    total_by_block = 0
-    for block, cnt in sorted(block_counter.items(), key=lambda x: (-x[1], x[0])):
-        logger.info(f"  {block}: {cnt}")
-        total_by_block += cnt
-    logger.info(f"  ИТОГО: {total_by_block}")
-
-    if unknown_rows:
-        lines = ["Найдены сотрудники с неизвестным значением в department/dep/dep1",
-                 "(значения отсутствуют в справочнике):", ""]
-        lines.append("tab_numb | ФИО | поле:значение")
-        for r in unknown_rows:
-            lines.append(f"{r['tab']} | {r['fio']} | {r['reason']} "
-                         f"(department={r['department']}; dep={r['dep']}; dep1={r['dep1']})")
-        lines += ["", f"Всего: {len(unknown_rows)}", f"Лог: {LOG_CSV}"]
-        send_alert("[AD Division Sync] Неизвестные значения в справочнике",
-                   "\n".join(lines))
-
-    if stats["errors"] > 0:
-        summary = "\n".join(f"{k}: {v}" for k,v in stats.items())
-        send_alert("[AD Division Sync] Завершено с ошибками",
-                   f"Лог: {LOG_CSV}\nLog-файл: {LOG_FILE}\n\n{summary}")
-
-    logger.info("=== DONE ===")
-
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception:
-        fatal("Необработанное исключение", traceback.format_exc())
+def load_dictionary():
+    if not os.path.exists(XLSX_PATH):
+        raise FileNotFoundError(f"Не найден справочник: {XLSX_PATH}")
+    wb = load_workbook(XLSX_PATH, data_only=True)
+    result = {}
+    for sheet in ("department", "dep", "dep1"):
+        if sheet not in wb.sheetnames:
+            raise ValueError(f"В справочнике нет листа '{sheet}'")
+        ws = wb[sheet]
+        d = {}
+        rows = ws.iter_rows(values_only=True)
+        next(rows, None)
+        for row in rows:
+            if not row or len(row) < 2: continue
+            block, name = row[0], row[1]
+            if name is None or block is None: continue
+            d[str(name).strip().lower()] = str(block).strip()
+        result[sheet] = d
+    return result
