@@ -1,46 +1,126 @@
-$ADData = @{
-    AllUsersOnDopOffices               = $AllUsersOnDopOffices
-    AllUsersOnInfTechBlock             = $AllUsersOnInfTechBlock
-    AllUsersOnOperationalBlock         = $AllUsersOnOperationalBlock
-    AllUsersOnRetailBlock              = $AllUsersOnRetailBlock
-    AllUsersOnCorporateBlock           = $AllUsersOnCorporateBlock
-    AllUsersOnBlockRisks               = $AllUsersOnBlockRisks
-    AllUsersOnFinancialBlock           = $AllUsersOnFinancialBlock
-    AllUsersOnAdminHousBlock           = $AllUsersOnAdminHousBlock
-    AllUsersOnDepartmentSecurity       = $AllUsersOnDepartmentSecurity
-    AllUsersOnHRBlock                  = $AllUsersOnHRBlock
-    AllUsersOnDirectorateLegalSupport  = $AllUsersOnDirectorateLegalSupport
-    AllUsersOnBlockInfSecurity         = $AllUsersOnBlockInfSecurity
-    AllUsersOnStrategManag             = $AllUsersOnStrategManag
-    AllUsersOnInvestBlock              = $AllUsersOnInvestBlock
-    AllUsersOnInternalControlService   = $AllUsersOnInternalControlService
-    AllUsersOnDepartmentInternalAudit  = $AllUsersOnDepartmentInternalAudit
-    AllUsersOnBoardStaff               = $AllUsersOnBoardStaff
-    AllUsersOnBlockDistressedAssets    = $AllUsersOnBlockDistressedAssets
-    AllUsersOnNotDivision              = $AllUsersOnNotDivision
-    Timestart                          = $time
+# =========================================================================================================================
+# ADData_UsersBlocks_Discovery.ps1 — LLD discovery: пользователи по division
+# =========================================================================================================================
+
+cls
+
+# Фиксация времени
+$timestart = Get-Date
+$today = Get-Date -Format dd.MM.yyyy
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+
+# =========================================================================================================================
+# Сбор данных из Active Directory
+# =========================================================================================================================
+
+$AllUsersOn = Get-ADUser -Filter { enabled -eq $true } -Properties division, samaccountname, DistinguishedName, name
+
+# Хэш-таблица для подсчёта пользователей по division
+$DivisionCount = @{}
+
+# Счётчик исключённых
+$ExcludedCount = 0
+
+foreach ($User in $AllUsersOn) {
+    $sam = $User.samaccountname
+    $name = $User.name
+    $dn  = $User.DistinguishedName
+
+    # Исключаем сервисные, административные и вендорские учётки
+    if (
+        $sam -like "s-*" -or $sam -like "sl-*" -or
+        $sam -like "*test*" -or $sam -like "Health*" -or
+        $sam -like "room*" -or $sam -like "sp-*" -or
+        $sam -like "st-*" -or $sam -like "audit*" -or
+        $sam -like "temp*" -or $sam -like "esas*" -or
+        $name -like "Сервисная*" -or
+        $sam -like "a-*" -or 
+        $sam -like "z-*" -or
+        $name -like "*`$*" -or
+        $name -like "*sadmin*" -or
+        $name -like "*Администратор*" -or
+        $name -like "Оператор" -or
+        $name -like "*СУЗ*" -or
+        $name -like "*Тестовая*" -or
+        $dn -like "*Сервисные учетные записи*" -or
+        $dn -like "*Отключенные пользователи*" -or
+        $dn -like "*сторон*"
+    ) {
+        $ExcludedCount++
+        continue
+    }
+
+    # Считаем по division
+    $div = $User.division
+    if ($div) {
+        if ($DivisionCount.ContainsKey($div)) {
+            $DivisionCount[$div]++
+        } else {
+            $DivisionCount[$div] = 1
+        }
+    } else {
+        $emptyKey = "(не указано)"
+        if ($DivisionCount.ContainsKey($emptyKey)) {
+            $DivisionCount[$emptyKey]++
+        } else {
+            $DivisionCount[$emptyKey] = 1
+        }
+    }
 }
 
-а файл сформировался вот таким
-{
-    "AllUsersOnRetailBlock":  567,
-    "AllUsersOnBlockDistressedAssets":  23,
-    "AllUsersOnBlockInfSecurity":  77,
-    "AllUsersOnInternalControlService":  54,
-    "AllUsersOnFinancialBlock":  161,
-    "AllUsersOnDopOffices":  1287,
-    "AllUsersOnDepartmentSecurity":  107,
-    "AllUsersOnDepartmentInternalAudit":  31,
-    "AllUsersOnBlockRisks":  304,
-    "AllUsersOnInfTechBlock":  975,
-    "AllUsersOnHRBlock":  96,
-    "AllUsersOnOperationalBlock":  618,
-    "AllUsersOnDirectorateLegalSupport":  80,
-    "AllUsersOnCorporateBlock":  548,
-    "AllUsersOnInvestBlock":  65,
-    "AllUsersOnAdminHousBlock":  141,
-    "AllUsersOnStrategManag":  67,
-    "Timestart":  "14.05.2026 11:00",
-    "AllUsersOnBoardStaff":  30,
-    "AllUsersOnNotDivision":  1
+# =========================================================================================================================
+# Формирование discovery-данных для Zabbix LLD
+# =========================================================================================================================
+
+# Массив объектов для LLD — каждый division становится макросом {#DIVISION}
+$discovery = foreach ($k in $DivisionCount.Keys) {
+    @{ '{#DIVISION}' = $k }
 }
+
+# Итоговый payload: discovery (для Zabbix) + counts (для информации/отладки)
+$payload = [ordered]@{
+    discovery = @($discovery)
+    counts    = $DivisionCount
+    metadata  = @{
+        TotalActiveUsers  = $AllUsersOn.Count
+        ExcludedUsers     = $ExcludedCount
+        RealUsers         = ($DivisionCount.Values | Measure-Object -Sum).Sum
+        UniqueDivisions   = $DivisionCount.Count
+        GeneratedAt       = $time
+        ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+    }
+}
+
+# Конвертация в JSON
+$json = $payload | ConvertTo-Json -Depth 4
+
+# =========================================================================================================================
+# Сохранение результата
+# =========================================================================================================================
+
+$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
+$json | Out-File -FilePath $outputPath -Encoding default
+
+# =========================================================================================================================
+# Вывод статистики в консоль
+# =========================================================================================================================
+
+$RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+Write-Host "`n=== Статистика по подразделениям (division) — LLD Discovery ===" -ForegroundColor Green
+Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+
+$DivisionCount.GetEnumerator() | 
+    Sort-Object Value -Descending | 
+    Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50}, 
+                 @{Label="Кол-во"; Expression={$_.Value}; Width=10}, 
+                 @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
+
+Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
+Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
+Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
+
+$timestop = Get-Date
+$TimeSum = $timestop - $timestart
+Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+Write-Host "Файл сохранён: $outputPath" -ForegroundColor Green
