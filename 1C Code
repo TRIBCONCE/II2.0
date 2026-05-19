@@ -1,1 +1,99 @@
+# ad_division_attr.py
+import os, sys, csv, smtplib, traceback, socket, logging, time
+from datetime import datetime
+from collections import Counter
+from email.mime.text import MIMEText
+from email.header import Header
+import pyodbc
+from openpyxl import load_workbook
+from ldap3 import Server, Connection, ALL, SUBTREE
+from cryptography.fernet import Fernet
 
+DRY_RUN = False
+
+BASE_DIR   = r"C:\Scripts\AD_Division_Attr"
+KEYS_DIR   = r"C:\Scripts\AD_Division_Attr\keys"
+KEY_PATH   = os.path.join(KEYS_DIR, "ad_sync.key")
+
+XLSX_PATH  = os.path.join(BASE_DIR, "Справочник.xlsx")
+EXCL_PATH  = os.path.join(BASE_DIR, "excluded_tabs.txt")
+LOG_DIR    = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_RETENTION_DAYS = 100
+
+SQL_SERVER   = "p-knot-db01"
+SQL_DATABASE = "DWDATA_ODS"
+SQL_VIEW     = "IC.v_Empl_info"
+
+AD_SERVER    = "abb-win.akbars.ru"
+AD_BASE_DN   = "DC=abb-win,DC=akbars,DC=ru"
+
+SQL_USER_ENC     = ""
+SQL_PASSWORD_ENC = ""
+AD_USER_ENC      = ""
+AD_PASSWORD_ENC  = ""
+
+DEFAULT_BLOCK = "Дополнительные офисы"
+UNKNOWN_BLOCK = "Неизвестно"
+OPS_BLOCK     = "Операционный блок"
+
+UAC_DISABLED = 0x2
+EXCLUDED_OU_MARKERS = ("отключенные пользователи", "отключенные объекты")
+
+SMTP_HOST    = "p-ln-smtp.abb-win.akbars.ru"
+SMTP_PORT    = 25
+SENDER_EMAIL = "ADRobot@akbars.ru"
+SENDER_NAME  = "Робот для оповещений - ДИТ"
+ALERT_TO     = "RashidovAR@akbars.ru"
+
+TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+MODE_TAG = "DRY" if DRY_RUN else "PROD"
+LOG_CSV  = os.path.join(LOG_DIR, f"division_sync_{MODE_TAG}_{TS}.csv")
+LOG_FILE = os.path.join(LOG_DIR, f"run_{MODE_TAG}_{TS}.log")
+
+logger = logging.getLogger("ad_div_sync")
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh.setFormatter(_fmt)
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_fmt)
+logger.addHandler(_fh)
+logger.addHandler(_sh)
+
+def load_secrets():
+    if not os.path.exists(KEY_PATH):
+        raise FileNotFoundError(f"Нет ключа шифрования: {KEY_PATH}")
+    with open(KEY_PATH, "rb") as f:
+        fer = Fernet(f.read())
+    def dec(tok):
+        return fer.decrypt(tok.encode("ascii")).decode("utf-8")
+    return (dec(SQL_USER_ENC), dec(SQL_PASSWORD_ENC),
+            dec(AD_USER_ENC),  dec(AD_PASSWORD_ENC))
+
+def send_alert(subject, body):
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = Header(subject, "utf-8")
+        msg["From"] = f"{Header(SENDER_NAME,'utf-8').encode()} <{SENDER_EMAIL}>"
+        msg["To"] = ALERT_TO
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.sendmail(SENDER_EMAIL, [ALERT_TO], msg.as_string())
+    except Exception as e:
+        logger.error(f"[ALERT FAIL] {e}")
+
+def fatal(subject, err):
+    body = f"Хост: {socket.gethostname()}\nСкрипт: {sys.argv[0]}\nDRY_RUN: {DRY_RUN}\n\n{err}"
+    logger.error(f"[FATAL] {subject}\n{body}")
+    send_alert(f"[AD Division Sync] {subject}", body)
+    sys.exit(1)
+
+def cleanup_old_logs():
+    cutoff = time.time() - LOG_RETENTION_DAYS * 86400
+    removed = 0
+    for name in os.listdir(LOG_DIR):
+        if not (name.endswith(".log") or name.endswith(".csv")):
+            continue
+        full = os.path.join(LOG_DIR, name)
+        try:
