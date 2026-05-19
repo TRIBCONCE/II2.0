@@ -23,6 +23,31 @@ def load_excluded():
 def load_dictionary():
     if not os.path.exists(XLSX_PATH):
         raise FileNotFoundError(f"Не найден справочник: {XLSX_PATH}")
+wb = load_workbook(XLSX_PATH, data_only=True)
+    result = {}
+    for sheet in ("department", "dep", "dep1"):
+        if sheet not in wb.sheetnames:
+            raise ValueError(f"В справочнике нет листа '{sheet}'")
+        ws = wb[sheet]
+        d = {}
+        rows = ws.iter_rows(values_only=True)
+        next(rows, None)
+        for row in rows:
+            if not row or len(row) < 2: continue
+            block, name = row[0], row[1]
+            if name is None or block is None: continue
+            d[str(name).strip().lower()] = str(block).strip()
+        result[sheet] = d
+    return result
+
+def resolve_block(emp, dic):
+    for field in ("department", "dep", "dep1"):
+        v = emp.get(field)
+        if not is_empty(v):
+            block = dic[field].get(str(v).strip().lower())
+            if block:
+                return block, f"matched_{field}", "update"
+            else:
 private void InsertDB(string login, string phone, string description, int passexp, string Org, string mail, string keyword)
         {
             System.Data.DataTable table = new System.Data.DataTable();
