@@ -1,3 +1,28 @@
+if os.path.isfile(full) and os.path.getmtime(full) < cutoff:
+                os.remove(full)
+                removed += 1
+        except Exception as e:
+            logger.warning(f"не смог удалить {full}: {e}")
+    if removed:
+        logger.info(f"Удалено старых файлов логов (>{LOG_RETENTION_DAYS} дн.): {removed}")
+
+def norm_tab(v):
+    if v is None: return None
+    s = "".join(ch for ch in str(v).strip() if ch.isdigit())
+    if not s: return None
+    return s.zfill(10)
+
+def is_empty(v):
+    return v is None or not str(v).strip()
+
+def load_excluded():
+    if not os.path.exists(EXCL_PATH): return set()
+    with open(EXCL_PATH, "r", encoding="utf-8") as f:
+        return {norm_tab(x) for x in f if norm_tab(x)}
+
+def load_dictionary():
+    if not os.path.exists(XLSX_PATH):
+        raise FileNotFoundError(f"Не найден справочник: {XLSX_PATH}")
 private void InsertDB(string login, string phone, string description, int passexp, string Org, string mail, string keyword)
         {
             System.Data.DataTable table = new System.Data.DataTable();
