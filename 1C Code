@@ -1,99 +1,100 @@
-# ad_division_attr.py
-import os, sys, csv, smtplib, traceback, socket, logging, time
-from datetime import datetime
-from collections import Counter
-from email.mime.text import MIMEText
-from email.header import Header
-import pyodbc
-from openpyxl import load_workbook
-from ldap3 import Server, Connection, ALL, SUBTREE
-from cryptography.fernet import Fernet
 
-DRY_RUN = False
+def resolve_block(emp, dic):
+    for field in ("department", "dep", "dep1"):
+        v = emp.get(field)
+        if not is_empty(v):
+            block = dic[field].get(str(v).strip().lower())
+            if block:
+                return block, f"matched_{field}", "update"
+            else:
+                return None, f"unknown_{field}:{v}", "unknown"
+    if not is_empty(emp.get("dokko")):
+        return DEFAULT_BLOCK, "default_by_dokko", "update"
+    return UNKNOWN_BLOCK, "no_data_no_dokko", "stats"
 
-BASE_DIR   = r"C:\Scripts\AD_Division_Attr"
-KEYS_DIR   = r"C:\Scripts\AD_Division_Attr\keys"
-KEY_PATH   = os.path.join(KEYS_DIR, "ad_sync.key")
-
-XLSX_PATH  = os.path.join(BASE_DIR, "Справочник.xlsx")
-EXCL_PATH  = os.path.join(BASE_DIR, "excluded_tabs.txt")
-LOG_DIR    = os.path.join(BASE_DIR, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-
-LOG_RETENTION_DAYS = 100
-
-SQL_SERVER   = "p-knot-db01"
-SQL_DATABASE = "DWDATA_ODS"
-SQL_VIEW     = "IC.v_Empl_info"
-
-AD_SERVER    = "abb-win.akbars.ru"
-AD_BASE_DN   = "DC=abb-win,DC=akbars,DC=ru"
-
-SQL_USER_ENC     = ""
-SQL_PASSWORD_ENC = ""
-AD_USER_ENC      = ""
-AD_PASSWORD_ENC  = ""
-
-DEFAULT_BLOCK = "Дополнительные офисы"
-UNKNOWN_BLOCK = "Неизвестно"
-OPS_BLOCK     = "Операционный блок"
-
-UAC_DISABLED = 0x2
-EXCLUDED_OU_MARKERS = ("отключенные пользователи", "отключенные объекты")
-
-SMTP_HOST    = "p-ln-smtp.abb-win.akbars.ru"
-SMTP_PORT    = 25
-SENDER_EMAIL = "ADRobot@akbars.ru"
-SENDER_NAME  = "Робот для оповещений - ДИТ"
-ALERT_TO     = "RashidovAR@akbars.ru"
-
-TS = datetime.now().strftime("%Y%m%d_%H%M%S")
-MODE_TAG = "DRY" if DRY_RUN else "PROD"
-LOG_CSV  = os.path.join(LOG_DIR, f"division_sync_{MODE_TAG}_{TS}.csv")
-LOG_FILE = os.path.join(LOG_DIR, f"run_{MODE_TAG}_{TS}.log")
-
-logger = logging.getLogger("ad_div_sync")
-logger.setLevel(logging.INFO)
-_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-_fh.setFormatter(_fmt)
-_sh = logging.StreamHandler(sys.stdout)
-_sh.setFormatter(_fmt)
-logger.addHandler(_fh)
-logger.addHandler(_sh)
-
-def load_secrets():
-    if not os.path.exists(KEY_PATH):
-        raise FileNotFoundError(f"Нет ключа шифрования: {KEY_PATH}")
-    with open(KEY_PATH, "rb") as f:
-        fer = Fernet(f.read())
-    def dec(tok):
-        return fer.decrypt(tok.encode("ascii")).decode("utf-8")
-    return (dec(SQL_USER_ENC), dec(SQL_PASSWORD_ENC),
-            dec(AD_USER_ENC),  dec(AD_PASSWORD_ENC))
-
-def send_alert(subject, body):
+def fetch_employees(sql_user, sql_pwd):
+    conn_str = (f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SQL_SERVER};"
+                f"DATABASE={SQL_DATABASE};UID={sql_user};PWD={sql_pwd};")
     try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = Header(subject, "utf-8")
-        msg["From"] = f"{Header(SENDER_NAME,'utf-8').encode()} <{SENDER_EMAIL}>"
-        msg["To"] = ALERT_TO
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-            s.sendmail(SENDER_EMAIL, [ALERT_TO], msg.as_string())
-    except Exception as e:
-        logger.error(f"[ALERT FAIL] {e}")
+        cn = pyodbc.connect(conn_str, timeout=15)
+    except Exception:
+        fatal("Недоступна БД DWDATA_ODS", traceback.format_exc())
+    cur = cn.cursor()
+    cur.execute(f"""
+        SELECT Tab_Numb, fio, UvDate, department, dep, dep1, dokko
+        FROM {SQL_DATABASE}.{SQL_VIEW}
+    """)
+    today = datetime.now().date()
+    out = []
+    for r in cur.fetchall():
+        uv = r.UvDate
+        if uv is not None:
+            try:
+                if uv.date() <= today: continue
+            except AttributeError:
+                pass
+        tab = norm_tab(r.Tab_Numb)
+        if not tab: continue
+        out.append({"tab": tab, "fio": r.fio or "",
+                    "department": r.department, "dep": r.dep, "dep1": r.dep1,
+                    "dokko": r.dokko})
+    cn.close()
+    return out
 
-def fatal(subject, err):
-    body = f"Хост: {socket.gethostname()}\nСкрипт: {sys.argv[0]}\nDRY_RUN: {DRY_RUN}\n\n{err}"
-    logger.error(f"[FATAL] {subject}\n{body}")
-    send_alert(f"[AD Division Sync] {subject}", body)
-    sys.exit(1)
+def connect_ad(ad_user, ad_pwd):
+    try:
+        srv = Server(AD_SERVER, get_info=ALL)
+        c = Connection(srv, user=ad_user, password=ad_pwd,
+                       authentication="SIMPLE", auto_bind=True)
+        return c
+    except Exception:
+        fatal("Не удалось подключиться к AD", traceback.format_exc())
 
-def cleanup_old_logs():
-    cutoff = time.time() - LOG_RETENTION_DAYS * 86400
-    removed = 0
-    for name in os.listdir(LOG_DIR):
-        if not (name.endswith(".log") or name.endswith(".csv")):
+def load_ad_users(conn):
+    flt = ("(&(objectClass=user)(objectCategory=person)(wWWHomePage=*)"
+           "(!(sAMAccountName=z-*))(!(sAMAccountName=a-*))(!(sAMAccountName=s-*))"
+           "(!(employeeType=vendor))(!(employeeType=service)))")
+    attrs = ["sAMAccountName", "distinguishedName", "division",
+             "wWWHomePage", "userAccountControl",
+             "physicalDeliveryOfficeName", "streetAddress"]
+    index = {}
+    disabled_index = {}
+    total = 0
+    skipped_disabled_ou = 0
+    for entry in conn.extend.standard.paged_search(
+            search_base=AD_BASE_DN, search_filter=flt,
+            search_scope=SUBTREE, attributes=attrs,
+            paged_size=500, generator=True):
+        if entry.get("type") != "searchResEntry":
             continue
-        full = os.path.join(LOG_DIR, name)
+        a = entry["attributes"]
+        dn = entry["dn"]
+        uac = a.get("userAccountControl") or 0
         try:
+            uac = int(uac)
+        except (TypeError, ValueError):
+            uac = 0
+        is_disabled = bool(uac & UAC_DISABLED)
+
+        tab = norm_tab(a.get("wWWHomePage"))
+        if not tab:
+            continue
+
+        if is_disabled and any(m in dn.lower() for m in EXCLUDED_OU_MARKERS):
+            skipped_disabled_ou += 1
+            disabled_index.setdefault(tab, []).append(a.get("sAMAccountName") or "")
+            continue
+
+        index.setdefault(tab, []).append({
+            "sam": a.get("sAMAccountName") or "",
+            "dn":  dn,
+            "division": a.get("division") or "",
+            "disabled": is_disabled,
+            "office": a.get("physicalDeliveryOfficeName") or "",
+            "street": a.get("streetAddress") or "",
+        })
+        total += 1
+        if total % 1000 == 0:
+            logger.info(f"  AD загружено: {total}")
+    logger.info(f"  AD итого записей: {total}, уникальных табельников: {len(index)}, "
+                f"пропущено отключенных в спец-OU: {skipped_disabled_ou}")
