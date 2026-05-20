@@ -1,81 +1,244 @@
-private void InsertDB(string login, string phone, string description, int passexp, string Org, string mail, string keyword)
-        {
-            System.Data.DataTable table = new System.Data.DataTable();
-            bool update = false;
-            int kol = 0;
-            string connectionstring = @"Data Source=XDPASS;Initial Catalog=CitrixRemoteAuthentication;User Id=Citrix;Password=P@ssw0rd1;";
-            using (SqlConnection ConnectToUsers = new SqlConnection(@connectionstring))
-            {
-                try
-                {
-                    ConnectToUsers.Open();
-                }
-                catch (Exception ex)
-                {
-                    LogWrite(ex.Message + ex.StackTrace);
-                }
-                try
-                {
-                    using (SqlDataAdapter adapter = new SqlDataAdapter("select * from dbo.Users where Login  = '" + login + "'", ConnectToUsers))
-                    {
-                        adapter.Fill(table);
-                        if (table.Rows.Count > 0)
-                        {
-                            update = true;
-                            LogWrite("Учетная запись уже есть в базе. Обновляем." + login);
-                        }
-                    }
+# ad_division_zabbix_discovery.py
+import os, sys, json, socket
+from datetime import datetime
+from collections import Counter
+import pyodbc
+from openpyxl import load_workbook
+from cryptography.fernet import Fernet
 
-                }
-                catch (Exception ex)
-                {
-                    LogWrite(ex.Message + ex.StackTrace);
-                }
-                if (!update)
-                {
-                    try
-                    {
-                        using (SqlCommand SqlCmd2 = new SqlCommand())
-                        {
-                            SqlCmd2.Connection = ConnectToUsers;
-                            SqlCmd2.CommandText = "insert into dbo.Users (Login, Phone, Description, PasswordExpirationInMinutes,Org,email,Keyword) VALUES ( @Login, @phone, @description, @passexp, @Org, @mail, @keyword)";
-                            SqlCmd2.Parameters.AddWithValue("@Login", login.Replace(" ", ""));
-                            SqlCmd2.Parameters.AddWithValue("@phone", phone);
-                            SqlCmd2.Parameters.AddWithValue("@description", description);
-                            SqlCmd2.Parameters.AddWithValue("@passexp", passexp);
-                            SqlCmd2.Parameters.AddWithValue("@Org", Org);
-                            SqlCmd2.Parameters.AddWithValue("@mail", mail);
-                            SqlCmd2.Parameters.AddWithValue("@keyword", keyword);
-                            kol = SqlCmd2.ExecuteNonQuery();
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        LogWrite(ex.Message + ex.StackTrace);
-                    }
-                }
-                else
-                {
-                    try
-                    {
-                        using (SqlCommand SqlCmd3 = new SqlCommand())
-                        {
-                            SqlCmd3.Connection = ConnectToUsers;
-                            SqlCmd3.CommandText = "update dbo.Users set Phone=@phone, Description=@description, PasswordExpirationInMinutes = @passexp,Org = @Org where Login= @Login";
-                            SqlCmd3.Parameters.AddWithValue("@Login", login);
-                            SqlCmd3.Parameters.AddWithValue("@phone", phone);
-                            SqlCmd3.Parameters.AddWithValue("@description", description);
-                            SqlCmd3.Parameters.AddWithValue("@passexp", passexp);
-                            SqlCmd3.Parameters.AddWithValue("@Org", Org);
-                            kol = SqlCmd3.ExecuteNonQuery();
-                        }
+# ========== НАСТРОЙКИ ==========
+BASE_DIR   = r"C:\Scripts\AD_Division_Attr"
+KEYS_DIR   = r"C:\Scripts\AD_Division_Attr\keys"
+KEY_PATH   = os.path.join(KEYS_DIR, "ad_sync.key")
 
-                    }
-                    catch (Exception ex)
-                    {
-                        LogWrite(ex.Message + ex.StackTrace);
-                    }
-                }
+XLSX_PATH  = os.path.join(BASE_DIR, "Справочник.xlsx")
 
-            }
-        }
+# Путь для выходного JSON файла (Zabbix discovery)
+OUTPUT_PATH = r"\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
+
+SQL_SERVER   = "p-knot-db01"
+SQL_DATABASE = "DWDATA_ODS"
+SQL_VIEW     = "IC.v_Empl_info"
+
+SQL_USER_ENC     = ""
+SQL_PASSWORD_ENC = ""
+
+# Специальные блоки
+DEFAULT_BLOCK = "Дополнительные офисы"
+UNKNOWN_BLOCK = "(не указано)"
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def load_secrets():
+    """Загрузка и расшифровка секретов"""
+    if not os.path.exists(KEY_PATH):
+        raise FileNotFoundError(f"Нет ключа шифрования: {KEY_PATH}")
+    with open(KEY_PATH, "rb") as f:
+        fer = Fernet(f.read())
+    
+    def dec(tok):
+        return fer.decrypt(tok.encode("ascii")).decode("utf-8")
+    
+    return dec(SQL_USER_ENC), dec(SQL_PASSWORD_ENC)
+
+def norm_tab(v):
+    """Нормализация табельного номера"""
+    if v is None:
+        return None
+    s = "".join(ch for ch in str(v).strip() if ch.isdigit())
+    if not s:
+        return None
+    return s.zfill(10)
+
+def is_empty(v):
+    """Проверка на пустое значение"""
+    return v is None or not str(v).strip()
+
+def load_dictionary():
+    """Загрузка справочника подразделений из Excel"""
+    if not os.path.exists(XLSX_PATH):
+        raise FileNotFoundError(f"Не найден справочник: {XLSX_PATH}")
+    
+    wb = load_workbook(XLSX_PATH, data_only=True)
+    result = {}
+    
+    for sheet in ("department", "dep", "dep1"):
+        if sheet not in wb.sheetnames:
+            raise ValueError(f"В справочнике нет листа '{sheet}'")
+        
+        ws = wb[sheet]
+        d = {}
+        rows = ws.iter_rows(values_only=True)
+        next(rows, None)  # Пропускаем заголовок
+        
+        for row in rows:
+            if not row or len(row) < 2:
+                continue
+            block, name = row[0], row[1]
+            if name is None or block is None:
+                continue
+            d[str(name).strip().lower()] = str(block).strip()
+        
+        result[sheet] = d
+    
+    return result
+
+def resolve_block(emp, dic):
+    """
+    Определение блока (division) для сотрудника на основе данных из БД.
+    """
+    # Пробуем найти по department, dep, dep1
+    for field in ("department", "dep", "dep1"):
+        v = emp.get(field)
+        if not is_empty(v):
+            block = dic[field].get(str(v).strip().lower())
+            if block:
+                return block
+    
+    # Если есть dokko - назначаем блок по умолчанию
+    if not is_empty(emp.get("dokko")):
+        return DEFAULT_BLOCK
+    
+    # Иначе - неизвестно
+    return UNKNOWN_BLOCK
+
+def fetch_employees(sql_user, sql_pwd):
+    """Получение активных сотрудников из БД"""
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SQL_SERVER};"
+        f"DATABASE={SQL_DATABASE};UID={sql_user};PWD={sql_pwd};"
+    )
+    
+    cn = pyodbc.connect(conn_str, timeout=15)
+    cur = cn.cursor()
+    cur.execute(f"""
+        SELECT Tab_Numb, fio, UvDate, department, dep, dep1, dokko
+        FROM {SQL_DATABASE}.{SQL_VIEW}
+    """)
+    
+    today = datetime.now().date()
+    out = []
+    
+    for r in cur.fetchall():
+        # Проверка на уволенных
+        uv = r.UvDate
+        if uv is not None:
+            try:
+                if uv.date() <= today:
+                    continue
+            except AttributeError:
+                pass
+        
+        # Нормализация табельного номера
+        tab = norm_tab(r.Tab_Numb)
+        if not tab:
+            continue
+        
+        out.append({
+            "tab": tab,
+            "fio": r.fio or "",
+            "department": r.department,
+            "dep": r.dep,
+            "dep1": r.dep1,
+            "dokko": r.dokko
+        })
+    
+    cn.close()
+    return out
+
+def generate_zabbix_json(division_counts, metadata):
+    """Формирование JSON для Zabbix LLD Discovery"""
+    # Массив для discovery
+    discovery = []
+    for division_name in sorted(division_counts.keys()):
+        discovery.append({"{#DIVISION}": division_name})
+    
+    # Итоговый payload
+    payload = {
+        "discovery": discovery,
+        "counts": dict(division_counts),
+        "metadata": metadata
+    }
+    
+    return json.dumps(payload, ensure_ascii=False, indent=4)
+
+# ========== ОСНОВНАЯ ЛОГИКА ==========
+def main():
+    timestart = datetime.now()
+    
+    print(f"=== Zabbix Division Discovery ===")
+    print(f"Host: {socket.gethostname()}")
+    print(f"Start: {timestart.strftime('%d.%m.%Y %H:%M:%S')}")
+    print()
+    
+    # 1. Загрузка секретов
+    print("[1/3] Расшифровка секретов...")
+    sql_user, sql_pwd = load_secrets()
+    
+    # 2. Загрузка справочника
+    print("[2/3] Загрузка справочника подразделений...")
+    dic = load_dictionary()
+    
+    # 3. Получение сотрудников из БД
+    print("[3/3] Получение сотрудников из БД...")
+    employees = fetch_employees(sql_user, sql_pwd)
+    print(f"Получено активных сотрудников: {len(employees)}")
+    print()
+    
+    # Подсчёт по блокам
+    division_counts = Counter()
+    
+    for emp in employees:
+        block = resolve_block(emp, dic)
+        division_counts[block] += 1
+    
+    # Формирование метаданных
+    timeend = datetime.now()
+    duration = (timeend - timestart).total_seconds()
+    
+    metadata = {
+        "TotalActiveUsers": len(employees),
+        "ExcludedUsers": 0,
+        "RealUsers": len(employees),
+        "UniqueDivisions": len(division_counts),
+        "GeneratedAt": timestart.strftime("%d.%m.%Y %H:%M"),
+        "ScriptDurationSec": round(duration, 2)
+    }
+    
+    # Вывод статистики в консоль
+    print("===== СТАТИСТИКА ПО БЛОКАМ =====")
+    for block, count in sorted(division_counts.items(), key=lambda x: (-x[1], x[0])):
+        pct = (count / len(employees) * 100) if len(employees) > 0 else 0
+        print(f"  {block}: {count} ({pct:.1f}%)")
+    
+    print()
+    print(f"Всего сотрудников: {len(employees)}")
+    print(f"Уникальных блоков: {len(division_counts)}")
+    print()
+    
+    # Генерация JSON
+    json_output = generate_zabbix_json(division_counts, metadata)
+    
+    # Сохранение в файл
+    output_dir = os.path.dirname(OUTPUT_PATH)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        f.write(json_output)
+    
+    print(f"JSON сохранён в: {OUTPUT_PATH}")
+    print(f"Время выполнения: {duration:.2f} сек")
+    print("=== DONE ===")
+    
+    # Вывод JSON в stdout (для Zabbix можно перенаправить)
+    print()
+    print(json_output)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
