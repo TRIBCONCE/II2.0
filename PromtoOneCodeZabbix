@@ -56,3 +56,4 @@ $Users1C = Import-Csv -Delimiter ";" -Path $TXT_PATH | Where-Object {
     $_.decret -eq "0" -and $_.date_uv -eq "" 
 } 
 Какое место выдаёт вот такую ошибку - WARNING: One or more headers were not specified. Default names starting with "H" have been used in place of any missing headers. И насколько она критична? 
+в файле есть заголовки вот такие - date_vigr;surname;name;patronymic;dr;tab;date_priem;fil;date_uv;vid_doc;seria_doc;nomer_doc;decret;podr;podr_kod;doldn;sex;;vid_zan;
