@@ -1,515 +1,58 @@
-Смотри не получается у меня пайтон код. По этому идём по другому пути. 
-Вот есть код который считает информацию по пользователям беря инфорамацию из txt файла отсюда эту логику и берём. 
-# =========================================================================================================================
-# Раздел 1: Инициализация и фиксация времени
-# =========================================================================================================================
-
-# Очищаем экран консоли для удобства, если скрипт запускается вручную.
 cls
 
-# Фиксируем текущее время начала работы скрипта. Это нужно для подсчета общего времени выполнения в конце.
-$timestart = Get-Date
-
-# Формируем строку с текущей датой в формате ДД.ММ.ГГГГ (например, 12.05.2026).
-$today = Get-Date -Format dd.MM.yyyy
-
-# Формируем строку с датой и временем начала выполнения для записи в итоговый JSON-отчет.
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
-
-# Вычисляем начало и конец предыдущего дня. Это нужно для поиска объектов, созданных "вчера".
-# $lastday: Дата вчерашнего дня с временем 00:00:00.
-$lastday = (Get-Date).AddDays(-1).Date
-# $lastdayStart: Начало вчерашнего дня (аналогично $lastday).
-$lastdayStart = $lastday
-# $lastdayStop: Конец вчерашнего дня (23:59:59).
-$lastdayStop = $lastday + "23:59:59"
-
-# =========================================================================================================================
-# Раздел 2: Сбор данных из Active Directory
-# =========================================================================================================================
-
-# 2.1 Объекты
-# Получаем вообще все объекты AD (пользователи, компьютеры, группы, контакты и т.д.).
-$AllObjects = Get-ADObject -Filter *
-
-# 2.2 Пользователи
-# Получаем всех пользователей AD, сразу запрашивая дополнительные свойства: дату создания, веб-страницу (таб. номер) и ID сотрудника.
-$AllUsers = Get-ADUser -Filter * -Properties whencreated, wWWHomePage, employeeID
-
-# --- Фильтрация пользователей ---
-# Активные (включенные) пользователи.
-$AllUsersOn = $AllUsers | Where-Object { $_.enabled -eq $true }
-
-# Из активных выделяем сервисные учетные записи по маске имени входа (s-*, sl-*, *test* и т.д.) или по имени "Сервисная*".
-$AllUsersOnS = $AllUsersOn | Where-Object {
-    $_.samaccountname -like "s-*" -or $_.samaccountname -like "sl-*" -or
-    $_.samaccountname -like "*test*" -or $_.samaccountname -like "Health*" -or
-    $_.samaccountname -like "room*" -or $_.samaccountname -like "sp-*" -or
-    $_.samaccountname -like "st-*" -or $_.samaccountname -like "audit*" -or
-    $_.samaccountname -like "temp*" -or $_.samaccountname -like "esas*" -or
-    $_.name -like "Сервисная*"
-}
-
-# Административные учетные записи с префиксом "a-".
-$AllUsersOnA = $AllUsersOn | Where-Object { $_.samaccountname -like "a-*" }
-
-# Административные записи с префиксом "z-" (возможно, для администраторов ИБ).
-$AllUsersOnZ = $AllUsersOn | Where-Object { $_.samaccountname -like "z-*" }
-
-# Пользователи-вендоры (сторонние). Их OU содержит слово "сторон".
-$AllUsersOnU = $AllUsersOn | Where-Object { $_.DistinguishedName -like "*сторон*" }
-
-# --- Поиск "проблемных" пользователей (аудит) ---
-
-# Пользователи, у которых поле "Веб-страница" (wWWHomePage, используется как табельный номер) не совпадает с "ID сотрудника" (employeeID).
-$AllUsersOnErrorTN = $AllUsersOn | Where-Object { $_.wWWHomePage -ne $_.employeeID }
-
-# Активные пользователи, у которых есть табельный номер (wWWHomePage не пусто) и имя оканчивается на "_" (вероятно, признак уволенного, но не отключенного).
-$AllUsersOnErrorDN = $AllUsersOn | Where-Object { $_.wWWHomePage -like "*" -and $_.Name -like "*_" }
-
-# Активные пользователи, которые находятся в OU "Отключенные" (или "Уволенные сотрудники"). Критическая ошибка аудита.
-$AllUsersOnErrorOU = $AllUsersOn | Where-Object { $_.DistinguishedName -like "*Отключенные*" }
-
-# Активные пользователи, в имени которых есть цифры, но которые не являются сервисными (исключаем те же маски, что для сервисных).
-# Примечание: Логика "Сервисная*" в этом фильтре выглядит странно (используется -like без отрицания в родительском условии).
-$AllUsersOnErrorNum = $AllUsersOn | Where-Object {
-    $_.name -match '\d' -and
-    (
-        $_.samaccountname -notlike "s-*" -and $_.samaccountname -notlike "sl-*" -and
-        $_.samaccountname -notlike "*test*" -and $_.samaccountname -notlike "room*" -and
-        $_.samaccountname -notlike "Health*" -and $_.samaccountname -notlike "sp-*" -and
-        $_.samaccountname -notlike "st-*" -and $_.samaccountname -notlike "audit*" -and
-        $_.samaccountname -notlike "temp*" -and $_.samaccountname -notlike "esas*" -and
-        $_.name -like "Сервисная*"
-    )
-}
-
-# Новые пользователи, созданные за вчерашний день, исключая административные (z-*) и сервисные (s-*, sl-*, *test*).
-$AllUsersNewU = $AllUsersOn | Where-Object {
-    $_.whencreated -ge $lastdayStart -and $_.whencreated -le $lastdayStop -and
-    $_.SamAccountName -notlike 'z-*' -and $_.SamAccountName -notlike 's-*' -and
-    $_.SamAccountName -notlike '*test*' -and $_.SamAccountName -notlike 'sl-*'
-}
-
-# 2.3 Группы
-# Получаем все группы AD вместе с их членами (Members).
-$AllGroup = Get-ADGroup -Filter * -Properties Members
-# Находим пустые группы (без членов).
-$GroupEmpty = $AllGroup | Where-Object { $_.members.Count -eq 0 }
-
-# 2.4 Компьютеры
-# Получаем все компьютеры с их ОС и датой создания.
-$AllComputers = Get-ADComputer -Filter * -Properties operatingSystem, whenCreated
-
-# Активные (включенные) компьютеры.
-$ComputersOn = $AllComputers | Where-Object { $_.enabled -eq $true }
-
-# --- Распределение компьютеров по типу ОС ---
-$ComputersOnWSrv = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server*" }
-$ComputersOnWSrv2019 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server 2019*" }
-$ComputersOnWSrv2016 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server 2016*" }
-$ComputersOnWSrv2012 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server 2012*" }
-$ComputersOnWSrv2008 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows Server 2008*" }
-$ComputersOnW11 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows 11*" }
-$ComputersOnW10 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows 10*" }
-$ComputersOnW8 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows 8*" }
-$ComputersOnW7 = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows 7*" }
-$ComputersOnWXP = $ComputersOn | Where-Object { $_.operatingSystem -like "Windows XP*" }
-
-# --- Распределение по географическим/функциональным площадкам (филиалам) ---
-# Исключаем серверы из выборок по локациям, проверяя, что в ОС нет "Windows Server".
-$ComputersOnURM = $ComputersOn | Where-Object { $_.samaccountname -like "URM-*" -and $_.operatingSystem -notlike "Windows Server*" }
-$ComputersOnMRM = $ComputersOn | Where-Object { $_.samaccountname -like "MRM-*" -and $_.operatingSystem -notlike "Windows Server*" }
-$ComputersOnKOV = $ComputersOn | Where-Object { $_.samaccountname -like "kov*" -and $_.operatingSystem -notlike "Windows Server*" }
-$ComputersOnSUO = $ComputersOn | Where-Object { $_.samaccountname -like "suo*" -and $_.operatingSystem -notlike "Windows Server*" }
-$ComputersOnGO = $ComputersOn | Where-Object { $_.samaccountname -like "GO-*" -and $_.operatingSystem -notlike "Windows Server*" }
-
-# Компьютеры региональной сети (Филиалы: AL, AR, BA и т.д.).
-$ComputersOnFIL = $ComputersOn | Where-Object {
-    $_.operatingSystem -notlike "Windows Server*" -and
-    (
-        $_.samaccountname -like "AL-*" -or $_.samaccountname -like "AR-*" -or
-        $_.samaccountname -like "BA-*" -or $_.samaccountname -like "EK-*" -or
-        # ... и так далее по всем маскам филиалов ...
-        $_.samaccountname -like "MS-*" -or $_.samaccountname -like "CR-*"
-    )
-}
-
-# Новые рабочие станции (не серверы), созданные за вчерашний день.
-$ComputersOnNew = $ComputersOn | Where-Object {
-    $_.operatingSystem -like "Windows*" -and
-    $_.operatingSystem -notlike "Windows Server*" -and
-    $_.whencreated -ge $lastdayStart -and
-    $_.whencreated -le $lastdayStop
-}
-
-# =========================================================================================================================
-# Раздел 3: Сбор и обработка данных из 1С
-# =========================================================================================================================
-
-# Читаем CSV-файл выгрузки из 1С (разделитель ";"). Файл находится на сетевом ресурсе.
-# Берем только тех, кто не в декрете (decret == "0") и не уволен (date_uv пустая).
-$Users1C = Import-Csv -Delimiter ";" -Path "\\abb-win.akbars.ru\departments\AppDS\1CKadryIntegration\Список.txt" |
-    Where-Object { $_.decret -eq "0" -and $_.date_uv -eq "" }
-
-# Разделяем всех активных сотрудников по типу занятости.
-$Users1Comr = $Users1C | Where-Object { $_.vid_zan -eq "Основное место работы" }     # Основные сотрудники
-$Users1Cins = $Users1C | Where-Object { $_.vid_zan -eq "Внешнее совместительство" }   # Внешние совместители
-$Users1Couts = $Users1C | Where-Object { $_.vid_zan -eq "Внутреннее совместительство" } # Внутренние совместители
-
-# Отдельно получаем сотрудников в декрете (decret == "1") и не уволенных.
-$Users1Cdecret = Import-Csv -Delimiter ";" -Path "\\abb-win.akbars.ru\departments\AppDS\1CKadryIntegration\Список.txt" |
-    Where-Object { $_.decret -eq "1" -and $_.date_uv -eq "" }
-
-# =========================================================================================================================
-# Раздел 4: Формирование итогового JSON-объекта
-# =========================================================================================================================
-
-# Собираем все полученные количества в единый хэш-таблицу (словарь) для дальнейшей конвертации в JSON.
-$ADData = @{
-    # Данные из 1С
-    Users1Comr               = ($Users1Comr | Measure-Object).count
-    Users1Cins               = ($Users1Cins | Measure-Object).count
-    Users1Couts              = ($Users1Couts | Measure-Object).count
-    Users1Cdecret            = ($Users1Cdecret | Measure-Object).count
-
-    # Статистика по AD
-    AllObjects               = ($AllObjects | Measure-Object).count
-    AllUsers                 = ($AllUsers | Measure-Object).count
-    AllUsersOn               = ($AllUsersOn | Measure-Object).count
-    AllUsersOnS              = ($AllUsersOnS | Measure-Object).count
-    AllUsersOnA              = ($AllUsersOnA | Measure-Object).count
-    AllUsersOnZ              = ($AllUsersOnZ | Measure-Object).count
-    AllUsersOnU              = ($AllUsersOnU | Measure-Object).count
-    AllUsersNewU             = ($AllUsersNewU | Measure-Object).Count
-    AllUsersOnErrorNum       = ($AllUsersOnErrorNum | Measure-Object).Count
-    AllUsersOnErrorOU        = ($AllUsersOnErrorOU | Measure-Object).count
-    AllUsersOnErrorDN        = ($AllUsersOnErrorDN | Measure-Object).Count
-    AllUsersOnErrorTN        = ($AllUsersOnErrorTN | Measure-Object).Count
-    AllGroup                 = ($AllGroup | Measure-Object).count
-    GroupEmpty               = ($GroupEmpty | Measure-Object).count
-    AllComputers             = ($AllComputers | Measure-Object).count
-    ComputersOn              = ($ComputersOn | Measure-Object).count
-    ComputersOnWSrv          = ($ComputersOnWSrv | Measure-Object).count
-    ComputersOnWSrv2019      = ($ComputersOnWSrv2019 | Measure-Object).count
-    ComputersOnWSrv2016      = ($ComputersOnWSrv2016 | Measure-Object).count
-    ComputersOnWSrv2012      = ($ComputersOnWSrv2012 | Measure-Object).count
-    ComputersOnWSrv2008      = ($ComputersOnWSrv2008 | Measure-Object).count
-    ComputersOnW11           = ($ComputersOnW11 | Measure-Object).count
-    ComputersOnW10           = ($ComputersOnW10 | Measure-Object).count
-    ComputersOnW8            = ($ComputersOnW8 | Measure-Object).count
-    ComputersOnW7            = ($ComputersOnW7 | Measure-Object).count
-    ComputersOnWXP           = ($ComputersOnWXP | Measure-Object).count
-    ComputersOnURM           = ($ComputersOnURM | Measure-Object).count
-    ComputersOnMRM           = ($ComputersOnMRM | Measure-Object).count
-    ComputersOnSUO           = ($ComputersOnSUO | Measure-Object).count
-    ComputersOnKOV           = ($ComputersOnKOV | Measure-Object).count
-    ComputersOnFIL           = ($ComputersOnFIL | Measure-Object).count
-    ComputersOnGO            = ($ComputersOnGO | Measure-Object).count
-    ComputersOnNew           = ($ComputersOnNew | Measure-Object).count
-
-    # Время запуска скрипта для отчета
-    Timestart                = $time
-}
-
-# Конвертируем хэш-таблицу с данными в формат JSON.
-$JSONdata = $ADData | ConvertTo-Json
-
-# Записываем JSON в файл. Этот файл, судя по пути, будет читать Zabbix Agent для отправки метрик на сервер мониторинга.
-$JSONdata | Out-File -FilePath "C:\Program Files\Zabbix Agent\scripts\AD\ADData.txt" -Encoding default
-
-# Альтернатива для отладки: вывод JSON напрямую в консоль. Закомментировано в рабочей версии.
-# Write-Output $JSONdata
-
-# =========================================================================================================================
-# Раздел 5: Подсчет времени выполнения скрипта и вывод в консоль
-# =========================================================================================================================
-
-# Фиксируем время завершения работы.
-$timestop = Get-Date
-
-# Вычисляем разницу во времени между стартом и финишем.
-$TimeSum = $timestop - $timestart
-
-# Извлекаем часы, минуты, секунды из полученной разницы для удобочитаемого вывода.
-$TimeSumH = $TimeSum.Hours
-$TimeSumM = $TimeSum.Minutes
-$TimeSumS = $TimeSum.Seconds
-
-# Выводим сообщение о времени выполнения в консоль.
-Write-Host "Время формирования отчета составило: " $TimeSumH "ч " $TimeSumM "м " $TimeSumS "с" 
-
-теперь нам надо сослаться на файл "\\p-rpait-syn01\c$\Scripts\AD_Division_Attr\Справочник.xlsx" 
-и проверку подразделений в которыйх будет проверяться к которому блоку они относятся взять из скрипта пайтон 
-def load_dictionary():
-    if not os.path.exists(XLSX_PATH):
-        raise FileNotFoundError(f"Не найден справочник: {XLSX_PATH}")
-    wb = load_workbook(XLSX_PATH, data_only=True)
-    result = {}
-    for sheet in ("department", "dep", "dep1"):
-        if sheet not in wb.sheetnames:
-            raise ValueError(f"В справочнике нет листа '{sheet}'")
-        ws = wb[sheet]
-        d = {}
-        rows = ws.iter_rows(values_only=True)
-        next(rows, None)
-        for row in rows:
-            if not row or len(row) < 2: continue
-            block, name = row[0], row[1]
-            if name is None or block is None: continue
-            d[str(name).strip().lower()] = str(block).strip()
-        result[sheet] = d
-    return result
-
-def resolve_block(emp, dic):
-    for field in ("department", "dep", "dep1"):
-        v = emp.get(field)
-        if not is_empty(v):
-            block = dic[field].get(str(v).strip().lower())
-            if block:
-                return block, f"matched_{field}", "update"
-            else:
-                return None, f"unknown_{field}:{v}", "unknown"
-    if not is_empty(emp.get("dokko")):
-        return DEFAULT_BLOCK, "default_by_dokko", "update"
-    return UNKNOWN_BLOCK, "no_data_no_dokko", "stats"
-
-def fetch_employees(sql_user, sql_pwd):
-    conn_str = (f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SQL_SERVER};"
-                f"DATABASE={SQL_DATABASE};UID={sql_user};PWD={sql_pwd};")
-    try:
-        cn = pyodbc.connect(conn_str, timeout=15)
-    except Exception:
-        fatal("Недоступна БД DWDATA_ODS", traceback.format_exc())
-    cur = cn.cursor()
-    cur.execute(f"""
-        SELECT Tab_Numb, fio, UvDate, department, dep, dep1, dokko
-        FROM {SQL_DATABASE}.{SQL_VIEW}
-    """)
-    today = datetime.now().date()
-    out = []
-    for r in cur.fetchall():
-        uv = r.UvDate
-        if uv is not None:
-            try:
-                if uv.date() <= today: continue
-            except AttributeError:
-                pass
-        tab = norm_tab(r.Tab_Numb)
-        if not tab: continue
-        out.append({"tab": tab, "fio": r.fio or "",
-                    "department": r.department, "dep": r.dep, "dep1": r.dep1,
-                    "dokko": r.dokko})
-    cn.close()
-    return out
-и нужно провести подсчёт пользователей как это было вот в этом скрипте 
-cls
-
-# Фиксация времени
 $timestart = Get-Date
 $today = Get-Date -Format dd.MM.yyyy
 $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
 
-$AllUsersOn = Get-ADUser -Filter { enabled -eq $true } -Properties division, samaccountname, DistinguishedName, name
+$TXT_PATH   = "\\abb-win.akbars.ru\departments\AppDS\1CKadryIntegration\Список.txt"
+$XLSX_PATH  = "\\p-rpait-syn01\c$\Scripts\AD_Division_Attr\Справочник.xlsx"
+$OUTPUT_PATH = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery 1C.txt"
 
-# Хэш-таблица для подсчёта пользователей по division
-$DivisionCount = @{}
 
-# Счётчик исключённых
-$ExcludedCount = 0
+$DEFAULT_BLOCK = "Дополнительные офисы"
+$UNKNOWN_BLOCK = "(не указано)"
 
-foreach ($User in $AllUsersOn) {
-    $sam = $User.samaccountname
-    $name = $User.name
-    $dn  = $User.DistinguishedName
+# Write-Host "=== Загрузка справочника из Excel ===" -ForegroundColor Green
 
-    # Исключаем сервисные, административные и вендорские учётки
-    if (
-        $sam -like "s-*" -or $sam -like "sl-*" -or
-        $sam -like "*test*" -or $sam -like "Health*" -or
-        $sam -like "room*" -or $sam -like "sp-*" -or
-        $sam -like "st-*" -or $sam -like "audit*" -or
-        $sam -like "temp*" -or $sam -like "esas*" -or
-        $name -like "Сервисная*" -or
-        $sam -like "a-*" -or 
-        $sam -like "z-*" -or
-        $name -like "*`$*" -or
-        $name -like "*sadmin*" -or
-        $name -like "*Администратор*" -or
-        $name -like "Оператор" -or
-        $name -like "*СУЗ*" -or
-        $name -like "*Тестовая*" -or
-        $dn -like "*Сервисные учетные записи*" -or
-        $dn -like "*Отключенные пользователи*" -or
-        $dn -like "*сторон*"
-    ) {
-        $ExcludedCount++
-        continue
-    }
 
-    # Считаем по division
-    $div = $User.division
-    if ($div) {
-        if ($DivisionCount.ContainsKey($div)) {
-            $DivisionCount[$div]++
-        } else {
-            $DivisionCount[$div] = 1
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+
+try {
+    $workbook = $excel.Workbooks.Open($XLSX_PATH)
+    
+    $dict = @{}
+    
+    foreach ($sheetName in @("department", "dep", "dep1")) {
+        $worksheet = $workbook.Worksheets.Item($sheetName)
+        $sheetDict = @{}
+        
+        $row = 2
+        while ($worksheet.Cells.Item($row, 1).Text -ne "") {
+            $block = $worksheet.Cells.Item($row, 1).Text.Trim()
+            $name  = $worksheet.Cells.Item($row, 2).Text.Trim()
+            
+            if ($block -and $name) {
+                $sheetDict[$name.ToLower()] = $block
+            }
+            $row++
         }
-    } else {
-        $emptyKey = "(не указано)"
-        if ($DivisionCount.ContainsKey($emptyKey)) {
-            $DivisionCount[$emptyKey]++
-        } else {
-            $DivisionCount[$emptyKey] = 1
-        }
+        
+        $dict[$sheetName] = $sheetDict
+        #Write-Host "  Загружен лист '$sheetName': $($sheetDict.Count) записей"
     }
+    
+    $workbook.Close($false)
+} finally {
+    $excel.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
 }
 
-# Формирование discovery-данных для Zabbix LLD
+#Write-Host "`n=== Загрузка данных из 1С ===" -ForegroundColor Green
 
-# Массив объектов для LLD — каждый division становится макросом {#DIVISION}
-$discovery = foreach ($k in $DivisionCount.Keys) {
-    @{ '{#DIVISION}' = $k }
-}
-
-# Итоговый payload: discovery (для Zabbix) + counts (для информации/отладки)
-$payload = [ordered]@{
-    discovery = @($discovery)
-    counts    = $DivisionCount
-    metadata  = @{
-        TotalActiveUsers  = $AllUsersOn.Count
-        ExcludedUsers     = $ExcludedCount
-        RealUsers         = ($DivisionCount.Values | Measure-Object -Sum).Sum
-        UniqueDivisions   = $DivisionCount.Count
-        GeneratedAt       = $time
-        ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
-    }
-}
-
-# Конвертация в JSON
-$json = $payload | ConvertTo-Json -Depth 4
-
-
-
-$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
-#$json | Out-File -FilePath $outputPath -Encoding default
-[System.IO.File]::WriteAllText($outputPath,$json, [System.Text.UTF8Encoding]::new($false))
-# =========================================================================================================================
-# Вывод статистики в консоль
-# =========================================================================================================================
-
-$RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
-
-Write-Host "`n=== Статистика по подразделениям (division) — LLD Discovery ===" -ForegroundColor Green
-Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
-
-$DivisionCount.GetEnumerator() | 
-    Sort-Object Value -Descending | 
-    Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50}, 
-                 @{Label="Кол-во"; Expression={$_.Value}; Width=10}, 
-                 @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
-
-Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
-Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
-Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
-
-$timestop = Get-Date
-$TimeSum = $timestop - $timestart
-Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
-Write-Host "Файл сохранён: $outputPath" -ForegroundColor Green
-смотри какие атрибуты в txt список - date_vigr;surname;name;patronymic;dr;tab;date_priem;fil;date_uv;vid_doc;seria_doc;nomer_doc;decret;podr;podr_kod;doldn;sex;;vid_zan; 
-podr выглядит примерно вот так - Головной Офис%Управление по работе с проблемными активами юридических лиц%Отдел взыскания по корпоративной модели сбора 
-а в справочнике распределение вот такое - Block	Department Блок Проблемные активы	Управление по работе с проблемными активами юридических лиц
-надо это учитывать. 
-итоговый вывод дожен быть таким 
-{
-    "discovery":  [
-                      {
-                          "{#DIVISION}":  "Аппарат правления"
-                      },
-                      {
-                          "{#DIVISION}":  "Департамент безопасности"
-                      },
-                      {
-                          "{#DIVISION}":  "Информационно-технологический блок"
-                      },
-                      {
-                          "{#DIVISION}":  "Операционный блок"
-                      },
-                      {
-                          "{#DIVISION}":  "Блок Риски"
-                      },
-                      {
-                          "{#DIVISION}":  "Блок информационной безопасности"
-                      },
-                      {
-                          "{#DIVISION}":  "Административно-хозяйственный блок"
-                      },
-                      {
-                          "{#DIVISION}":  "Розничный блок"
-                      },
-                      {
-                          "{#DIVISION}":  "Дирекция правового сопровождения"
-                      },
-                      {
-                          "{#DIVISION}":  "Дополнительные офисы"
-                      },
-                      {
-                          "{#DIVISION}":  "Блок стратегического управления"
-                      },
-                      {
-                          "{#DIVISION}":  "Блок Проблемные активы"
-                      },
-                      {
-                          "{#DIVISION}":  "Служба внутреннего контроля"
-                      },
-                      {
-                          "{#DIVISION}":  "HR-блок"
-                      },
-                      {
-                          "{#DIVISION}":  "Корпоративный блок"
-                      },
-                      {
-                          "{#DIVISION}":  "(не указано)"
-                      },
-                      {
-                          "{#DIVISION}":  "Финансовый блок"
-                      },
-                      {
-                          "{#DIVISION}":  "Департамент внутреннего аудита"
-                      },
-                      {
-                          "{#DIVISION}":  "Инвестиционный блок"
-                      }
-                  ],
-    "counts":  {
-                   "Аппарат правления":  30,
-                   "Департамент безопасности":  107,
-                   "Информационно-технологический блок":  976,
-                   "Операционный блок":  615,
-                   "Блок Риски":  304,
-                   "Блок информационной безопасности":  77,
-                   "Административно-хозяйственный блок":  140,
-                   "Розничный блок":  554,
-                   "Дирекция правового сопровождения":  80,
-                   "Дополнительные офисы":  1286,
-                   "Блок стратегического управления":  67,
-                   "Блок Проблемные активы":  23,
-                   "Служба внутреннего контроля":  54,
-                   "HR-блок":  96,
-                   "Корпоративный блок":  544,
-                   "(не указано)":  2,
-                   "Финансовый блок":  161,
-                   "Департамент внутреннего аудита":  30,
-                   "Инвестиционный блок":  65
-               },
-    "metadata":  {
-                     "ExcludedUsers":  1933,
-                     "TotalActiveUsers":  7144,
-                     "GeneratedAt":  "19.05.2026 12:45",
-                     "RealUsers":  5211,
-                     "UniqueDivisions":  19,
-                     "ScriptDurationSec":  14.17
-                 }
-}
+$Users1C = Import-Csv -Delimiter ";" -Path $TXT_PATH | Where-Object { 
+    $_.decret -eq "0" -and $_.date_uv -eq "" 
+} 
+Какое место выдаёт вот такую ошибку - WARNING: One or more headers were not specified. Default names starting with "H" have been used in place of any missing headers. И насколько она критична? 
