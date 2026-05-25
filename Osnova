@@ -1,167 +1,242 @@
-cls
+import tkinter as tk
+from tkinter import scrolledtext
+import subprocess
+import tkinter.messagebox
 
-# ========== Фиксация времени ==========
-$timestart = Get-Date
-$today = Get-Date -Format dd.MM.yyyy
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+def add_path():
+    """Добавляет путь из поля ввода в список"""
+    path = entry.get().strip()
+    if path:
+        listbox.insert(tk.END, path)
+        entry.delete(0, tk.END)
+    else:
+        tk.messagebox.showwarning("Предупреждение", "Введите путь перед добавлением")
 
-# ========== Пути к файлам ==========
-$TXT_PATH   = "\\abb-win.akbars.ru\departments\AppDS\1CKadryIntegration\Список.txt"
-$XLSX_PATH  = "\\p-rpait-syn01\c$\Scripts\AD_Division_Attr\Справочник.xlsx"
-$OUTPUT_PATH = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
+def remove_path():
+    """Удаляет выбранный путь из списка"""
+    selected = listbox.curselection()
+    if selected:
+        listbox.delete(selected)
 
-# ========== Специальные блоки ==========
-$DEFAULT_BLOCK = "Дополнительные офисы"
-$UNKNOWN_BLOCK = "(не указано)"
+def clear_paths():
+    """Очищает весь список путей"""
+    listbox.delete(0, tk.END)
 
-Write-Host "=== Загрузка справочника из Excel ===" -ForegroundColor Green
-
-# Создаём Excel COM объект для чтения XLSX
-$excel = New-Object -ComObject Excel.Application
-$excel.Visible = $false
-$excel.DisplayAlerts = $false
-
-try {
-    $workbook = $excel.Workbooks.Open($XLSX_PATH)
+def run_script():
+    """Выполняет проверку для всех путей в списке"""
+    paths = list(listbox.get(0, tk.END))
+    if not paths:
+        text_area.delete(1.0, tk.END)
+        text_area.insert(1.0, "Ошибка: Добавьте хотя бы один путь к папке")
+        return
     
-    # Загружаем все три листа справочника
-    $dict = @{}
+    text_area.delete(1.0, tk.END)
+    text_area.insert(1.0, "Выполнение скрипта...\n\n")
+    root.update()
     
-    foreach ($sheetName in @("department", "dep", "dep1")) {
-        $worksheet = $workbook.Worksheets.Item($sheetName)
-        $sheetDict = @{}
+    # Формируем массив путей для PowerShell
+    paths_array = '@("' + '", "'.join(paths) + '")'
+    
+    # PowerShell скрипт с новыми правилами фильтрации
+    ps_script = f"""
+$pathArray = {paths_array}
+
+foreach ($pat in $pathArray)
+{{
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host " Путь: $pat " -ForegroundColor Yellow
+    Write-Host "========================================" -ForegroundColor Cyan
+    
+    try
+    {{
+        $accessRules = (Get-Acl -Path $pat).Access
+    }}
+    catch
+    {{
+        Write-Warning "Не удалось получить ACL для пути: $pat"
+        continue
+    }}
+
+    # Фильтруем только нужные группы
+    $filteredRules = @()
+    
+    foreach ($rule in $accessRules)
+    {{
+        $identity = $rule.IdentityReference.Value
+        $name = $identity.Split('\\')[-1]
         
-        # Начинаем со 2-й строки (пропускаем заголовок)
-        $row = 2
-        while ($worksheet.Cells.Item($row, 1).Text -ne "") {
-            $block = $worksheet.Cells.Item($row, 1).Text.Trim()
-            $name  = $worksheet.Cells.Item($row, 2).Text.Trim()
-            
-            if ($block -and $name) {
-                $sheetDict[$name.ToLower()] = $block
-            }
-            $row++
-        }
+        # Правила исключения
+        $exclude = $false
         
-        $dict[$sheetName] = $sheetDict
-        Write-Host "  Загружен лист '$sheetName': $($sheetDict.Count) записей"
-    }
-    
-    $workbook.Close($false)
-} finally {
-    $excel.Quit()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-}
-
-# ========== Загрузка данных из TXT (1С) ==========
-Write-Host "`n=== Загрузка данных из 1С ===" -ForegroundColor Green
-
-$Users1C = Import-Csv -Delimiter ";" -Path $TXT_PATH | Where-Object { 
-    $_.decret -eq "0" -and $_.date_uv -eq "" 
-}
-
-Write-Host "Загружено активных сотрудников: $($Users1C.Count)"
-
-# ========== Функция определения блока ==========
-function Resolve-Block {
-    param($Employee, $Dictionary)
-    
-    # Поле podr содержит вложенность через %
-    $podr = $Employee.podr
-    if (-not [string]::IsNullOrWhiteSpace($podr)) {
-        $parts = $podr -split '%' | ForEach-Object { $_.Trim() }
+        # Исключаем стандартные системные группы
+        if ($name -eq "SYSTEM" -or 
+            $name -eq "Administrators" -or 
+            $name -eq "Users" -or
+            $name -eq "CREATOR OWNER" -or
+            $name -like "BUILTIN*" -or
+            $name -like "NT AUTHORITY*" -or
+            $name -like "NT SERVICE*" -or
+            $name -like "SERVICE*" -or
+            $name -like "Все*" -or
+            $name -like "Все*" -or
+            $name -like "Everyone*")
+        {{
+            $exclude = $true
+        }}
         
-        # Проверяем каждую часть пути во всех словарях
-        foreach ($part in $parts) {
-            if (-not $part) { continue }
-            
-            foreach ($sheet in @("department", "dep", "dep1")) {
-                $block = $Dictionary[$sheet][$part.ToLower()]
-                if ($block) {
-                    return $block
-                }
-            }
-        }
-    }
+        # Исключаем группы с SID (S-1-5-...)
+        if ($name -match "^S-1-5-")
+        {{
+            $exclude = $true
+        }}
+        
+        # Исключаем группы, начинающиеся с z- или s- (регистронезависимо)
+        if ($name -match "^(z-|s-)")
+        {{
+            $exclude = $true
+        }}
+        
+        # Исключаем "ДОСТУП ДЛЯ ЧТЕНИЯ КО ВСЕМУ ДИСКУ"
+        if ($name -like "*ДОСТУП*ЧТЕНИЯ*ДИСКУ*" -or 
+            $name -like "*READ*ACCESS*DISK*")
+        {{
+            $exclude = $true
+        }}
+        
+        # Исключаем "FSDPT ALL SpecFolders Read"
+        if ($name -like "*SpecFolders*")
+        {{
+            $exclude = $true
+        }}
+        
+        # Если группа не попала в исключения - добавляем
+        if (-not $exclude)
+        {{
+            $filteredRules += [PSCustomObject]@{{
+                Identity = $name
+                FullIdentity = $identity
+                Rights = $rule.FileSystemRights
+                AccessType = $rule.AccessControlType
+                IsInherited = $rule.IsInherited
+            }}
+        }}
+    }}
     
-    # Если есть vid_zan (тип занятости) - можно считать основным сотрудником
-    if (-not [string]::IsNullOrWhiteSpace($Employee.vid_zan)) {
-        return $DEFAULT_BLOCK
-    }
+    # Выводим отфильтрованные группы
+    if ($filteredRules.Count -gt 0)
+    {{
+        Write-Host " Найденные группы доступа:" -ForegroundColor Green
+        Write-Host ""
+        
+        # Группируем по Identity для лучшей читаемости
+        $grouped = $filteredRules | Group-Object Identity
+        
+        foreach ($group in $grouped)
+        {{
+            Write-Host "  ▶ $($group.Name)" -ForegroundColor White
+            foreach ($rule in $group.Group)
+            {{
+                $type = if ($rule.AccessType -eq "Allow") {{ "Разрешить" }} else {{ "Запретить" }}
+                $inherited = if ($rule.IsInherited) {{ "(наследовано)" }} else {{ "(явно)" }}
+                Write-Host "     • $type`: $($rule.Rights) $inherited" -ForegroundColor Gray
+            }}
+            Write-Host ""
+        }}
+    }}
+    else
+    {{
+        Write-Host " Не найдено групп, соответствующих критериям" -ForegroundColor Yellow
+    }}
     
-    return $UNKNOWN_BLOCK
-}
-
-# ========== Подсчёт по блокам ==========
-Write-Host "`n=== Подсчёт по блокам ===" -ForegroundColor Green
-
-$DivisionCount = @{}
-$ExcludedCount = 0
-
-foreach ($User in $Users1C) {
-    $block = Resolve-Block -Employee $User -Dictionary $dict
+    Write-Host ""
+}}
+"""
     
-    if ($DivisionCount.ContainsKey($block)) {
-        $DivisionCount[$block]++
-    } else {
-        $DivisionCount[$block] = 1
-    }
-}
+    result = subprocess.run(["powershell", "-Command", ps_script],
+                           capture_output=True,
+                           text=True,
+                           encoding='cp866',
+                           errors='replace')
+    
+    # Выводим результат
+    output = result.stdout
+    
+    # Убираем дублирующиеся строки
+    lines = output.split('\n')
+    unique_lines = []
+    prev_line = ""
+    for line in lines:
+        # Не добавляем подряд идущие одинаковые строки
+        if line.strip() != prev_line.strip():
+            unique_lines.append(line)
+            prev_line = line
+    
+    output = '\n'.join(unique_lines)
+    text_area.insert(tk.END, output)
+    
+    if result.stderr:
+        text_area.insert(tk.END, f"\n\nОшибки:\n{result.stderr}")
 
-# ========== Вывод статистики в консоль ==========
-$RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+# Создаем окно
+root = tk.Tk()
+root.title("Проверка прав доступа")
+root.geometry("1200x800")
 
-Write-Host "`n=== Статистика по подразделениям (division) — LLD Discovery ===" -ForegroundColor Green
-Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+# Верхняя панель для ввода пути
+top_frame = tk.Frame(root)
+top_frame.pack(fill=tk.X, padx=10, pady=10)
 
-$DivisionCount.GetEnumerator() | 
-    Sort-Object Value -Descending | 
-    Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50}, 
-                 @{Label="Кол-во"; Expression={$_.Value}; Width=10}, 
-                 @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
+tk.Label(top_frame, text="Введите путь к папке:", font=("Arial", 10)).pack(side=tk.LEFT, padx=(0, 5))
+entry = tk.Entry(top_frame, width=80, font=("Arial", 10))
+entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
-Write-Host "Всего активных сотрудников в 1С: $($Users1C.Count)" -ForegroundColor Yellow
-Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
+# Кнопки управления
+btn_add = tk.Button(top_frame, text="Добавить", command=add_path,
+                    bg="#2196F3", fg="white", font=("Arial", 10))
+btn_add.pack(side=tk.LEFT, padx=2)
 
-# ========== Формирование JSON для Zabbix ==========
-Write-Host "`n=== Формирование JSON ===" -ForegroundColor Green
+btn_remove = tk.Button(top_frame, text="Удалить", command=remove_path,
+                       bg="#FF9800", fg="white", font=("Arial", 10))
+btn_remove.pack(side=tk.LEFT, padx=2)
 
-# Массив для discovery
-$discovery = foreach ($k in $DivisionCount.Keys | Sort-Object) {
-    @{ '{#DIVISION}' = $k }
-}
+btn_clear = tk.Button(top_frame, text="Очистить все", command=clear_paths,
+                      bg="#f44336", fg="white", font=("Arial", 10))
+btn_clear.pack(side=tk.LEFT, padx=2)
 
-# Итоговый payload
-$payload = [ordered]@{
-    discovery = @($discovery)
-    counts    = $DivisionCount
-    metadata  = @{
-        TotalActiveUsers  = $Users1C.Count
-        ExcludedUsers     = 0
-        RealUsers         = $RealUsersCount
-        UniqueDivisions   = $DivisionCount.Count
-        GeneratedAt       = $time
-        ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
-    }
-}
+# Панель со списком путей
+list_frame = tk.Frame(root)
+list_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 10))
 
-# Конвертация в JSON
-$json = $payload | ConvertTo-Json -Depth 4
+tk.Label(list_frame, text="Список путей для проверки:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
 
-# Сохранение в файл
-$outputDir = Split-Path $OUTPUT_PATH -Parent
-if (-not (Test-Path $outputDir)) {
-    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-}
+# Listbox с прокруткой
+listbox_frame = tk.Frame(list_frame)
+listbox_frame.pack(fill=tk.BOTH, expand=True)
 
-[System.IO.File]::WriteAllText($OUTPUT_PATH, $json, [System.Text.UTF8Encoding]::new($false))
+scrollbar = tk.Scrollbar(listbox_frame)
+scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-# Вывод JSON в консоль
-Write-Host "`n=== JSON Output ===" -ForegroundColor Green
-$json
+listbox = tk.Listbox(listbox_frame, yscrollcommand=scrollbar.set,
+                      font=("Consolas", 10), height=5)
+listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+scrollbar.config(command=listbox.yview)
 
-# ========== Время выполнения ==========
-$timestop = Get-Date
-$TimeSum = $timestop - $timestart
-Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
-Write-Host "Файл сохранён: $OUTPUT_PATH" -ForegroundColor Green
+# Кнопка выполнения
+btn_frame = tk.Frame(root)
+btn_frame.pack(pady=5)
+
+btn_run = tk.Button(btn_frame, text="Выполнить проверку", command=run_script,
+                    bg="#4CAF50", fg="white", font=("Arial", 11))
+btn_run.pack()
+
+# Поле для вывода результата
+text_area = scrolledtext.ScrolledText(root, wrap=tk.NONE, font=("Consolas", 10))
+text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+# Горизонтальная прокрутка
+hbar = tk.Scrollbar(text_area, orient=tk.HORIZONTAL)
+hbar.pack(side=tk.BOTTOM, fill=tk.X)
+text_area.config(xscrollcommand=hbar.set)
+hbar.config(command=text_area.xview)
+
+root.mainloop()
