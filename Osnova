@@ -1,242 +1,136 @@
-import tkinter as tk
-from tkinter import scrolledtext
-import subprocess
-import tkinter.messagebox
+# src/main.py
 
-def add_path():
-    """Добавляет путь из поля ввода в список"""
-    path = entry.get().strip()
-    if path:
-        listbox.insert(tk.END, path)
-        entry.delete(0, tk.END)
-    else:
-        tk.messagebox.showwarning("Предупреждение", "Введите путь перед добавлением")
+from fastapi import FastAPI
 
-def remove_path():
-    """Удаляет выбранный путь из списка"""
-    selected = listbox.curselection()
-    if selected:
-        listbox.delete(selected)
+from bot import create_bot
+from config import settings
+from game_state import GameState
+from routers.botx import router as botx_router
+from routers.health import router as health_router
 
-def clear_paths():
-    """Очищает весь список путей"""
-    listbox.delete(0, tk.END)
+LOG = settings.logger
 
-def run_script():
-    """Выполняет проверку для всех путей в списке"""
-    paths = list(listbox.get(0, tk.END))
-    if not paths:
-        text_area.delete(1.0, tk.END)
-        text_area.insert(1.0, "Ошибка: Добавьте хотя бы один путь к папке")
-        return
-    
-    text_area.delete(1.0, tk.END)
-    text_area.insert(1.0, "Выполнение скрипта...\n\n")
-    root.update()
-    
-    # Формируем массив путей для PowerShell
-    paths_array = '@("' + '", "'.join(paths) + '")'
-    
-    # PowerShell скрипт с новыми правилами фильтрации
-    ps_script = f"""
-$pathArray = {paths_array}
+# ── Создание бота и приложения ──
+bot = create_bot()
+app = FastAPI(docs_url="/swagger")
 
-foreach ($pat in $pathArray)
-{{
-    Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host " Путь: $pat " -ForegroundColor Yellow
-    Write-Host "========================================" -ForegroundColor Cyan
-    
-    try
-    {{
-        $accessRules = (Get-Acl -Path $pat).Access
-    }}
-    catch
-    {{
-        Write-Warning "Не удалось получить ACL для пути: $pat"
-        continue
-    }}
 
-    # Фильтруем только нужные группы
-    $filteredRules = @()
-    
-    foreach ($rule in $accessRules)
-    {{
-        $identity = $rule.IdentityReference.Value
-        $name = $identity.Split('\\')[-1]
-        
-        # Правила исключения
-        $exclude = $false
-        
-        # Исключаем стандартные системные группы
-        if ($name -eq "SYSTEM" -or 
-            $name -eq "Administrators" -or 
-            $name -eq "Users" -or
-            $name -eq "CREATOR OWNER" -or
-            $name -like "BUILTIN*" -or
-            $name -like "NT AUTHORITY*" -or
-            $name -like "NT SERVICE*" -or
-            $name -like "SERVICE*" -or
-            $name -like "Все*" -or
-            $name -like "Все*" -or
-            $name -like "Everyone*")
-        {{
-            $exclude = $true
-        }}
-        
-        # Исключаем группы с SID (S-1-5-...)
-        if ($name -match "^S-1-5-")
-        {{
-            $exclude = $true
-        }}
-        
-        # Исключаем группы, начинающиеся с z- или s- (регистронезависимо)
-        if ($name -match "^(z-|s-)")
-        {{
-            $exclude = $true
-        }}
-        
-        # Исключаем "ДОСТУП ДЛЯ ЧТЕНИЯ КО ВСЕМУ ДИСКУ"
-        if ($name -like "*ДОСТУП*ЧТЕНИЯ*ДИСКУ*" -or 
-            $name -like "*READ*ACCESS*DISK*")
-        {{
-            $exclude = $true
-        }}
-        
-        # Исключаем "FSDPT ALL SpecFolders Read"
-        if ($name -like "*SpecFolders*")
-        {{
-            $exclude = $true
-        }}
-        
-        # Если группа не попала в исключения - добавляем
-        if (-not $exclude)
-        {{
-            $filteredRules += [PSCustomObject]@{{
-                Identity = $name
-                FullIdentity = $identity
-                Rights = $rule.FileSystemRights
-                AccessType = $rule.AccessControlType
-                IsInherited = $rule.IsInherited
-            }}
-        }}
-    }}
-    
-    # Выводим отфильтрованные группы
-    if ($filteredRules.Count -gt 0)
-    {{
-        Write-Host " Найденные группы доступа:" -ForegroundColor Green
-        Write-Host ""
-        
-        # Группируем по Identity для лучшей читаемости
-        $grouped = $filteredRules | Group-Object Identity
-        
-        foreach ($group in $grouped)
-        {{
-            Write-Host "  ▶ $($group.Name)" -ForegroundColor White
-            foreach ($rule in $group.Group)
-            {{
-                $type = if ($rule.AccessType -eq "Allow") {{ "Разрешить" }} else {{ "Запретить" }}
-                $inherited = if ($rule.IsInherited) {{ "(наследовано)" }} else {{ "(явно)" }}
-                Write-Host "     • $type`: $($rule.Rights) $inherited" -ForegroundColor Gray
-            }}
-            Write-Host ""
-        }}
-    }}
-    else
-    {{
-        Write-Host " Не найдено групп, соответствующих критериям" -ForegroundColor Yellow
-    }}
-    
-    Write-Host ""
-}}
-"""
-    
-    result = subprocess.run(["powershell", "-Command", ps_script],
-                           capture_output=True,
-                           text=True,
-                           encoding='cp866',
-                           errors='replace')
-    
-    # Выводим результат
-    output = result.stdout
-    
-    # Убираем дублирующиеся строки
-    lines = output.split('\n')
-    unique_lines = []
-    prev_line = ""
-    for line in lines:
-        # Не добавляем подряд идущие одинаковые строки
-        if line.strip() != prev_line.strip():
-            unique_lines.append(line)
-            prev_line = line
-    
-    output = '\n'.join(unique_lines)
-    text_area.insert(tk.END, output)
-    
-    if result.stderr:
-        text_area.insert(tk.END, f"\n\nОшибки:\n{result.stderr}")
+# ── Lifecycle ──
+async def on_startup() -> None:
+    LOG.info("[startup] Бот «Что? Где? Когда?» запускается...")
+    await bot.startup()
+    bot.state.game = GameState()
+    LOG.info("[startup] Готово. Ожидаю команды.")
 
-# Создаем окно
-root = tk.Tk()
-root.title("Проверка прав доступа")
-root.geometry("1200x800")
 
-# Верхняя панель для ввода пути
-top_frame = tk.Frame(root)
-top_frame.pack(fill=tk.X, padx=10, pady=10)
+async def on_shutdown() -> None:
+    LOG.info("[shutdown] Остановка бота...")
+    game: GameState = bot.state.game
+    if game.timer_task and not game.timer_task.done():
+        game.timer_task.cancel()
+    await bot.shutdown()
+    LOG.info("[shutdown] Бот остановлен.")
 
-tk.Label(top_frame, text="Введите путь к папке:", font=("Arial", 10)).pack(side=tk.LEFT, padx=(0, 5))
-entry = tk.Entry(top_frame, width=80, font=("Arial", 10))
-entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
-# Кнопки управления
-btn_add = tk.Button(top_frame, text="Добавить", command=add_path,
-                    bg="#2196F3", fg="white", font=("Arial", 10))
-btn_add.pack(side=tk.LEFT, padx=2)
+app.add_event_handler("startup", on_startup)
+app.add_event_handler("shutdown", on_shutdown)
 
-btn_remove = tk.Button(top_frame, text="Удалить", command=remove_path,
-                       bg="#FF9800", fg="white", font=("Arial", 10))
-btn_remove.pack(side=tk.LEFT, padx=2)
+app.state.bot = bot
 
-btn_clear = tk.Button(top_frame, text="Очистить все", command=clear_paths,
-                      bg="#f44336", fg="white", font=("Arial", 10))
-btn_clear.pack(side=tk.LEFT, padx=2)
+app.include_router(health_router)
+app.include_router(botx_router)
 
-# Панель со списком путей
-list_frame = tk.Frame(root)
-list_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 10))
+файл config.py
 
-tk.Label(list_frame, text="Список путей для проверки:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+# src/config.py
 
-# Listbox с прокруткой
-listbox_frame = tk.Frame(list_frame)
-listbox_frame.pack(fill=tk.BOTH, expand=True)
+import logging
+import sys
+from functools import lru_cache
+from uuid import UUID
 
-scrollbar = tk.Scrollbar(listbox_frame)
-scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+from pydantic import AnyHttpUrl, BaseSettings, Field
 
-listbox = tk.Listbox(listbox_frame, yscrollcommand=scrollbar.set,
-                      font=("Consolas", 10), height=5)
-listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-scrollbar.config(command=listbox.yview)
 
-# Кнопка выполнения
-btn_frame = tk.Frame(root)
-btn_frame.pack(pady=5)
+# ── Логгер ──────────────────────────────────────────────────────
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("quiz_bot")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("[%(asctime)s] %(levelname)s — %(message)s",
+                              datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(handler)
+    return logger
 
-btn_run = tk.Button(btn_frame, text="Выполнить проверку", command=run_script,
-                    bg="#4CAF50", fg="white", font=("Arial", 11))
-btn_run.pack()
 
-# Поле для вывода результата
-text_area = scrolledtext.ScrolledText(root, wrap=tk.NONE, font=("Consolas", 10))
-text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+# ── Pydantic Settings ───────────────────────────────────────────
+class ExpressSettings(BaseSettings):
+    uuid: UUID = Field(..., env="EXPRESS_UUID")
+    cts_url: AnyHttpUrl = Field(..., env="EXPRESS_URL")
+    secret_key: str = Field(..., env="EXPRESS_SECRET_KEY")
 
-# Горизонтальная прокрутка
-hbar = tk.Scrollbar(text_area, orient=tk.HORIZONTAL)
-hbar.pack(side=tk.BOTTOM, fill=tk.X)
-text_area.config(xscrollcommand=hbar.set)
-hbar.config(command=text_area.xview)
 
-root.mainloop()
+class GameSettings(BaseSettings):
+    admin_login: str = Field("rashidovar", env="ADMIN_LOGIN")
+    timer_discussion: int = Field(60, env="TIMER_DISCUSSION")
+    timer_answer: int = Field(10, env="TIMER_ANSWER")
+
+
+class Settings(BaseSettings):
+    express: ExpressSettings = Field(default_factory=ExpressSettings)
+    game: GameSettings = Field(default_factory=GameSettings)
+    logger: logging.Logger = Field(default_factory=_setup_logger)
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        arbitrary_types_allowed = True
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
+
+файл бот 
+# src/bot.py
+
+from uuid import UUID
+
+import httpx
+from pybotx import Bot, BotAccountWithSecret, HandlerCollector
+
+from config import settings
+from handlers import game
+
+
+def create_bot() -> Bot:
+    """Фабрика: создаёт и конфигурирует экземпляр бота."""
+
+    main_collector = HandlerCollector()
+    main_collector.include(game.collector)
+
+    timeouts = httpx.Timeout(30.0, connect=5.0)
+    limits = httpx.Limits(
+        max_keepalive_connections=5,
+        max_connections=10,
+        keepalive_expiry=5,
+    )
+    httpx_client = httpx.AsyncClient(timeout=timeouts, limits=limits)
+
+    return Bot(
+        collectors=[main_collector],
+        bot_accounts=[
+            BotAccountWithSecret(
+                id=UUID(str(settings.express.uuid)),
+                cts_url=settings.express.cts_url,
+                secret_key=settings.express.secret_key,
+            ),
+        ],
+        httpx_client=httpx_client,
+    )
