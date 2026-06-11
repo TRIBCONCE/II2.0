@@ -1,204 +1,40 @@
+import logging
+import sys
+from functools import lru_cache
+from uuid import UUID
 
-    return index, disabled_index
+from pydantic import AnyHttpUrl, BaseSettings, Field
 
-def main():
-    logger.info(f"=== START (DRY_RUN={DRY_RUN}) host={socket.gethostname()} ===")
-    cleanup_old_logs()
+# ── Логгер ──────────────────────────────────────────────────────
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("invite_bot")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("[%(asctime)s] %(levelname)s — %(message)s",
+                              datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(handler)
+    return logger
 
-    try:
-        sql_user, sql_pwd, ad_user, ad_pwd = load_secrets()
-    except Exception:
-        fatal("Ошибка расшифровки секретов", traceback.format_exc())
+# ── Pydantic Settings ───────────────────────────────────────────
+class ExpressSettings(BaseSettings):
+    uuid: UUID = Field(..., env="EXPRESS_UUID")
+    cts_url: AnyHttpUrl = Field(..., env="EXPRESS_URL")
+    secret_key: str = Field(..., env="EXPRESS_SECRET_KEY")
 
-    try:
-        logger.info("[1/4] Загружаю исключения и справочник...")
-        excluded = load_excluded()
-        dic = load_dictionary()
+class Settings(BaseSettings):
+    express: ExpressSettings = Field(default_factory=ExpressSettings)
+    logger: logging.Logger = Field(default_factory=_setup_logger)
 
-        logger.info(f"[2/4] Тяну сотрудников из БД {SQL_SERVER}...")
-        employees = fetch_employees(sql_user, sql_pwd)
-        logger.info(f"     получено активных: {len(employees)}")
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        arbitrary_types_allowed = True
 
-        logger.info("[3/4] Подключаюсь к AD и тяну юзеров...")
-        ad = connect_ad(ad_user, ad_pwd)
-        ad_index, disabled_index = load_ad_users(ad)
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
 
-        logger.info("[4/4] Старт обработки")
-    except SystemExit:
-        raise
-    except Exception:
-        fatal("Ошибка инициализации", traceback.format_exc())
-
-    stats = {"total":0,"skipped_excl":0,"need_update":0,"already_ok":0,
-             "not_found":0,"not_found_no_data":0,"disabled_only":0,"multi":0,
-             "unknown_dict":0,"no_data":0,
-             "errors":0,"updated":0}
-    block_counter = Counter()
-    unknown_rows = []
-
-    with open(LOG_CSV, "w", encoding="utf-8-sig", newline="", buffering=1) as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow(["timestamp","tab_numb","fio","sam","status","reason",
-                    "current_division","new_division","dry_run"])
-
-        for i, emp in enumerate(employees, 1):
-            if i % 500 == 0:
-                logger.info(f"  обработано {i}/{len(employees)}")
-
-            stats["total"] += 1
-            tab, fio = emp["tab"], emp["fio"]
-
-            if tab in excluded:
-                stats["skipped_excl"] += 1
-                w.writerow([datetime.now(),tab,fio,"","SKIPPED","in_exclusion_list","","",DRY_RUN])
-                continue
-
-            new_block, reason, action = resolve_block(emp, dic)
-
-            if action == "unknown":
-                stats["unknown_dict"] += 1
-                unknown_rows.append({
-                    "tab": tab, "fio": fio,
-                    "department": emp.get("department") or "",
-                    "dep": emp.get("dep") or "",
-                    "dep1": emp.get("dep1") or "",
-                    "reason": reason,
-                })
-                w.writerow([datetime.now(),tab,fio,"","UNKNOWN_DICT",reason,"","",DRY_RUN])
-                continue
-
-            if action == "stats":
-                ad_users = ad_index.get(tab, [])
-
-                office_hit = any("дополнительный" in (u["office"] or "").lower()
-                                 for u in ad_users)
-                if office_hit:
-                    new_block = DEFAULT_BLOCK
-                    reason = "default_by_ad_office"
-                    action = "update"
-                else:
-                    matched_block = None
-                    matched_src = None
-                    for u in ad_users:
-                        parts = [p.strip().lower() for p in (u["street"] or "").split("%") if p.strip()]
-                        if not parts:
-                            continue
-                        for sheet in ("department", "dep", "dep1"):
-                            for name_low, block in dic[sheet].items():
-                                if name_low in parts:
-                                    matched_block = block
-                                    matched_src = sheet
-                                    break
-                            if matched_block:
-                                break
-                        if matched_block:
-                            break
-
-                    if matched_block:
-                        new_block = matched_block
-                        reason = f"matched_by_ad_street:{matched_src}"
-                        action = "update"
-                    else:
-                        esc_hit = any("единый сервисный центр" in (u["street"] or "").lower()
-                                      for u in ad_users)
-                        if esc_hit:
-                            new_block = OPS_BLOCK
-                            reason = "matched_by_ad_street_esc"
-                            action = "update"
-                        elif not ad_users:
-                            stats["not_found_no_data"] += 1
-                            w.writerow([datetime.now(),tab,fio,"","NOT_FOUND_NO_DATA",
-                                        "no_user_in_ad_and_no_source_data","","",DRY_RUN])
-                            continue
-                        else:
-                            stats["no_data"] += 1
-                            block_counter[UNKNOWN_BLOCK] += 1
-                            w.writerow([datetime.now(),tab,fio,"","NO_DATA",
-                                        reason,"",UNKNOWN_BLOCK,DRY_RUN])
-                            continue
-
-            block_counter[new_block] += 1
-
-            users = ad_index.get(tab, [])
-            if not users:
-                if tab in disabled_index:
-                    stats["disabled_only"] += 1
-                    sams = ",".join(disabled_index[tab])
-                    w.writerow([datetime.now(),tab,fio,sams,"DISABLED",
-                                "ad_user_disabled_in_excluded_ou","",new_block,DRY_RUN])
-                else:
-                    stats["not_found"] += 1
-                    w.writerow([datetime.now(),tab,fio,"","NOT_FOUND",
-                                "no_user_in_ad","",new_block,DRY_RUN])
-                continue
-
-            if len(users) > 1:
-                active = [u for u in users if not u["disabled"]]
-                if len(active) == 1:
-                    users = active
-                else:
-                    stats["multi"] += 1
-                    sams = ",".join(u["sam"] for u in users)
-                    w.writerow([datetime.now(),tab,fio,sams,"MULTI",
-                                f"multiple_ad_users:active={len(active)}","",new_block,DRY_RUN])
-                    continue
-
-            u = users[0]
-            sam, cur_div, dn = u["sam"], u["division"], u["dn"]
-            if cur_div == new_block:
-                stats["already_ok"] += 1
-                w.writerow([datetime.now(),tab,fio,sam,"OK","already_set",cur_div,new_block,DRY_RUN])
-                continue
-
-            stats["need_update"] += 1
-            try:
-                ad.modify(dn, {"division":[("MODIFY_REPLACE",[new_block])]})
-                if ad.result["result"] == 0:
-                    stats["updated"] += 1
-                    w.writerow([datetime.now(),tab,fio,sam,"UPDATED",reason,cur_div,new_block,DRY_RUN])
-                else:
-                    stats["errors"] += 1
-                    w.writerow([datetime.now(),tab,fio,sam,"ERROR",f"ad_modify:{ad.result}",cur_div,new_block,DRY_RUN])
-            except Exception as e:
-                stats["errors"] += 1
-                w.writerow([datetime.now(),tab,fio,sam,"ERROR",f"ad_modify_exc:{e}",cur_div,new_block,DRY_RUN])
-
-    ad.unbind()
-
-    logger.info("===== ИТОГИ =====")
-    logger.info(f"CSV-лог: {LOG_CSV}")
-    for k, v in stats.items():
-        logger.info(f"  {k}: {v}")
-
-    logger.info("===== СВОДКА ПО БЛОКАМ =====")
-    total_by_block = 0
-    for block, cnt in sorted(block_counter.items(), key=lambda x: (-x[1], x[0])):
-        logger.info(f"  {block}: {cnt}")
-        total_by_block += cnt
-    logger.info(f"  ИТОГО: {total_by_block}")
-
-    if unknown_rows:
-        lines = ["Найдены сотрудники с неизвестным значением в department/dep/dep1",
-                 "(значения отсутствуют в справочнике):", ""]
-        lines.append("tab_numb | ФИО | поле:значение")
-        for r in unknown_rows:
-            lines.append(f"{r['tab']} | {r['fio']} | {r['reason']} "
-                         f"(department={r['department']}; dep={r['dep']}; dep1={r['dep1']})")
-        lines += ["", f"Всего: {len(unknown_rows)}", f"Лог: {LOG_CSV}"]
-        send_alert("[AD Division Sync] Неизвестные значения в справочнике",
-                   "\n".join(lines))
-
-    if stats["errors"] > 0:
-        summary = "\n".join(f"{k}: {v}" for k,v in stats.items())
-        send_alert("[AD Division Sync] Завершено с ошибками",
-                   f"Лог: {LOG_CSV}\nLog-файл: {LOG_FILE}\n\n{summary}")
-
-    logger.info("=== DONE ===")
-
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception:
-        fatal("Необработанное исключение", traceback.format_exc())
+settings = get_settings()
