@@ -1,3 +1,26 @@
+decret date_uv   
+------ -------   
+0                
+0                
+0      21.03.2025
+0      30.12.2025
+0                
+0      05.12.2025
+0      05.06.2018
+0      04.09.2018
+0      28.04.2017
+0      25.06.2021
+0      17.05.2023
+0      07.09.2020
+0      12.07.2021
+0      12.08.2019
+0      14.12.2023
+0                
+0      30.04.2026
+0      27.08.2021
+0      30.12.2022
+0      01.06.2026
+
 Exception calling "ParseExact" with "3" argument(s): "String was not recognized as a valid DateTime."
 At C:\Users\z-BorodinES\Desktop\ZabbixZadacha\1CAllUsersBlocksDiscovery.ps1:52 char:5
 +     $_.decret -eq "0" -and ($_.date_uv -eq "" -or ([datetime]::ParseE ...
