@@ -1,3 +1,128 @@
+
+cls
+
+$timestart = Get-Date
+$today = Get-Date -Format dd.MM.yyyy
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+
+$key_path = "C:\Scripts\cyph_keys\aes.key"
+$ab_pwd_path = "C:\Scripts\cyph_keys\pwd_abw.txt"
+
+$ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+$ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+
+$AllUsersOn = Get-ADUser `
+    -Filter { enabled -eq $true } `
+    -Credential $ab_creds `
+    -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType
+
+$LimitDate = (Get-Date).AddDays(-3)
+
+$DivisionCount = @{}
+
+# Счётчик исключённых
+$ExcludedCount = 0
+
+foreach ($User in $AllUsersOn) {
+
+    $sam = $User.samaccountname
+    $name = $User.name
+    $dn = $User.DistinguishedName
+
+    if (
+        $User.whenCreated -gt $LimitDate -or
+        $User.employeeType -eq "service" -or
+
+        $sam -like "*test*" -or
+        $sam -like "Health*" -or
+        $sam -like "room*" -or
+        $sam -like "audit*" -or
+        $sam -like "temp*" -or
+        $sam -like "esas*" -or
+        $sam -like "a-*" -or
+        $sam -like "z-*" -or
+        $name -like "*`$*" -or
+        $name -like "*sadmin*" -or
+        $name -like "*Администратор*" -or
+        $name -like "Оператор" -or
+        $name -like "*Тестовая*" -or
+        $dn -like "*Отключенные пользователи*" -or
+        $dn -like "*сторон*"
+    ) {
+        $ExcludedCount++
+        continue
+    }
+
+    $div = $User.division
+
+    if ($div) {
+        if ($DivisionCount.ContainsKey($div)) {
+            $DivisionCount[$div]++
+        }
+        else {
+            $DivisionCount[$div] = 1
+        }
+    }
+    else {
+        $emptyKey = "(не указано)"
+
+        if ($DivisionCount.ContainsKey($emptyKey)) {
+            $DivisionCount[$emptyKey]++
+        }
+        else {
+            $DivisionCount[$emptyKey] = 1
+        }
+    }
+}
+
+$discovery = foreach ($k in $DivisionCount.Keys) {
+    @{ '{#DIVISION}' = $k }
+}
+
+$payload = [ordered]@{
+    discovery = @($discovery)
+    counts = $DivisionCount
+    metadata = @{
+        TotalActiveUsers  = $AllUsersOn.Count
+        ExcludedUsers     = $ExcludedCount
+        RealUsers         = ($DivisionCount.Values | Measure-Object -Sum).Sum
+        UniqueDivisions   = $DivisionCount.Count
+        GeneratedAt       = $time
+        ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+    }
+}
+
+$json = $payload | ConvertTo-Json -Depth 4
+
+$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
+
+[System.IO.File]::WriteAllText(
+    $outputPath,
+    $json,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+$RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+Write-Host "`nПодсчёт по блокам" -ForegroundColor Green
+Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+
+$DivisionCount.GetEnumerator() |
+    Sort-Object Value -Descending |
+    Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
+                 @{Label="Кол-во"; Expression={$_.Value}; Width=10},
+                 @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
+
+Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
+Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
+Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
+
+$timestop = Get-Date
+$TimeSum = $timestop - $timestart
+
+Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+Write-Host "Файл сохранён." -ForegroundColor Green
+#########
 А егор, еще пж поменяй фильтры СУЗов рукописные на employeeType -eq "service"
 14:12
 А и еще в скрипт AD сделай что бы все взаимодействие с AD шло от имени СУЗа
