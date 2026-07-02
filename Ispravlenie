@@ -1,3 +1,10 @@
+Exception calling "ParseExact" with "3" argument(s): "String was not recognized as a valid DateTime."
+At C:\Users\z-BorodinES\Desktop\ZabbixZadacha\1CAllUsersBlocksDiscovery.ps1:52 char:5
++     $_.decret -eq "0" -and ($_.date_uv -eq "" -or ([datetime]::ParseE ...
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [], MethodInvocationException
+    + FullyQualifiedErrorId : FormatException
+
 1) по 1с , у тя стоит date_uv -eq "" , а по факту уволенные числятся так date_uv < сегодняшнего дня.
 $Users1C = Import-Csv -Delimiter ";" -Path $TXT_PATH -WarningAction SilentlyContinue | Where-Object { 
     $_.decret -eq "0" -and $_.date_uv -eq "" 
