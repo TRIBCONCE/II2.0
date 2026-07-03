@@ -1,69 +1,11 @@
-'Filter' = -join(
-            {(samaccountname -like "swift") },
-            {-or (samaccountname -like "sisb") },
-            {-or (samaccountname -like "SM_*") },
-			{-or (samaccountname -like "TsScU*") },
-            {-or (samaccountname -like "ext0*") },
-            {-or (samaccountname -like "ext1*") },
-            {-or (samaccountname -like "os-*") },
-            {-or (samaccountname -like "ExternalTraffic") },
-            {-or (samaccountname -like "HealthMailbox*") },
-            {-or (samaccountname -like "s-*") },
-            {-or (samaccountname -like "AdminIB") },
-            {-or (samaccountname -like "st-*") },
-            {-or (samaccountname -like "sp-*") },
-            {-or (samaccountname -like "scsm*") },
-            {-or (samaccountname -like "svc-*") },
-            {-or (samaccountname -like "u1test*") },
-            {-or (samaccountname -like "user_*") },
-            {-or (samaccountname -like "setpass*") },
-            {-or (samaccountname -like "safelogin*") },
-            {-or (samaccountname -like "test*") },
-            {-or (samaccountname -like "sshd*") },
-            {-or (samaccountname -like "sadmin*") },
-            {-or (samaccountname -like "AdminAntifraud*") },
-            {-or (samaccountname -like "ldap_*") },
-            {-or (samaccountname -like "elkldap") },
-            {-or (samaccountname -like "dsahead*") },
-            {-or (samaccountname -like "dlp_*") },
-            {-or (samaccountname -like "barnscanner*") },
-            {-or (samaccountname -like "sevzap-scan*") },
-            {-or (samaccountname -like "xml1*") },
-            {-or (samaccountname -like "grafana*") },
-            {-or (samaccountname -like "p-kfmbfileup*") },
-            {-or (samaccountname -like "QA_MEN_SOKS*") },
-            {-or (samaccountname -like "sfd-admin*") },
-			{-or (samaccountname -like "room-*") },
-            {-or (name -like "ФИС0*") },
-            {-or (name -like "ESAS*") },
-            {-or (name -like "ext*") },
-            {-or (name -like "own*") },
-            {-or (name -like "*admin*") },
-            {-or (name -like "*Временн*") },
-            {-or (name -like "*сервис*") },
-            {-or (name -like "*Оператор*") },
-            {-or (name -like "*apps*") },
-            {-or (name -like "*user*") },
-            {-or (name -like "s-*") },
-            {-or (name -like "*temp*") },
-            {-or (name -like "*test*") },
-            {-or (name -like "*тест*") },
-            {-or (name -like "СУЗ *")}
-        );
-16:09
-во
-16:09
-это короче фильтры которые входят в employeetype
-16:09
-можешь сравнить
 cls
 
 $timestart = Get-Date
 $today = Get-Date -Format dd.MM.yyyy
 $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
-$key_path = "C:\Scripts\cyph_keys\aes.key"
-$ab_pwd_path = "C:\Scripts\cyph_keys\pwd_abw.txt"
+$key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+$ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
 
 $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
 $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
@@ -90,18 +32,13 @@ foreach ($User in $AllUsersOn) {
         $User.whenCreated -gt $LimitDate -or
         $User.employeeType -eq "service" -or
 
-        $sam -like "*test*" -or
         $sam -like "Health*" -or
-        $sam -like "room*" -or
         $sam -like "audit*" -or
-        $sam -like "temp*" -or
         $sam -like "esas*" -or
         $sam -like "a-*" -or
         $sam -like "z-*" -or
         $name -like "*`$*" -or
-        $name -like "*sadmin*" -or
         $name -like "*Администратор*" -or
-        $name -like "Оператор" -or
         $name -like "*Тестовая*" -or
         $dn -like "*Отключенные пользователи*" -or
         $dn -like "*сторон*"
@@ -179,124 +116,5 @@ $TimeSum = $timestop - $timestart
 
 Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
 Write-Host "Файл сохранён." -ForegroundColor Green
-#########
-А егор, еще пж поменяй фильтры СУЗов рукописные на employeeType -eq "service"
-14:12
-А и еще в скрипт AD сделай что бы все взаимодействие с AD шло от имени СУЗа
-14:16
-$key_path = "C:\Scripts\cyph_keys\aes.key"
-$ab_pwd_path = "C:\Scripts\cyph_keys\pwd_abw.txt"
-$ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
-$ab_creds = New-Object System.Management.Automation.PsCredential("ABB-WIN\s-ad-expertise",$ab_password)
 
-вот скрипт:
-cls
-
-$timestart = Get-Date
-$today = Get-Date -Format dd.MM.yyyy
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
-
-
-$AllUsersOn = Get-ADUser -Filter { enabled -eq $true } -Properties division, samaccountname, DistinguishedName, name, whenCreated
-
-$LimitDate =(Get-Date).AddDays(-3)
-
-$DivisionCount = @{}
-
-# Счётчик исключённых
-$ExcludedCount = 0
-
-foreach ($User in $AllUsersOn) {
-    $sam = $User.samaccountname
-    $name = $User.name
-    $dn  = $User.DistinguishedName
-
-    if (
-        $User.whenCreated -gt $LimitDate -or
-        $sam -like "s-*" -or $sam -like "sl-*" -or
-        $sam -like "*test*" -or $sam -like "Health*" -or
-        $sam -like "room*" -or $sam -like "sp-*" -or
-        $sam -like "st-*" -or $sam -like "audit*" -or
-        $sam -like "temp*" -or $sam -like "esas*" -or
-        $name -like "Сервисная*" -or
-        $sam -like "a-*" -or 
-        $sam -like "z-*" -or
-        $name -like "*`$*" -or
-        $name -like "*sadmin*" -or
-        $name -like "*Администратор*" -or
-        $name -like "Оператор" -or
-        $name -like "*СУЗ*" -or
-        $name -like "*Тестовая*" -or
-        $dn -like "*Сервисные учетные записи*" -or
-        $dn -like "*Отключенные пользователи*" -or
-        $dn -like "*сторон*"
-    ) {
-        $ExcludedCount++
-        continue
-    }
-
-    $div = $User.division
-    if ($div) {
-        if ($DivisionCount.ContainsKey($div)) {
-            $DivisionCount[$div]++
-        } else {
-            $DivisionCount[$div] = 1
-        }
-    } else {
-        $emptyKey = "(не указано)"
-        if ($DivisionCount.ContainsKey($emptyKey)) {
-            $DivisionCount[$emptyKey]++
-        } else {
-            $DivisionCount[$emptyKey] = 1
-        }
-    }
-}
-
-
-$discovery = foreach ($k in $DivisionCount.Keys) {
-    @{ '{#DIVISION}' = $k }
-}
-
-
-$payload = [ordered]@{
-    discovery = @($discovery)
-    counts    = $DivisionCount
-    metadata  = @{
-        TotalActiveUsers  = $AllUsersOn.Count
-        ExcludedUsers     = $ExcludedCount
-        RealUsers         = ($DivisionCount.Values | Measure-Object -Sum).Sum
-        UniqueDivisions   = $DivisionCount.Count
-        GeneratedAt       = $time
-        ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
-    }
-}
-
-
-$json = $payload | ConvertTo-Json -Depth 4
-
-
-
-$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
-#$json | Out-File -FilePath $outputPath -Encoding default
-[System.IO.File]::WriteAllText($outputPath,$json, [System.Text.UTF8Encoding]::new($false))
-
-
-$RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
-
-Write-Host "`nПодсчёт по блокам" -ForegroundColor Green
-Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
-
-$DivisionCount.GetEnumerator() | 
-    Sort-Object Value -Descending | 
-    Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50}, 
-                 @{Label="Кол-во"; Expression={$_.Value}; Width=10}, 
-                 @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
-
-Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
-Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
-Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
-
-$timestop = Get-Date
-$TimeSum = $timestop - $timestart
-Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
-Write-Host "Файл сохранён." -ForegroundColor Green
+Смотри мне нужно будет делать логирование информации, во первых надо логировать статус всё ли успешно прошло или есть ошибки если ошибки записывать какие ошибки, первое обязательно время лога, и информацию начиная с посчёта по блокам до файл сохранён, путь к файлу я сам напишу 
