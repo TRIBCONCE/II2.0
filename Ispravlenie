@@ -4,6 +4,186 @@ $timestart = Get-Date
 $today = Get-Date -Format dd.MM.yyyy
 $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
+# Путь к логу
+$LogPath = "\\ПУТЬ\К\ЛОГУ\ADData_UsersBlocks.log"
+
+# Статус выполнения
+$ScriptStatus = "SUCCESS"
+
+# Функция записи в лог
+function Write-Log {
+    param(
+        [string]$Message
+    )
+    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
+}
+
+try {
+    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+
+    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+
+    $AllUsersOn = Get-ADUser `
+        -Filter { enabled -eq $true } `
+        -Credential $ab_creds `
+        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType
+
+    $LimitDate = (Get-Date).AddDays(-3)
+
+    $DivisionCount = @{}
+
+    # Счётчик исключённых
+    $ExcludedCount = 0
+
+    foreach ($User in $AllUsersOn) {
+
+        $sam = $User.samaccountname
+        $name = $User.name
+        $dn = $User.DistinguishedName
+
+        if (
+            $User.whenCreated -gt $LimitDate -or
+            $User.employeeType -eq "service" -or
+
+            $sam -like "Health*" -or
+            $sam -like "audit*" -or
+            $sam -like "esas*" -or
+            $sam -like "a-*" -or
+            $sam -like "z-*" -or
+            $name -like "*`$*" -or
+            $name -like "*Администратор*" -or
+            $name -like "*Тестовая*" -or
+            $dn -like "*Отключенные пользователи*" -or
+            $dn -like "*сторон*"
+        ) {
+            $ExcludedCount++
+            continue
+        }
+
+        $div = $User.division
+
+        if ($div) {
+            if ($DivisionCount.ContainsKey($div)) {
+                $DivisionCount[$div]++
+            }
+            else {
+                $DivisionCount[$div] = 1
+            }
+        }
+        else {
+            $emptyKey = "(не указано)"
+
+            if ($DivisionCount.ContainsKey($emptyKey)) {
+                $DivisionCount[$emptyKey]++
+            }
+            else {
+                $DivisionCount[$emptyKey] = 1
+            }
+        }
+    }
+
+    $discovery = foreach ($k in $DivisionCount.Keys) {
+        @{ '{#DIVISION}' = $k }
+    }
+
+    $payload = [ordered]@{
+        discovery = @($discovery)
+        counts = $DivisionCount
+        metadata = @{
+            TotalActiveUsers  = $AllUsersOn.Count
+            ExcludedUsers     = $ExcludedCount
+            RealUsers         = ($DivisionCount.Values | Measure-Object -Sum).Sum
+            UniqueDivisions   = $DivisionCount.Count
+            GeneratedAt       = $time
+            ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+        }
+    }
+
+    $json = $payload | ConvertTo-Json -Depth 4
+
+    $outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
+
+    [System.IO.File]::WriteAllText(
+        $outputPath,
+        $json,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+    # Логирование
+    Write-Log "========================================="
+    Write-Log "СТАТУС: $ScriptStatus"
+    Write-Log "Подсчёт по блокам"
+    Write-Log "Всего уникальных подразделений: $($DivisionCount.Count)"
+    Write-Log ""
+
+    Write-Host "`nПодсчёт по блокам" -ForegroundColor Green
+    Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        ForEach-Object {
+            $percent = "{0:P2}" -f ($_.Value / $RealUsersCount)
+            Write-Log ("{0,-60} {1,6} {2,8}" -f $_.Key, $_.Value, $percent)
+        }
+
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
+                     @{Label="Кол-во"; Expression={$_.Value}; Width=10},
+                     @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
+
+    Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
+    Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
+    Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
+
+    Write-Log ""
+    Write-Log "Всего активных пользователей в AD: $($AllUsersOn.Count)"
+    Write-Log "Исключено (служебные/админские/вендоры): $ExcludedCount"
+    Write-Log "Реальных пользователей для анализа: $RealUsersCount"
+
+    $timestop = Get-Date
+    $TimeSum = $timestop - $timestart
+
+    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+    Write-Host "Файл сохранён." -ForegroundColor Green
+
+    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
+    Write-Log "Файл сохранён: $outputPath"
+    Write-Log "СТАТУС: $ScriptStatus"
+    Write-Log "========================================="
+    Write-Log ""
+}
+catch {
+    $ScriptStatus = "ERROR"
+    
+    Write-Log "========================================="
+    Write-Log "СТАТУС: ERROR"
+    Write-Log "Ошибка:"
+    Write-Log $_.Exception.Message
+    Write-Log "Полная информация:"
+    Write-Log $_
+    Write-Log "========================================="
+    Write-Log ""
+    
+    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+    
+    throw
+}
+
+############
+
+
+cls
+
+$timestart = Get-Date
+$today = Get-Date -Format dd.MM.yyyy
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+
 $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
 $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
 
