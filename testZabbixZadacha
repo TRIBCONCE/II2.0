@@ -1,126 +1,167 @@
-# =========================================================================================================================
-# ADData_UsersBlocks_Discovery.ps1 — LLD discovery: пользователи по division
-# =========================================================================================================================
+Теперь смотри новая информация вот код который собирает данные сотрудников по больничным и отпускам
 
-cls
+function Invoke-Sql([string]$q){
+  $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
+  $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
+  $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
+  $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+  $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
+}
 
-# Фиксация времени
-$timestart = Get-Date
-$today = Get-Date -Format dd.MM.yyyy
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
-# =========================================================================================================================
-# Сбор данных из Active Directory
-# =========================================================================================================================
+$qF=@"
+SELECT e.LastName,e.FirstName,e.MiddleName,e.Tab_Numb,e.IDPerson,
+       f.StartDate,f.EndDate,f.CountDay,f.FurloughTypeID
+FROM IC.Furlough_WT f
+JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
+WHERE e.UvDate IS NULL
+  AND f.StartDate <= CAST(GETDATE() AS date)
+  AND f.EndDate >= CAST(GETDATE() AS date)
+ORDER BY f.StartDate,e.LastName
+"@
 
-$AllUsersOn = Get-ADUser -Filter { enabled -eq $true } -Properties division, samaccountname, DistinguishedName, name
+$qS=@"
+DECLARE @Today date = CAST(GETDATE() AS date);
+;WITH SickDays AS (
+  SELECT DISTINCT a.EmplID, CAST(a.[Day] AS date) AS SickDay
+  FROM [DWDATA_ODS].[IC].[Absent] a
+  WHERE a.TimeTypeID = '9A62E2C8-730F-11E7-80D4-005056926005'
+),
+MarkedDays AS (
+  SELECT EmplID, SickDay,
+    CASE WHEN LAG(SickDay) OVER (PARTITION BY EmplID ORDER BY SickDay)=DATEADD(day,-1,SickDay) THEN 0 ELSE 1 END AS IsNewPeriod
+  FROM SickDays
+),
+GroupedDays AS (
+  SELECT EmplID, SickDay,
+    SUM(IsNewPeriod) OVER (PARTITION BY EmplID ORDER BY SickDay ROWS UNBOUNDED PRECEDING) AS PeriodNo
+  FROM MarkedDays
+),
+SickPeriods AS (
+  SELECT EmplID, MIN(SickDay) AS SickFrom, MAX(SickDay) AS SickTo
+  FROM GroupedDays GROUP BY EmplID, PeriodNo
+)
+SELECT DISTINCT
+  e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson,
+  p.SickFrom AS StartDate, p.SickTo AS EndDate,
+  DATEDIFF(day, p.SickFrom, p.SickTo) + 1 AS CountDay
+FROM SickPeriods p
+JOIN [DWDATA_ODS].[IC].[Empl_WT_USPS] e ON e.EmplID=p.EmplID
+WHERE @Today BETWEEN p.SickFrom AND p.SickTo AND e.UvDate IS NULL
+ORDER BY p.SickTo, e.LastName
+"@
 
-# Хэш-таблица для подсчёта пользователей по division
-$DivisionCount = @{}
+$qE="SELECT DISTINCT IDPerson,email FROM IC.v_Empl_info WHERE email IS NOT NULL AND LTRIM(RTRIM(email))<>''"
 
-# Счётчик исключённых
-$ExcludedCount = 0
+$F = Invoke-Sql $qF
+$S = Invoke-Sql $qS
+$E = Invoke-Sql $qE
 
-foreach ($User in $AllUsersOn) {
-    $sam = $User.samaccountname
-    $name = $User.name
-    $dn  = $User.DistinguishedName
 
-    # Исключаем сервисные, административные и вендорские учётки
-    if (
-        $sam -like "s-*" -or $sam -like "sl-*" -or
-        $sam -like "*test*" -or $sam -like "Health*" -or
-        $sam -like "room*" -or $sam -like "sp-*" -or
-        $sam -like "st-*" -or $sam -like "audit*" -or
-        $sam -like "temp*" -or $sam -like "esas*" -or
-        $name -like "Сервисная*" -or
-        $sam -like "a-*" -or 
-        $sam -like "z-*" -or
-        $name -like "*`$*" -or
-        $name -like "*sadmin*" -or
-        $name -like "*Администратор*" -or
-        $name -like "Оператор" -or
-        $name -like "*СУЗ*" -or
-        $name -like "*Тестовая*" -or
-        $dn -like "*Сервисные учетные записи*" -or
-        $dn -like "*Отключенные пользователи*" -or
-        $dn -like "*сторон*"
-    ) {
-        $ExcludedCount++
-        continue
+# IDPerson -> список email из вьюхи 1C
+$mail=@{}
+foreach($r in $E.Rows){
+  $id="$($r.IDPerson)"
+  if(-not $mail.ContainsKey($id)){ $mail[$id]=New-Object System.Collections.ArrayList }
+  [void]$mail[$id].Add([string]$r.email)
+}
+
+# AD: собираем по всем активным УЗ -> хеш по табельнику
+$adByTab=@{}
+Get-ADUser -LDAPFilter "(&(wWWHomePage=*)(mail=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" `
+  -Properties mail,wWWHomePage,SamAccountName -Server $AdServer -Credential $AdCred |
+  Where-Object { $_.SamAccountName -notmatch '^(z|s|a)-' } |
+  ForEach-Object {
+    $t="$($_.wWWHomePage)".Trim()
+    if($t){
+      if(-not $adByTab.ContainsKey($t)){ $adByTab[$t]=New-Object System.Collections.ArrayList }
+      [void]$adByTab[$t].Add($_.mail)
     }
+  }
 
-    # Считаем по division
-    $div = $User.division
-    if ($div) {
-        if ($DivisionCount.ContainsKey($div)) {
-            $DivisionCount[$div]++
-        } else {
-            $DivisionCount[$div] = 1
+# Чтобы не дублировать код, выносим маппинг в отдельный блок скрипта (ScriptBlock)
+$ProcessRows = {
+    param($Rows, $TypeLabel)
+    foreach($r in $Rows){
+      $id="$($r.IDPerson)"; $tab="$($r.Tab_Numb)"
+      $list= if($mail.ContainsKey($id)){ @($mail[$id]) } else { @() }
+      $primary = $list | Select -First 1
+      $src = if($primary){"1C"}else{""}
+      
+      if(-not $primary){                       # fallback в AD по табельнику
+        if($adByTab.ContainsKey($tab)){
+          $adm=@($adByTab[$tab])
+          if($adm.Count -eq 1){ $primary=$adm[0]; $src="AD" }
+          else { $primary="AD_MULTI:"+($adm -join ","); $src="AD_MULTI" }
         }
-    } else {
-        $emptyKey = "(не указано)"
-        if ($DivisionCount.ContainsKey($emptyKey)) {
-            $DivisionCount[$emptyKey]++
-        } else {
-            $DivisionCount[$emptyKey] = 1
-        }
+      }
+      
+      [PSCustomObject]@{
+        ФИО      = ("{0} {1} {2}" -f $r.LastName,$r.FirstName,$r.MiddleName).Trim()
+        Тип      = $TypeLabel
+        Почта    = $primary
+        Источник = $src
+        Табель   = $tab
+        Начало   = ([datetime]$r.StartDate).ToString("dd.MM.yyyy")
+        Конец    = ([datetime]$r.EndDate).ToString("dd.MM.yyyy")
+        Дней     = $r.CountDay
+        EmailCnt = @($list).Count
+        Emails   = ($list -join "; ")
+        IDPerson = $id
+      }
     }
 }
 
-# =========================================================================================================================
-# Формирование discovery-данных для Zabbix LLD
-# =========================================================================================================================
 
-# Массив объектов для LLD — каждый division становится макросом {#DIVISION}
-$discovery = foreach ($k in $DivisionCount.Keys) {
-    @{ '{#DIVISION}' = $k }
+$rowsF = &$ProcessRows -Rows $F.Rows -TypeLabel 'Отпуск'
+$rowsS = &$ProcessRows -Rows $S.Rows -TypeLabel 'Больничный'
+
+# Вывод Отпусков
+Write-Host "`nОТПУСКА" -ForegroundColor Green
+if ($rowsF) {
+    $rowsF | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Format-Table -AutoSize
+    $noMailF = @($rowsF|?{-not $_.Почта})
+    Write-Host "Всего в отпуске: $($rowsF.Count) | без почты: $($noMailF.Count)" -ForegroundColor Cyan
+} else {
+    Write-Host "Сегодня нет сотрудников в отпуске." -ForegroundColor Yellow
 }
 
-# Итоговый payload: discovery (для Zabbix) + counts (для информации/отладки)
-$payload = [ordered]@{
-    discovery = @($discovery)
-    counts    = $DivisionCount
-    metadata  = @{
-        TotalActiveUsers  = $AllUsersOn.Count
-        ExcludedUsers     = $ExcludedCount
-        RealUsers         = ($DivisionCount.Values | Measure-Object -Sum).Sum
-        UniqueDivisions   = $DivisionCount.Count
-        GeneratedAt       = $time
-        ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
-    }
+# Вывод Больничных
+Write-Host "`nБОЛЬНИЧНЫЕ" -ForegroundColor Green
+if ($rowsS) {
+    $rowsS | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Format-Table -AutoSize
+    $noMailS = @($rowsS|?{-not $_.Почта})
+    Write-Host "Всего на больничном: $($rowsS.Count) | без почты: $($noMailS.Count)" -ForegroundColor Cyan
+} else {
+    Write-Host "Сегодня нет сотрудников на больничном." -ForegroundColor Yellow
 }
 
-# Конвертация в JSON
-$json = $payload | ConvertTo-Json -Depth 4
 
-# =========================================================================================================================
-# Сохранение результата
-# =========================================================================================================================
+# --- 5. ЭКСПОРТ В CSV ---
 
-$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
-$json | Out-File -FilePath $outputPath -Encoding default
+$dir = if($PSScriptRoot){$PSScriptRoot} elseif($MyInvocation.MyCommand.Path){Split-Path $MyInvocation.MyCommand.Path} else {(Get-Location).Path}
+$st = Get-Date -Format yyyyMMdd
+$allRows = @()
+if($rowsF) { $allRows += $rowsF }
+if($rowsS) { $allRows += $rowsS }
 
-# =========================================================================================================================
-# Вывод статистики в консоль
-# =========================================================================================================================
+if ($rowsF) {
+    $rowsF | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Export-Csv (Join-Path $dir "furlough_$st.csv") -NoTypeInformation -Encoding UTF8
+}
+if ($rowsS) {
+    $rowsS | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Export-Csv (Join-Path $dir "sickleave_$st.csv") -NoTypeInformation -Encoding UTF8
+}
 
-$RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+# Проблемные email (выгружаем общим списком для всех)
+$ambig = @($allRows | ?{$_.EmailCnt -gt 1})
+$adMulti = @($allRows | ?{$_.Источник -eq 'AD_MULTI'})
 
-Write-Host "`n=== Статистика по подразделениям (division) — LLD Discovery ===" -ForegroundColor Green
-Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
-
-$DivisionCount.GetEnumerator() | 
-    Sort-Object Value -Descending | 
-    Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50}, 
-                 @{Label="Кол-во"; Expression={$_.Value}; Width=10}, 
-                 @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
-
-Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
-Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
-Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
-
-$timestop = Get-Date
-$TimeSum = $timestop - $timestart
-Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
-Write-Host "Файл сохранён: $outputPath" -ForegroundColor Green
+if($ambig.Count){
+  $ambig | Select ФИО,Тип,Табель,IDPerson,Emails | Export-Csv (Join-Path $dir "absences_ambiguous_$st.csv") -NoTypeInformation -Encoding UTF8
+  Write-Host "`n[!] Неоднозначные email (1С) -> absences_ambiguous_$st.csv" -ForegroundColor Yellow
+}
+if($adMulti.Count){
+  $adMulti | Select ФИО,Тип,Табель,Почта | Export-Csv (Join-Path $dir "absences_admulti_$st.csv") -NoTypeInformation -Encoding UTF8
+  Write-Host "[!] AD: несколько УЗ на табельник -> absences_admulti_$st.csv" -ForegroundColor Yellow
+}
+Новый код должен записывать в discovery файл такую информацию: Колчичество сотрудников в отпуске, количество сотрудников на больничном, процентное соотношение сотрудников в отпуске ко всем сотрудникам в банке, процентное соотношение сотрудников на больничном ко всем сотрудникам в банке. 
