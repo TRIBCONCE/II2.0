@@ -1,4 +1,38 @@
-Смотри у меня вот есть код который собирает данные по отпускам сотрудников, мне надо сделать новую логику и собирать только тех сотрудников которые находятся в отпуске на момент исполнения скрипта тоесть сегодня
+  # 1. Кто СЕГОДНЯ на больничном (период мог открыться раньше)
+  $F=Invoke-Sql @"
+DECLARE @Today date = CAST(GETDATE() AS date);
+;WITH SickDays AS (
+  SELECT DISTINCT a.EmplID, CAST(a.[Day] AS date) AS SickDay
+  FROM [DWDATA_ODS].[IC].[Absent] a
+  WHERE a.TimeTypeID = '9A62E2C8-730F-11E7-80D4-005056926005'
+),
+MarkedDays AS (
+  SELECT EmplID, SickDay,
+    CASE WHEN LAG(SickDay) OVER (PARTITION BY EmplID ORDER BY SickDay)=DATEADD(day,-1,SickDay) THEN 0 ELSE 1 END AS IsNewPeriod
+  FROM SickDays
+),
+GroupedDays AS (
+  SELECT EmplID, SickDay,
+    SUM(IsNewPeriod) OVER (PARTITION BY EmplID ORDER BY SickDay ROWS UNBOUNDED PRECEDING) AS PeriodNo
+  FROM MarkedDays
+),
+SickPeriods AS (
+  SELECT EmplID, MIN(SickDay) AS SickFrom, MAX(SickDay) AS SickTo
+  FROM GroupedDays GROUP BY EmplID, PeriodNo
+)
+SELECT DISTINCT
+  e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson,
+  p.SickFrom AS StartDate, p.SickTo AS EndDate
+FROM SickPeriods p
+JOIN [DWDATA_ODS].[IC].[Empl_WT_USPS] e ON e.EmplID=p.EmplID
+WHERE @Today BETWEEN p.SickFrom AND p.SickTo AND e.UvDate IS NULL
+ORDER BY p.SickTo, e.LastName
+"@
+  $E=Invoke-Sql "SELECT DISTINCT IDPerson,email FROM IC.v_Empl_info WHERE email IS NOT NULL AND LTRIM(RTRIM(email))<>''"
+Вот код по больничным, добавь логику сбора людей по больничным вот в этот основной код который собирает людей по отпускам 
+
+
+
 
 function Invoke-Sql([string]$q){
   $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
@@ -14,8 +48,8 @@ SELECT e.LastName,e.FirstName,e.MiddleName,e.Tab_Numb,e.IDPerson,
 FROM IC.Furlough_WT f
 JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
 WHERE e.UvDate IS NULL
-  AND f.StartDate>=CAST(GETDATE() AS date)
-  AND f.StartDate<=DATEADD(day,$Days,CAST(GETDATE() AS date))
+  AND f.StartDate <= CAST(GETDATE() AS date)
+  AND f.EndDate >= CAST(GETDATE() AS date)
 ORDER BY f.StartDate,e.LastName
 "@
 $qE="SELECT DISTINCT IDPerson,email FROM IC.v_Empl_info WHERE email IS NOT NULL AND LTRIM(RTRIM(email))<>''"
