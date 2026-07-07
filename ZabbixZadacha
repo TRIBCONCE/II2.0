@@ -1,3 +1,8 @@
+$Users1C = Import-Csv -Delimiter ";" -Path $TXT_PATH -WarningAction SilentlyContinue | Where-Object { 
+        $_.decret -eq "0" -and ([string]::IsNullOrWhiteSpace($_.date_uv) -or ([datetime]::ParseExact($_.date_uv, "dd.MM.yyyy", $null) -ge $today.Date))
+    }
+$qTotal = "SELECT COUNT(EmplID) AS TotalCount FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
+Можешь первый код привести в подобие второго 
 Теперь нужно сформировать новый код который собирает и формирует новый discovary zabbix файл
 Вот код который формирует файл по всем департаментам, из него надо взять логику формирования файла правильную запись в файл информации а так же подсчёт всех сотрудников: 
 cls
