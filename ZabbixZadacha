@@ -1,114 +1,90 @@
-cls
-$date = Get-Date # Фиксируем время начала формирования отчета
-$timestart = Get-Date # Фиксируем время начала формирования отчета
-$today = Get-Date -Format dd.MM.yyyy # Текущая дата
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
-$lastday = (Get-Date).AddDays(-1).Date
-$lastdayStart = $lastday 
-$lastdayStop = $lastday + "23:59:59"
+Смотри у меня вот есть код который собирает данные по отпускам сотрудников, мне надо сделать новую логику и собирать только тех сотрудников которые находятся в отпуске на момент исполнения скрипта тоесть сегодня
 
-# Все объекты
-$AllObjects = Get-ADObject -Filter * # "Все объекты: "
-    #$AllObjectsOn = $AllObjects | Where-Object {$_.enabled -eq $true}
-
-$AllUsers = Get-ADUser -Filter * -Properties whencreated,wWWHomePage,employeeID # "Все пользователи: "
-    $AllUsersOn = $AllUsers | Where-Object {$_.enabled -eq $true} # "Все активные пользователи: "
-    $AllUsersOnS = $AllUsersOn | Where-Object {$_.samaccountname -like "s-*" -or $_.samaccountname -like "sl-*" -or $_.samaccountname -like "*test*" -or $_.samaccountname -like "Health*" -or $_.samaccountname -like "room*" -or $_.samaccountname -like "sp-*" -or $_.samaccountname -like "st-*" -or $_.samaccountname -like "audit*" -or $_.samaccountname -like "temp*" -or $_.samaccountname -like "esas*" -or $_.name -like "Сервисная*"} # "Все сервисные УЗ: "
-    $AllUsersOnA = $AllUsersOn | Where-Object {$_.samaccountname -like "a-*"} # "Все админ a- УЗ: "
-    $AllUsersOnZ = $AllUsersOn | Where-Object {$_.samaccountname -like "z-*"} # "Все админ z- УЗ: "
-    $AllUsersOnU = $AllUsersOn | Where-Object {$_.DistinguishedName -like "*сторон*"} # "Все УЗ вендоров: "
-    $AllUsersOnErrorTN = $AllUsersOn | Where-Object {$_.wWWHomePage -ne $_.employeeID} # "Пользователи, у которых не совпадает табельный номер"
-    $AllUsersOnErrorDN = $AllUsersOn | Where-Object {$_.wWWHomePage -like "*" -and $_.Name -like "*_"} # "Активные пользователи с Description *Уволен* + *_*"
-    $AllUsersOnErrorOU = $AllUsersOn | Where-Object {$_.DistinguishedName -like "*Отключенные*"} # Активные пользователи в OU Уволенные сотрудники / Отключенные
-    $AllUsersOnErrorNum = $AllUsersOn | Where-Object {$_.name  -match '\d' -and ($_.samaccountname -notlike "s-*" -and $_.samaccountname -notlike "sl-*" -and $_.samaccountname -notlike "*test*" -and $_.samaccountname -notlike "room*" -and $_.samaccountname -notlike "Health*" -and $_.samaccountname -notlike "sp-*" -and $_.samaccountname -notlike "st-*" -and $_.samaccountname -notlike "audit*" -and $_.samaccountname -notlike "temp*" -and $_.samaccountname -notlike "esas*" -and $_.name -like "Сервисная*")} # 
-    # Бессрочный пароль PasswordNeverExpires -eq $true
-    $AllUsersNewU = $AllUsersOn | Where-Object {($_.whencreated -ge $lastdayStart -and $_.whencreated -le $lastdayStop -and $_.SamAccountName -notlike 'z-*' -and $_.SamAccountName -notlike 's-*' -and $_.SamAccountName -notlike '*test*' -and $_.SamAccountName -notlike 'sl-*')}
-      
-
-$AllGroup = Get-ADGroup -Filter * -Properties Members # "Все группы: "
-    $GroupEmpty = $AllGroup | Where-Object {$_.members.Count -eq 0} # Пустые группы безопасности
-
-$AllComputers = Get-ADComputer -Filter * -Properties operatingSystem, whenCreated # "Все компьютеры: "
-    $ComputersOn = $AllComputers | Where-Object {$_.enabled -eq $true} # "Все вкл.компьютеры: "
-
-    $ComputersOnWSrv = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows Server*"} # "Windows Servers: "
-    $ComputersOnWSrv2019 = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows Server 2019*"} # "Windows Servers 2019: "
-    $ComputersOnWSrv2016 = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows Server 2016*"} # "Windows Servers 2016: "
-    $ComputersOnWSrv2012 = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows Server 2012*"} # "Windows Servers 2012: "
-    $ComputersOnWSrv2008 = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows Server 2008*"} # "Windows Servers 2008: "
-
-    $ComputersOnW11 = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows 11*"} # "Windows 11: "
-    $ComputersOnW10 = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows 10*"} # "Windows 10: "
-    $ComputersOnW8 = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows 8*"} # "Windows 8: "
-    $ComputersOnW7 = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows 7*"} # "Windows 7: "
-    $ComputersOnWXP = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows XP*"} # "Windows XP: "
-    $ComputersOnURM = $ComputersOn | Where-Object {$_.samaccountname -like "URM-*" -and $_.operatingSystem -notlike "Windows Server*"} # "URM: "
-    $ComputersOnMRM = $ComputersOn | Where-Object {$_.samaccountname -like "MRM-*" -and $_.operatingSystem -notlike "Windows Server*"} # "MRM: "
-    $ComputersOnKOV = $ComputersOn | Where-Object {$_.samaccountname -like "kov*" -and $_.operatingSystem -notlike "Windows Server*"} # "KOV: "
-    $ComputersOnSUO = $ComputersOn | Where-Object {$_.samaccountname -like "suo*" -and $_.operatingSystem -notlike "Windows Server*"} # "SUO: "
-    $ComputersOnGO = $ComputersOn | Where-Object {$_.samaccountname -like "GO-*" -and $_.operatingSystem -notlike "Windows Server*"} # "GO: "
-    $ComputersOnFIL = $ComputersOn | Where-Object {$_.operatingSystem -notlike "Windows Server*" -and ($_.samaccountname -like "AL-*" -or $_.samaccountname -like "AR-*" -or $_.samaccountname -like "BA-*" -or $_.samaccountname -like "EK-*" -or $_.samaccountname -like "EL-*" -or $_.samaccountname -like "ZK-*" -or $_.samaccountname -like "ZE-*" -or $_.samaccountname -like "IZ-*" -or $_.samaccountname -like "KF-*" -or $_.samaccountname -like "KR-*" -or $_.samaccountname -like "KK-*" -or $_.samaccountname -like "MA-*" -or $_.samaccountname -like "NI-*" -or $_.samaccountname -like "NK-*"  -or $_.samaccountname -like "NO-*" -or $_.samaccountname -like "OM-*" -or $_.samaccountname -like "OR-*" -or $_.samaccountname -like "PM-*" -or $_.samaccountname -like "SA-*" -or $_.samaccountname -like "SR-*" -or $_.samaccountname -like "SZ-*" -or $_.samaccountname -like "UR-*" -or $_.samaccountname -like "UL-*" -or $_.samaccountname -like "UF-*" -or $_.samaccountname -like "MS-*" -or $_.samaccountname -like "CR-*")} # "Рег.сеть: "
-    $ComputersOnNew = $ComputersOn | Where-Object {$_.operatingSystem -like "Windows*" -and $_.operatingSystem -notlike "Windows Server*" -and $_.whencreated -ge $lastdayStart -and $_.whencreated -le $lastdayStop} 
-
-# Считываем данные из текстового файла 1C
-$Users1C = Import-Csv -Delimiter ";" -Path "\\abb-win.akbars.ru\departments\AppDS\1CKadryIntegration\Список.txt" | Where-Object { $_.decret -eq "0" -and $_.date_uv -eq "" } 
-$Users1Comr = $Users1C | Where-Object { $_.vid_zan -eq "Основное место работы" }
-$Users1Cins = $Users1C | Where-Object { $_.vid_zan -eq "Внешнее совместительство" }
-$Users1Couts = $Users1C | Where-Object { $_.vid_zan -eq "Внутреннее совместительство" }
-$Users1Cdecret = Import-Csv -Delimiter ";" -Path "\\abb-win.akbars.ru\departments\AppDS\1CKadryIntegration\Список.txt" | Where-Object { $_.decret -eq "1" -and $_.date_uv -eq "" } 
-
-$ADData = @{
-    Users1Comr = ($Users1Comr | Measure-Object).count
-    Users1Cins = ($Users1Cins | Measure-Object).count
-    Users1Couts = ($Users1Couts | Measure-Object).count
-    Users1Cdecret = ($Users1Cdecret | Measure-Object).count
-    AllObjects = ($AllObjects | Measure-Object).count
-    AllUsers = ($AllUsers | Measure-Object).count
-    AllUsersOn = ($AllUsersOn | Measure-Object).count
-    AllUsersOnS = ($AllUsersOnS | Measure-Object).count
-    AllUsersOnA = ($AllUsersOnA | Measure-Object).count
-    AllUsersOnZ = ($AllUsersOnZ | Measure-Object).count
-    AllUsersOnU = ($AllUsersOnU | Measure-Object).count
-    AllUsersNewU = ($AllUsersNewU | Measure-Object).Count
-    AllUsersOnErrorNum = ($AllUsersOnErrorNum | Measure-Object).Count
-    AllUsersOnErrorOU = ($AllUsersOnErrorOU | Measure-Object).count
-    AllUsersOnErrorDN = ($AllUsersOnErrorDN | Measure-Object).Count
-    AllUsersOnErrorTN = ($AllUsersOnErrorTN | Measure-Object).Count
-    AllGroup = ($AllGroup | Measure-Object).count
-    GroupEmpty = ($GroupEmpty | Measure-Object).count
-    AllComputers = ($AllComputers | Measure-Object).count
-    ComputersOn = ($ComputersOn | Measure-Object).count
-    ComputersOnWSrv = ($ComputersOnWSrv | Measure-Object).count
-    ComputersOnWSrv2019 = ($ComputersOnWSrv2019 | Measure-Object).count
-    ComputersOnWSrv2016 = ($ComputersOnWSrv2016 | Measure-Object).count
-    ComputersOnWSrv2012 = ($ComputersOnWSrv2012 | Measure-Object).count
-    ComputersOnWSrv2008 = ($ComputersOnWSrv2008 | Measure-Object).count
-    ComputersOnW11 = ($ComputersOnW11 | Measure-Object).count
-    ComputersOnW10 = ($ComputersOnW10 | Measure-Object).count
-    ComputersOnW8 = ($ComputersOnW8 | Measure-Object).count
-    ComputersOnW7 = ($ComputersOnW7 | Measure-Object).count
-    ComputersOnWXP = ($ComputersOnWXP | Measure-Object).count
-    ComputersOnURM = ($ComputersOnURM | Measure-Object).count
-    ComputersOnMRM = ($ComputersOnMRM | Measure-Object).count
-    ComputersOnSUO = ($ComputersOnSUO | Measure-Object).count
-    ComputersOnKOV = ($ComputersOnKOV | Measure-Object).count
-    ComputersOnFIL = ($ComputersOnFIL | Measure-Object).count
-    ComputersOnGO = ($ComputersOnGO | Measure-Object).count
-    ComputersOnNew = ($ComputersOnNew | Measure-Object).count
-    Timestart = $time
+function Invoke-Sql([string]$q){
+  $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
+  $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
+  $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
+  $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+  $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
 }
 
-$JSONdata = $ADData | ConvertTo-Json 
+$qF=@"
+SELECT e.LastName,e.FirstName,e.MiddleName,e.Tab_Numb,e.IDPerson,
+       f.StartDate,f.EndDate,f.CountDay,f.FurloughTypeID
+FROM IC.Furlough_WT f
+JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
+WHERE e.UvDate IS NULL
+  AND f.StartDate>=CAST(GETDATE() AS date)
+  AND f.StartDate<=DATEADD(day,$Days,CAST(GETDATE() AS date))
+ORDER BY f.StartDate,e.LastName
+"@
+$qE="SELECT DISTINCT IDPerson,email FROM IC.v_Empl_info WHERE email IS NOT NULL AND LTRIM(RTRIM(email))<>''"
 
-$JSONdata | Out-File -FilePath "C:\Program Files\Zabbix Agent\scripts\AD\ADData.txt" -Encoding default
-# Write-Output $JSONdata
+$F=Invoke-Sql $qF
+$E=Invoke-Sql $qE
 
-#####################################################################################################################################
-# Подсчет времени формирования отчета
+# IDPerson -> список email из вьюхи
+$mail=@{}
+foreach($r in $E.Rows){
+  $id="$($r.IDPerson)"
+  if(-not $mail.ContainsKey($id)){ $mail[$id]=New-Object System.Collections.ArrayList }
+  [void]$mail[$id].Add([string]$r.email)
+}
 
-$timestop = Get-Date
-$TimeSum = $timestop - $timestart 
-$TimeSumH = $TimeSum.Hours
-$TimeSumM = $TimeSum.Minutes
-$TimeSumS = $TimeSum.Seconds
-Write-Host "Время формирования отчета составило: "$TimeSumH"ч "$TimeSumM"м "$TimeSumS"с"
+# AD: один запрос — все обычные Enabled УЗ с табельником и почтой -> хеш по табельнику
+$adByTab=@{}
+Get-ADUser -LDAPFilter "(&(wWWHomePage=*)(mail=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" `
+  -Properties mail,wWWHomePage,SamAccountName -Server $AdServer -Credential $AdCred |
+  Where-Object { $_.SamAccountName -notmatch '^(z|s|a)-' } |
+  ForEach-Object {
+    $t="$($_.wWWHomePage)".Trim()
+    if($t){
+      if(-not $adByTab.ContainsKey($t)){ $adByTab[$t]=New-Object System.Collections.ArrayList }
+      [void]$adByTab[$t].Add($_.mail)
+    }
+  }
+
+$rows=foreach($r in $F.Rows){
+  $id="$($r.IDPerson)"; $tab="$($r.Tab_Numb)"
+  $list= if($mail.ContainsKey($id)){ @($mail[$id]) } else { @() }
+  $primary = $list | Select -First 1
+  $src = if($primary){"1C"}else{""}
+  if(-not $primary){                       # fallback в AD по табельнику (из хеша)
+    if($adByTab.ContainsKey($tab)){
+      $adm=@($adByTab[$tab])
+      if($adm.Count -eq 1){ $primary=$adm[0]; $src="AD" }
+      else { $primary="AD_MULTI:"+($adm -join ","); $src="AD_MULTI" }
+    }
+  }
+  [PSCustomObject]@{
+    ФИО      = ("{0} {1} {2}" -f $r.LastName,$r.FirstName,$r.MiddleName).Trim()
+    Почта    = $primary
+    Источник = $src
+    Табель   = $tab
+    Начало   = ([datetime]$r.StartDate).ToString("dd.MM.yyyy")
+    Конец    = ([datetime]$r.EndDate).ToString("dd.MM.yyyy")
+    Дней     = $r.CountDay
+    EmailCnt = @($list).Count
+    Emails   = ($list -join "; ")
+    IDPerson = $id
+  }
+}
+
+$rows | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Format-Table -AutoSize
+$noMail=@($rows|?{-not $_.Почта})
+$ambig =@($rows|?{$_.EmailCnt -gt 1})
+$adMulti=@($rows|?{$_.Источник -eq 'AD_MULTI'})
+$fromAd=@($rows|?{$_.Источник -eq 'AD'})
+Write-Host "`nВсего: $($rows.Count) | без почты: $($noMail.Count) | из AD: $($fromAd.Count) | AD-мультидубль: $($adMulti.Count) | неоднозн.(1С): $($ambig.Count)" -ForegroundColor Cyan
+
+$dir= if($PSScriptRoot){$PSScriptRoot} elseif($MyInvocation.MyCommand.Path){Split-Path $MyInvocation.MyCommand.Path} else {(Get-Location).Path}
+$st=Get-Date -Format yyyyMMdd
+$rows | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Export-Csv (Join-Path $dir "furlough_$st.csv") -NoTypeInformation -Encoding UTF8
+if($ambig.Count){
+  $ambig | Select ФИО,Табель,IDPerson,Emails | Export-Csv (Join-Path $dir "furlough_ambiguous_$st.csv") -NoTypeInformation -Encoding UTF8
+  Write-Host "Неоднозначные email (1С) -> furlough_ambiguous_$st.csv" -ForegroundColor Yellow
+}
+if($adMulti.Count){
+  $adMulti | Select ФИО,Табель,Почта | Export-Csv (Join-Path $dir "furlough_admulti_$st.csv") -NoTypeInformation -Encoding UTF8
+  Write-Host "AD: несколько УЗ на табельник -> furlough_admulti_$st.csv" -ForegroundColor Yellow
+}
