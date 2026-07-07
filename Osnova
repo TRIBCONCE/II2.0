@@ -1,136 +1,169 @@
-# src/main.py
+function Invoke-Sql([string]$q){
+  $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
+  $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
+  $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
+  $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+  $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
+}
 
-from fastapi import FastAPI
+# --- 1. ЗАПРОСЫ К БД ---
 
-from bot import create_bot
-from config import settings
-from game_state import GameState
-from routers.botx import router as botx_router
-from routers.health import router as health_router
+$qF=@"
+SELECT e.LastName,e.FirstName,e.MiddleName,e.Tab_Numb,e.IDPerson,
+       f.StartDate,f.EndDate,f.CountDay,f.FurloughTypeID
+FROM IC.Furlough_WT f
+JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
+WHERE e.UvDate IS NULL
+  AND f.StartDate <= CAST(GETDATE() AS date)
+  AND f.EndDate >= CAST(GETDATE() AS date)
+ORDER BY f.StartDate,e.LastName
+"@
 
-LOG = settings.logger
+$qS=@"
+DECLARE @Today date = CAST(GETDATE() AS date);
+;WITH SickDays AS (
+  SELECT DISTINCT a.EmplID, CAST(a.[Day] AS date) AS SickDay
+  FROM [DWDATA_ODS].[IC].[Absent] a
+  WHERE a.TimeTypeID = '9A62E2C8-730F-11E7-80D4-005056926005'
+),
+MarkedDays AS (
+  SELECT EmplID, SickDay,
+    CASE WHEN LAG(SickDay) OVER (PARTITION BY EmplID ORDER BY SickDay)=DATEADD(day,-1,SickDay) THEN 0 ELSE 1 END AS IsNewPeriod
+  FROM SickDays
+),
+GroupedDays AS (
+  SELECT EmplID, SickDay,
+    SUM(IsNewPeriod) OVER (PARTITION BY EmplID ORDER BY SickDay ROWS UNBOUNDED PRECEDING) AS PeriodNo
+  FROM MarkedDays
+),
+SickPeriods AS (
+  SELECT EmplID, MIN(SickDay) AS SickFrom, MAX(SickDay) AS SickTo
+  FROM GroupedDays GROUP BY EmplID, PeriodNo
+)
+SELECT DISTINCT
+  e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson,
+  p.SickFrom AS StartDate, p.SickTo AS EndDate,
+  DATEDIFF(day, p.SickFrom, p.SickTo) + 1 AS CountDay
+FROM SickPeriods p
+JOIN [DWDATA_ODS].[IC].[Empl_WT_USPS] e ON e.EmplID=p.EmplID
+WHERE @Today BETWEEN p.SickFrom AND p.SickTo AND e.UvDate IS NULL
+ORDER BY p.SickTo, e.LastName
+"@
 
-# ── Создание бота и приложения ──
-bot = create_bot()
-app = FastAPI(docs_url="/swagger")
+$qE="SELECT DISTINCT IDPerson,email FROM IC.v_Empl_info WHERE email IS NOT NULL AND LTRIM(RTRIM(email))<>''"
+
+# Выполняем SQL запросы
+$F = Invoke-Sql $qF
+$S = Invoke-Sql $qS
+$E = Invoke-Sql $qE
+
+# --- 2. СБОР КОНТАКТОВ (1С и AD) ---
+
+# IDPerson -> список email из вьюхи 1C
+$mail=@{}
+foreach($r in $E.Rows){
+  $id="$($r.IDPerson)"
+  if(-not $mail.ContainsKey($id)){ $mail[$id]=New-Object System.Collections.ArrayList }
+  [void]$mail[$id].Add([string]$r.email)
+}
+
+# AD: собираем по всем активным УЗ -> хеш по табельнику
+$adByTab=@{}
+Get-ADUser -LDAPFilter "(&(wWWHomePage=*)(mail=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" `
+  -Properties mail,wWWHomePage,SamAccountName -Server $AdServer -Credential $AdCred |
+  Where-Object { $_.SamAccountName -notmatch '^(z|s|a)-' } |
+  ForEach-Object {
+    $t="$($_.wWWHomePage)".Trim()
+    if($t){
+      if(-not $adByTab.ContainsKey($t)){ $adByTab[$t]=New-Object System.Collections.ArrayList }
+      [void]$adByTab[$t].Add($_.mail)
+    }
+  }
+
+# --- 3. ФУНКЦИЯ ДЛЯ ОБРАБОТКИ СТРОК ---
+# Чтобы не дублировать код, выносим маппинг в отдельный блок скрипта (ScriptBlock)
+$ProcessRows = {
+    param($Rows, $TypeLabel)
+    foreach($r in $Rows){
+      $id="$($r.IDPerson)"; $tab="$($r.Tab_Numb)"
+      $list= if($mail.ContainsKey($id)){ @($mail[$id]) } else { @() }
+      $primary = $list | Select -First 1
+      $src = if($primary){"1C"}else{""}
+      
+      if(-not $primary){                       # fallback в AD по табельнику
+        if($adByTab.ContainsKey($tab)){
+          $adm=@($adByTab[$tab])
+          if($adm.Count -eq 1){ $primary=$adm[0]; $src="AD" }
+          else { $primary="AD_MULTI:"+($adm -join ","); $src="AD_MULTI" }
+        }
+      }
+      
+      [PSCustomObject]@{
+        ФИО      = ("{0} {1} {2}" -f $r.LastName,$r.FirstName,$r.MiddleName).Trim()
+        Тип      = $TypeLabel
+        Почта    = $primary
+        Источник = $src
+        Табель   = $tab
+        Начало   = ([datetime]$r.StartDate).ToString("dd.MM.yyyy")
+        Конец    = ([datetime]$r.EndDate).ToString("dd.MM.yyyy")
+        Дней     = $r.CountDay
+        EmailCnt = @($list).Count
+        Emails   = ($list -join "; ")
+        IDPerson = $id
+      }
+    }
+}
+
+# --- 4. ФОРМИРОВАНИЕ И ВЫВОД ДАННЫХ ---
+
+$rowsF = &$ProcessRows -Rows $F.Rows -TypeLabel 'Отпуск'
+$rowsS = &$ProcessRows -Rows $S.Rows -TypeLabel 'Больничный'
+
+# Вывод Отпусков
+Write-Host "`n================== ОТПУСКА ==================" -ForegroundColor Green
+if ($rowsF) {
+    $rowsF | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Format-Table -AutoSize
+    $noMailF = @($rowsF|?{-not $_.Почта})
+    Write-Host "Всего в отпуске: $($rowsF.Count) | без почты: $($noMailF.Count)" -ForegroundColor Cyan
+} else {
+    Write-Host "Сегодня нет сотрудников в отпуске." -ForegroundColor Yellow
+}
+
+# Вывод Больничных
+Write-Host "`n================= БОЛЬНИЧНЫЕ ================" -ForegroundColor Green
+if ($rowsS) {
+    $rowsS | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Format-Table -AutoSize
+    $noMailS = @($rowsS|?{-not $_.Почта})
+    Write-Host "Всего на больничном: $($rowsS.Count) | без почты: $($noMailS.Count)" -ForegroundColor Cyan
+} else {
+    Write-Host "Сегодня нет сотрудников на больничном." -ForegroundColor Yellow
+}
 
 
-# ── Lifecycle ──
-async def on_startup() -> None:
-    LOG.info("[startup] Бот «Что? Где? Когда?» запускается...")
-    await bot.startup()
-    bot.state.game = GameState()
-    LOG.info("[startup] Готово. Ожидаю команды.")
+# --- 5. ЭКСПОРТ В CSV ---
 
+$dir = if($PSScriptRoot){$PSScriptRoot} elseif($MyInvocation.MyCommand.Path){Split-Path $MyInvocation.MyCommand.Path} else {(Get-Location).Path}
+$st = Get-Date -Format yyyyMMdd
+$allRows = @()
+if($rowsF) { $allRows += $rowsF }
+if($rowsS) { $allRows += $rowsS }
 
-async def on_shutdown() -> None:
-    LOG.info("[shutdown] Остановка бота...")
-    game: GameState = bot.state.game
-    if game.timer_task and not game.timer_task.done():
-        game.timer_task.cancel()
-    await bot.shutdown()
-    LOG.info("[shutdown] Бот остановлен.")
+if ($rowsF) {
+    $rowsF | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Export-Csv (Join-Path $dir "furlough_$st.csv") -NoTypeInformation -Encoding UTF8
+}
+if ($rowsS) {
+    $rowsS | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Export-Csv (Join-Path $dir "sickleave_$st.csv") -NoTypeInformation -Encoding UTF8
+}
 
+# Проблемные email (выгружаем общим списком для всех)
+$ambig = @($allRows | ?{$_.EmailCnt -gt 1})
+$adMulti = @($allRows | ?{$_.Источник -eq 'AD_MULTI'})
 
-app.add_event_handler("startup", on_startup)
-app.add_event_handler("shutdown", on_shutdown)
-
-app.state.bot = bot
-
-app.include_router(health_router)
-app.include_router(botx_router)
-
-файл config.py
-
-# src/config.py
-
-import logging
-import sys
-from functools import lru_cache
-from uuid import UUID
-
-from pydantic import AnyHttpUrl, BaseSettings, Field
-
-
-# ── Логгер ──────────────────────────────────────────────────────
-def _setup_logger() -> logging.Logger:
-    logger = logging.getLogger("quiz_bot")
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(
-            logging.Formatter("[%(asctime)s] %(levelname)s — %(message)s",
-                              datefmt="%Y-%m-%d %H:%M:%S")
-        )
-        logger.addHandler(handler)
-    return logger
-
-
-# ── Pydantic Settings ───────────────────────────────────────────
-class ExpressSettings(BaseSettings):
-    uuid: UUID = Field(..., env="EXPRESS_UUID")
-    cts_url: AnyHttpUrl = Field(..., env="EXPRESS_URL")
-    secret_key: str = Field(..., env="EXPRESS_SECRET_KEY")
-
-
-class GameSettings(BaseSettings):
-    admin_login: str = Field("rashidovar", env="ADMIN_LOGIN")
-    timer_discussion: int = Field(60, env="TIMER_DISCUSSION")
-    timer_answer: int = Field(10, env="TIMER_ANSWER")
-
-
-class Settings(BaseSettings):
-    express: ExpressSettings = Field(default_factory=ExpressSettings)
-    game: GameSettings = Field(default_factory=GameSettings)
-    logger: logging.Logger = Field(default_factory=_setup_logger)
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        arbitrary_types_allowed = True
-
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-
-
-settings = get_settings()
-
-файл бот 
-# src/bot.py
-
-from uuid import UUID
-
-import httpx
-from pybotx import Bot, BotAccountWithSecret, HandlerCollector
-
-from config import settings
-from handlers import game
-
-
-def create_bot() -> Bot:
-    """Фабрика: создаёт и конфигурирует экземпляр бота."""
-
-    main_collector = HandlerCollector()
-    main_collector.include(game.collector)
-
-    timeouts = httpx.Timeout(30.0, connect=5.0)
-    limits = httpx.Limits(
-        max_keepalive_connections=5,
-        max_connections=10,
-        keepalive_expiry=5,
-    )
-    httpx_client = httpx.AsyncClient(timeout=timeouts, limits=limits)
-
-    return Bot(
-        collectors=[main_collector],
-        bot_accounts=[
-            BotAccountWithSecret(
-                id=UUID(str(settings.express.uuid)),
-                cts_url=settings.express.cts_url,
-                secret_key=settings.express.secret_key,
-            ),
-        ],
-        httpx_client=httpx_client,
-    )
+if($ambig.Count){
+  $ambig | Select ФИО,Тип,Табель,IDPerson,Emails | Export-Csv (Join-Path $dir "absences_ambiguous_$st.csv") -NoTypeInformation -Encoding UTF8
+  Write-Host "`n[!] Неоднозначные email (1С) -> absences_ambiguous_$st.csv" -ForegroundColor Yellow
+}
+if($adMulti.Count){
+  $adMulti | Select ФИО,Тип,Табель,Почта | Export-Csv (Join-Path $dir "absences_admulti_$st.csv") -NoTypeInformation -Encoding UTF8
+  Write-Host "[!] AD: несколько УЗ на табельник -> absences_admulti_$st.csv" -ForegroundColor Yellow
+}
