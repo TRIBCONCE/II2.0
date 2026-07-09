@@ -1,122 +1,133 @@
 try {
-    Import-Module ActiveDirectory -ErrorAction Stop
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
 
-    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
-    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+    try {
+        $workbook = $excel.Workbooks.Open($XLSX_PATH)
 
-    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
-    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+        $dict = @{}
 
-    $AllUsersOn = Get-ADUser `
-        -Filter { enabled -eq $true } `
-        -Credential $ab_creds `
-        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials
+        foreach ($sheetName in @("department", "dep", "dep1")) {
+            $worksheet = $workbook.Worksheets.Item($sheetName)
+            $sheetDict = @{}
 
-    $LimitDate = (Get-Date).AddDays(-3)
+            $row = 2
+            while ($worksheet.Cells.Item($row, 1).Text -ne "") {
+                $block = $worksheet.Cells.Item($row, 1).Text.Trim()
+                $name  = $worksheet.Cells.Item($row, 2).Text.Trim()
 
-    # Исключения по initials
-    $ExcludeInitials = @("abdt","vnsov","1/40")
+                if ($block -and $name) {
+                    $sheetDict[$name.ToLower()] = $block
+                }
+                $row++
+            }
 
-    # Ручные исключения по логинам SamAccountName
-    # Эти УЗ вообще не будут попадать в счетчики
-    $ExcludeSamAccounts = @(
-        "TantushjanAM"
-    )
-
-    $ExcludeSamAccountsHash = @{}
-    foreach ($x in $ExcludeSamAccounts) {
-        $x = ([string]$x).Trim()
-        if ($x) {
-            $ExcludeSamAccountsHash[$x] = $true
+            $dict[$sheetName] = $sheetDict
         }
+
+        $workbook.Close($false)
+    } finally {
+        $excel.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
     }
+
+    $Users1C = Import-Csv -Delimiter ";" -Path $TXT_PATH -WarningAction SilentlyContinue | Where-Object { 
+        $_.decret -eq "0" -and $_.vid_zan -eq "Основное место работы" -and ([string]::IsNullOrWhiteSpace($_.date_uv) -or ([datetime]::ParseExact($_.date_uv, "dd.MM.yyyy", $null) -ge $today.Date))
+    }
+
+    function Resolve-Block {
+        param($Employee, $Dictionary)
+
+        $podr = $Employee.podr
+        if (-not [string]::IsNullOrWhiteSpace($podr)) {
+            $parts = $podr -split '%' | ForEach-Object { $_.Trim() }
+
+            foreach ($part in $parts) {
+                if (-not $part) { continue }
+
+                foreach ($sheet in @("department", "dep", "dep1")) {
+                    $block = $Dictionary[$sheet][$part.ToLower()]
+                    if ($block) {
+                        return $block
+                    }
+                }
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($Employee.vid_zan)) {
+            return $DEFAULT_BLOCK
+        }
+
+        return $UNKNOWN_BLOCK
+    }
+
+    Write-Host "`nПодсчёт по блокам" -ForegroundColor Green
 
     $DivisionCount = @{}
-
-    # Счётчик исключённых
     $ExcludedCount = 0
-
-    # + ДОБАВЛЕНО: Создаем список для сбора пользователей "Аппарат правления"
+    
+    # + ДОБАВЛЕНО: Создаем список для сбора сотрудников "Аппарат правления"
     $ApparatUsers = New-Object System.Collections.ArrayList
 
-    foreach ($User in $AllUsersOn) {
+    foreach ($User in $Users1C) {
+        $block = Resolve-Block -Employee $User -Dictionary $dict
 
-        $sam = ([string]$User.samaccountname).Trim()
-        $name = $User.name
-        $dn = $User.DistinguishedName
-
-        if (
-                $User.whenCreated -gt $LimitDate -or
-                (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) -or
-                $ExcludeInitials -contains ([string]$User.initials).Trim() -or
-                $ExcludeSamAccountsHash.ContainsKey($sam) -or
-
-                $sam -like "Health*" -or
-                $sam -like "audit*" -or
-                $sam -like "esas*" -or
-                $sam -like "a-*" -or
-                $sam -like "z-*" -or
-                $name -like "*`$*" -or
-                $name -like "*Администратор*" -or
-                $name -like "*Тестовая*" -or
-                $dn -like "*Отключенные пользователи*" -or
-                $dn -like "*сторон*"
-        ) {
-                $ExcludedCount++
-                continue
+        if ($DivisionCount.ContainsKey($block)) {
+            $DivisionCount[$block]++
+        } else {
+            $DivisionCount[$block] = 1
         }
 
-        $div = $User.division
-
-        if ($div) {
-            if ($DivisionCount.ContainsKey($div)) {
-                $DivisionCount[$div]++
-            }
-            else {
-                $DivisionCount[$div] = 1
-            }
+        # + ДОБАВЛЕНО: Отбор сотрудников конкретного блока
+        if ($block -eq "Аппарат правления") {
+            # Добавляем свойство с именем определённого блока, чтобы было видно
+            $User | Add-Member -MemberType NoteProperty -Name "ResolvedBlock" -Value $block -Force
+            [void]$ApparatUsers.Add($User)
         }
-        else {
-            $emptyKey = "(не указано)"
-
-            if ($DivisionCount.ContainsKey($emptyKey)) {
-                $DivisionCount[$emptyKey]++
-            }
-            else {
-                $DivisionCount[$emptyKey] = 1
-            }
-        }
-
-        # + ДОБАВЛЕНО: Если пользователь прошел все фильтры и его блок "Аппарат правления" - сохраняем его параметры
-        if (([string]$div).Trim() -eq "Аппарат правления") {
-            [void]$ApparatUsers.Add([PSCustomObject]@{
-                Name              = $User.name
-                SamAccountName    = $sam
-                Division          = $div
-                EmployeeType      = $User.employeeType
-                Initials          = $User.initials
-                WhenCreated       = if ($User.whenCreated) { $User.whenCreated.ToString("dd.MM.yyyy HH:mm") } else { "" }
-                DistinguishedName = $dn
-            })
-        }
-    }
-
-    $discovery = foreach ($k in $DivisionCount.Keys) {
-        @{ '{#DIVISION}' = $k }
     }
 
     $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
 
-    if ($null -eq $RealUsersCount) {
-        $RealUsersCount = 0
+    # Логирование
+    Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+
+    $DivisionCount.GetEnumerator() | 
+        Sort-Object Value -Descending | 
+        ForEach-Object {
+            $percent = "{0:P2}" -f ($_.Value / $RealUsersCount)
+        }
+
+    $DivisionCount.GetEnumerator() | 
+        Sort-Object Value -Descending | 
+        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50}, 
+                     @{Label="Кол-во"; Expression={$_.Value}; Width=10}, 
+                     @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
+
+    Write-Host "Всего активных сотрудников в 1С: $($Users1C.Count)" -ForegroundColor Yellow
+    Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
+
+    # + ДОБАВЛЕНО: Вывод списка "Аппарат правления" в консоль
+    if ($ApparatUsers.Count -gt 0) {
+        Write-Host "`n=========== СОТРУДНИКИ БЛОКА 'АППАРАТ ПРАВЛЕНИЯ' ===========" -ForegroundColor Cyan
+        # Выводим все атрибуты, прочитанные из CSV
+        $ApparatUsers | Format-Table -AutoSize
+        Write-Host "Итого в Аппарате правления: $($ApparatUsers.Count)" -ForegroundColor Yellow
+        Write-Host "==============================================================`n" -ForegroundColor Cyan
+    } else {
+        Write-Host "`n[!] В блоке 'Аппарат правления' не найдено ни одного сотрудника.`n" -ForegroundColor Red
+    }
+
+    $discovery = foreach ($k in $DivisionCount.Keys | Sort-Object) {
+        @{ '{#DIVISION}' = $k }
     }
 
     $payload = [ordered]@{
         discovery = @($discovery)
-        counts = $DivisionCount
-        metadata = @{
-            TotalActiveUsers  = $AllUsersOn.Count
-            ExcludedUsers     = $ExcludedCount
+        counts    = $DivisionCount
+        metadata  = @{
+            TotalActiveUsers  = $Users1C.Count
+            ExcludedUsers     = 0
             RealUsers         = $RealUsersCount
             UniqueDivisions   = $DivisionCount.Count
             GeneratedAt       = $time
@@ -124,53 +135,14 @@ try {
         }
     }
 
-    $json = $payload | ConvertTo-Json -Depth 4
+  #  $json = $payload | ConvertTo-Json -Depth 4
 
-    #$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
-
-
-    # + ДОБАВЛЕНО: Вывод списка пользователей "Аппарат правления" в консоль
-    if ($ApparatUsers.Count -gt 0) {
-        Write-Host "`n=========== ПОЛЬЗОВАТЕЛИ БЛОКА 'АППАРАТ ПРАВЛЕНИЯ' ===========" -ForegroundColor Cyan
-        $ApparatUsers | Format-Table -AutoSize
-        Write-Host "Итого в Аппарате правления (после фильтрации): $($ApparatUsers.Count)" -ForegroundColor Yellow
-        Write-Host "================================================================`n" -ForegroundColor Cyan
-    } else {
-        Write-Host "`n[!] В блоке 'Аппарат правления' не найдено ни одного пользователя подходящего под условия.`n" -ForegroundColor Red
+    $outputDir = Split-Path $OUTPUT_PATH -Parent
+    if (-not (Test-Path $outputDir)) {
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     }
 
-
-    Write-Host "Подсчёт по блокам" -ForegroundColor Green
-    Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
-
-    $DivisionCount.GetEnumerator() |
-        Sort-Object Value -Descending |
-        ForEach-Object {
-            if ($RealUsersCount -gt 0) {
-                $percent = "{0:P2}" -f ($_.Value / $RealUsersCount)
-            }
-            else {
-                $percent = "0,00%"
-            }
-        }
-
-    $DivisionCount.GetEnumerator() |
-        Sort-Object Value -Descending |
-        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
-                     @{Label="Кол-во"; Expression={$_.Value}; Width=10},
-                     @{Label="%"; Expression={
-                         if ($RealUsersCount -gt 0) {
-                             "{0:P2}" -f ($_.Value / $RealUsersCount)
-                         }
-                         else {
-                             "0,00%"
-                         }
-                     }; Width=10} -AutoSize
-
-    Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
-    Write-Host "Исключено (служебные/админские/вендоры/ручные исключения): $ExcludedCount" -ForegroundColor Magenta
-    Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
-
+   # [System.IO.File]::WriteAllText($OUTPUT_PATH, $json, [System.Text.UTF8Encoding]::new($false))
 
     $timestop = Get-Date
     $TimeSum = $timestop - $timestart
@@ -181,6 +153,3 @@ try {
 }
 catch {
     $ScriptStatus = "ERROR"
-    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
-    throw
-}
