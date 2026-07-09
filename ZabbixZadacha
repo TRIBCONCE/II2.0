@@ -2,3 +2,11 @@
         -Filter {enabled -eq $false} `
         -Credential $ab_creds `
         -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials Смотри мне нужно вывести на консоль пользователей которые отключены при этом которые имеют параметр division вывести все представленные параменты
+-Properties : The term '-Properties' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify 
+that the path is correct and try again.
+At line:3 char:5
++     -Properties division, samaccountname |
++     ~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (-Properties:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+и он не выводит параметр division при этом сам фильтр работает 
