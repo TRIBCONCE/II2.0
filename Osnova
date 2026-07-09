@@ -1,93 +1,124 @@
-cls
-
-$timestart = Get-Date
-$today = (Get-Date).Date
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
-
-# --- Настройки путей ---
-$LogPath = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\HR_Movement_DiscoveryLOG.log"
-$OUTPUT_PATH = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_HRMovement_Discovery_1C.txt"
-
-# Статус выполнения
-$ScriptStatus = "SUCCESS"
-
-# Функция записи в лог
-function Write-Log {
-    param([string]$Message)
-    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
-    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
-}
-
-function Invoke-Sql([string]$q){
-    $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
-    $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
-    $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
-    $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-    $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
-}
-
 try {
-    Write-Host "`n[1/3] Выполнение SQL-запросов..." -ForegroundColor Cyan
-    Write-Log "Запуск совмещенного сбора данных (Трудоустроенные и Уволенные за сегодня)..."
+    Import-Module ActiveDirectory -ErrorAction Stop
 
-    # SQL Скрипт 1: Список трудоустроенных за сегодня
-    $qHired = @"
-    SELECT e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson, e.PrDate
-    FROM IC.Empl_WT_USPS e
-    WHERE CAST(e.PrDate AS date) = CAST(GETDATE() AS date)
-      AND e.EmplType = 'AD273B83-8100-11E8-A94B-005056902B6A'
-    ORDER BY e.LastName
-"@
+    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
 
-    # SQL Скрипт 2: Список уволенных за сегодня
-    $qTerminated = @"
-    SELECT e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson, e.UvDate
-    FROM IC.Empl_WT_USPS e
-    WHERE CAST(e.UvDate AS date) = CAST(GETDATE() AS date)
-    ORDER BY e.LastName
-"@
+    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
 
-    # SQL Скрипт 3: База сотрудников для расчета %
-    $qTotal = "SELECT COUNT(EmplID) AS TotalCount FROM IC.Empl_WT_USPS WHERE UvDate IS NULL AND StatusEmpl != 'Отпуск по уходу за ребенком'"
+    $AllUsersOn = Get-ADUser `
+        -Filter { enabled -eq $true } `
+        -Credential $ab_creds `
+        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials
 
-    # Выполняем все три запроса
-    $HiredResult      = Invoke-Sql $qHired
-    $TerminatedResult = Invoke-Sql $qTerminated
-    $TotalResult      = Invoke-Sql $qTotal
+    $LimitDate = (Get-Date).AddDays(-3)
 
-    # Подсчет метрик
-    $HiredCount      = if ($HiredResult.Rows) { $HiredResult.Rows.Count } else { 0 }
-    $TerminatedCount = if ($TerminatedResult.Rows) { $TerminatedResult.Rows.Count } else { 0 }
-    $TotalUsers      = if ($TotalResult.Rows) { $TotalResult.Rows[0].TotalCount } else { 1 } # Защита от деления на 0
+    # Исключения по initials
+    $ExcludeInitials = @("abdt","vnsov","1/40")
 
-    # Расчет процентов
-    $HiredPercent      = [math]::Round((($HiredCount / $TotalUsers) * 100), 2)
-    $TerminatedPercent = [math]::Round((($TerminatedCount / $TotalUsers) * 100), 2)
-
-    Write-Log "Метрики: Принято=$HiredCount ($HiredPercent%), Уволено=$TerminatedCount ($TerminatedPercent%), Всего активных=$TotalUsers"
-
-    # --- ФОРМИРОВАНИЕ ЕДИНОГО ZABBIX DISCOVERY ---
-    Write-Host "[2/3] Формирование Zabbix Discovery JSON..." -ForegroundColor Cyan
-
-    $discovery = @(
-        @{ '{#EMPLOYEETYPE}' = 'Трудоустроенные_сегодня' },
-        @{ '{#EMPLOYEETYPE}' = 'Уволенные_сегодня' },
-        @{ '{#EMPLOYEETYPE}' = 'Процент_трудоустроенных' },
-        @{ '{#EMPLOYEETYPE}' = 'Процент_уволенных' },
-        @{ '{#EMPLOYEETYPE}' = 'Пользователей_всего' }
+    # Ручные исключения по логинам SamAccountName
+    # Эти УЗ вообще не будут попадать в счетчики
+    $ExcludeSamAccounts = @(
+        "TantushjanAM"
     )
 
-    $payload = [ordered]@{
-        discovery = $discovery
-        counts = @{
-            Трудоустроенные_сегодня = $HiredCount
-            Уволенные_сегодня       = $TerminatedCount
-            Процент_трудоустроенных = $HiredPercent
-            Процент_уволенных       = $TerminatedPercent
-            Пользователей_всего     = $TotalUsers
+    $ExcludeSamAccountsHash = @{}
+    foreach ($x in $ExcludeSamAccounts) {
+        $x = ([string]$x).Trim()
+        if ($x) {
+            $ExcludeSamAccountsHash[$x] = $true
         }
+    }
+
+    $DivisionCount = @{}
+
+    # Счётчик исключённых
+    $ExcludedCount = 0
+
+    # + ДОБАВЛЕНО: Создаем список для сбора пользователей "Аппарат правления"
+    $ApparatUsers = New-Object System.Collections.ArrayList
+
+    foreach ($User in $AllUsersOn) {
+
+        $sam = ([string]$User.samaccountname).Trim()
+        $name = $User.name
+        $dn = $User.DistinguishedName
+
+        if (
+                $User.whenCreated -gt $LimitDate -or
+                (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) -or
+                $ExcludeInitials -contains ([string]$User.initials).Trim() -or
+                $ExcludeSamAccountsHash.ContainsKey($sam) -or
+
+                $sam -like "Health*" -or
+                $sam -like "audit*" -or
+                $sam -like "esas*" -or
+                $sam -like "a-*" -or
+                $sam -like "z-*" -or
+                $name -like "*`$*" -or
+                $name -like "*Администратор*" -or
+                $name -like "*Тестовая*" -or
+                $dn -like "*Отключенные пользователи*" -or
+                $dn -like "*сторон*"
+        ) {
+                $ExcludedCount++
+                continue
+        }
+
+        $div = $User.division
+
+        if ($div) {
+            if ($DivisionCount.ContainsKey($div)) {
+                $DivisionCount[$div]++
+            }
+            else {
+                $DivisionCount[$div] = 1
+            }
+        }
+        else {
+            $emptyKey = "(не указано)"
+
+            if ($DivisionCount.ContainsKey($emptyKey)) {
+                $DivisionCount[$emptyKey]++
+            }
+            else {
+                $DivisionCount[$emptyKey] = 1
+            }
+        }
+
+        # + ДОБАВЛЕНО: Если пользователь прошел все фильтры и его блок "Аппарат правления" - сохраняем его параметры
+        if (([string]$div).Trim() -eq "Аппарат правления") {
+            [void]$ApparatUsers.Add([PSCustomObject]@{
+                Name              = $User.name
+                SamAccountName    = $sam
+                Division          = $div
+                EmployeeType      = $User.employeeType
+                Initials          = $User.initials
+                WhenCreated       = if ($User.whenCreated) { $User.whenCreated.ToString("dd.MM.yyyy HH:mm") } else { "" }
+                DistinguishedName = $dn
+            })
+        }
+    }
+
+    $discovery = foreach ($k in $DivisionCount.Keys) {
+        @{ '{#DIVISION}' = $k }
+    }
+
+    $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+    if ($null -eq $RealUsersCount) {
+        $RealUsersCount = 0
+    }
+
+    $payload = [ordered]@{
+        discovery = @($discovery)
+        counts = $DivisionCount
         metadata = @{
-            TotalActiveUsers  = $TotalUsers
+            TotalActiveUsers  = $AllUsersOn.Count
+            ExcludedUsers     = $ExcludedCount
+            RealUsers         = $RealUsersCount
+            UniqueDivisions   = $DivisionCount.Count
             GeneratedAt       = $time
             ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
         }
@@ -95,36 +126,61 @@ try {
 
     $json = $payload | ConvertTo-Json -Depth 4
 
-    # Сохранение итогового JSON файла
-    $outputDir = Split-Path $OUTPUT_PATH -Parent
-    if (-not (Test-Path $outputDir)) {
-        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-    }
-    [System.IO.File]::WriteAllText($OUTPUT_PATH, $json, [System.Text.UTF8Encoding]::new($false))
-    Write-Log "Файл Zabbix Discovery успешно сохранен: $OUTPUT_PATH"
+    #$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
 
-    # --- ВЫВОД В КОНСОЛЬ ---
-    Write-Host "`n=========== СВОДНЫЕ ИТОГИ ДВИЖЕНИЯ КАДРОВ ===========" -ForegroundColor Green
-    Write-Host "Всего активных сотрудников в банке: $TotalUsers" -ForegroundColor Yellow
-    Write-Host "Трудоустроено за сегодня (приём):   $HiredCount чел. ($HiredPercent %)" -ForegroundColor Green
-    Write-Host "Уволено за сегодня:                  $TerminatedCount чел. ($TerminatedPercent %)" -ForegroundColor Red
-    Write-Host "=====================================================" -ForegroundColor Green
+
+    # + ДОБАВЛЕНО: Вывод списка пользователей "Аппарат правления" в консоль
+    if ($ApparatUsers.Count -gt 0) {
+        Write-Host "`n=========== ПОЛЬЗОВАТЕЛИ БЛОКА 'АППАРАТ ПРАВЛЕНИЯ' ===========" -ForegroundColor Cyan
+        $ApparatUsers | Format-Table -AutoSize
+        Write-Host "Итого в Аппарате правления (после фильтрации): $($ApparatUsers.Count)" -ForegroundColor Yellow
+        Write-Host "================================================================`n" -ForegroundColor Cyan
+    } else {
+        Write-Host "`n[!] В блоке 'Аппарат правления' не найдено ни одного пользователя подходящего под условия.`n" -ForegroundColor Red
+    }
+
+
+    Write-Host "Подсчёт по блокам" -ForegroundColor Green
+    Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        ForEach-Object {
+            if ($RealUsersCount -gt 0) {
+                $percent = "{0:P2}" -f ($_.Value / $RealUsersCount)
+            }
+            else {
+                $percent = "0,00%"
+            }
+        }
+
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
+                     @{Label="Кол-во"; Expression={$_.Value}; Width=10},
+                     @{Label="%"; Expression={
+                         if ($RealUsersCount -gt 0) {
+                             "{0:P2}" -f ($_.Value / $RealUsersCount)
+                         }
+                         else {
+                             "0,00%"
+                         }
+                     }; Width=10} -AutoSize
+
+    Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
+    Write-Host "Исключено (служебные/админские/вендоры/ручные исключения): $ExcludedCount" -ForegroundColor Magenta
+    Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
+
 
     $timestop = Get-Date
     $TimeSum = $timestop - $timestart
 
     Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
     Write-Host "Файл сохранён." -ForegroundColor Green
-    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
-    Write-Log "СТАТУС: $ScriptStatus"
 
-} catch {
+}
+catch {
     $ScriptStatus = "ERROR"
-    Write-Log ""
-    Write-Log "СТАТУС: ERROR"
-    Write-Log "Ошибка: $($_.Exception.Message)"
-    Write-Log "Полная информация: $_"
-
     Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
     throw
 }
