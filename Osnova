@@ -4,9 +4,9 @@ $timestart = Get-Date
 $today = (Get-Date).Date
 $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
-# --- Настройки путей (замени на свои при необходимости) ---
-$LogPath = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\AbsencesDiscoveryLOG.log"
-$OUTPUT_PATH = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_Absences_Discovery_1C.txt"
+# --- Настройки путей ---
+$LogPath = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\HR_Movement_DiscoveryLOG.log"
+$OUTPUT_PATH = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_HRMovement_Discovery_1C.txt"
 
 # Статус выполнения
 $ScriptStatus = "SUCCESS"
@@ -19,93 +19,72 @@ function Write-Log {
 }
 
 function Invoke-Sql([string]$q){
-  $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
-  $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
-  $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
-  $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-  $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
+    $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
+    $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
+    $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
+    $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+    $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
 }
 
 try {
-    Write-Host "`n[1/4] Выполнение SQL-запросов..." -ForegroundColor Cyan
-    Write-Log "Запуск сбора данных об отсутствиях..."
+    Write-Host "`n[1/3] Выполнение SQL-запросов..." -ForegroundColor Cyan
+    Write-Log "Запуск совмещенного сбора данных (Трудоустроенные и Уволенные за сегодня)..."
 
-    # 1. Запрос: Отпуска
-    $qF=@"
-    SELECT e.LastName,e.FirstName,e.MiddleName,e.Tab_Numb,e.IDPerson,
-           f.StartDate,f.EndDate,f.CountDay,f.FurloughTypeID
-    FROM IC.Furlough_WT f
-    JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
-    WHERE e.UvDate IS NULL
-      AND f.StartDate <= CAST(GETDATE() AS date)
-      AND f.EndDate >= CAST(GETDATE() AS date)
-    ORDER BY f.StartDate,e.LastName
+    # SQL Скрипт 1: Список трудоустроенных за сегодня
+    $qHired = @"
+    SELECT e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson, e.PrDate
+    FROM IC.Empl_WT_USPS e
+    WHERE CAST(e.PrDate AS date) = CAST(GETDATE() AS date)
+      AND e.EmplType = 'AD273B83-8100-11E8-A94B-005056902B6A'
+    ORDER BY e.LastName
 "@
 
-    # 2. Запрос: Больничные
-    $qS=@"
-    DECLARE @Today date = CAST(GETDATE() AS date);
-    ;WITH SickDays AS (
-      SELECT DISTINCT a.EmplID, CAST(a.[Day] AS date) AS SickDay
-      FROM [DWDATA_ODS].[IC].[Absent] a
-      WHERE a.TimeTypeID = '9A62E2C8-730F-11E7-80D4-005056926005'
-    ),
-    MarkedDays AS (
-      SELECT EmplID, SickDay,
-        CASE WHEN LAG(SickDay) OVER (PARTITION BY EmplID ORDER BY SickDay)=DATEADD(day,-1,SickDay) THEN 0 ELSE 1 END AS IsNewPeriod
-      FROM SickDays
-    ),
-    GroupedDays AS (
-      SELECT EmplID, SickDay,
-        SUM(IsNewPeriod) OVER (PARTITION BY EmplID ORDER BY SickDay ROWS UNBOUNDED PRECEDING) AS PeriodNo
-      FROM MarkedDays
-    ),
-    SickPeriods AS (
-      SELECT EmplID, MIN(SickDay) AS SickFrom, MAX(SickDay) AS SickTo
-      FROM GroupedDays GROUP BY EmplID, PeriodNo
-    )
-    SELECT DISTINCT
-      e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson,
-      p.SickFrom AS StartDate, p.SickTo AS EndDate,
-      DATEDIFF(day, p.SickFrom, p.SickTo) + 1 AS CountDay
-    FROM SickPeriods p
-    JOIN [DWDATA_ODS].[IC].[Empl_WT_USPS] e ON e.EmplID=p.EmplID
-    WHERE @Today BETWEEN p.SickFrom AND p.SickTo AND e.UvDate IS NULL
-    ORDER BY p.SickTo, e.LastName
+    # SQL Скрипт 2: Список уволенных за сегодня
+    $qTerminated = @"
+    SELECT e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson, e.UvDate
+    FROM IC.Empl_WT_USPS e
+    WHERE CAST(e.UvDate AS date) = CAST(GETDATE() AS date)
+    ORDER BY e.LastName
 "@
 
-    # 3. Запрос: Общее количество активных сотрудников банка (для вычисления %)
-    $qTotal = "SELECT COUNT(EmplID) AS TotalCount FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
+    # SQL Скрипт 3: База сотрудников для расчета %
+    $qTotal = "SELECT COUNT(EmplID) AS TotalCount FROM IC.Empl_WT_USPS WHERE UvDate IS NULL AND StatusEmpl != 'Отпуск по уходу за ребенком'"
 
-    $F = Invoke-Sql $qF
-    $S = Invoke-Sql $qS
-    $TotalResult = Invoke-Sql $qTotal
+    # Выполняем все три запроса
+    $HiredResult      = Invoke-Sql $qHired
+    $TerminatedResult = Invoke-Sql $qTerminated
+    $TotalResult      = Invoke-Sql $qTotal
 
     # Подсчет метрик
-    $VacationCount = if ($F.Rows) { $F.Rows.Count } else { 0 }
-    $SickCount     = if ($S.Rows) { $S.Rows.Count } else { 0 }
-    $TotalUsers    = if ($TotalResult.Rows) { $TotalResult.Rows[0].TotalCount } else { 1 } # Защита от деления на 0
+    $HiredCount      = if ($HiredResult.Rows) { $HiredResult.Rows.Count } else { 0 }
+    $TerminatedCount = if ($TerminatedResult.Rows) { $TerminatedResult.Rows.Count } else { 0 }
+    $TotalUsers      = if ($TotalResult.Rows) { $TotalResult.Rows[0].TotalCount } else { 1 } # Защита от деления на 0
 
-    $VacationPercent = [math]::Round((($VacationCount / $TotalUsers) * 100), 2)
-    $SickPercent     = [math]::Round((($SickCount / $TotalUsers) * 100), 2)
+    # Расчет процентов
+    $HiredPercent      = [math]::Round((($HiredCount / $TotalUsers) * 100), 2)
+    $TerminatedPercent = [math]::Round((($TerminatedCount / $TotalUsers) * 100), 2)
 
-    Write-Log "Отпусков: $VacationCount | Больничных: $SickCount | Всего активных: $TotalUsers"
+    Write-Log "Метрики: Принято=$HiredCount ($HiredPercent%), Уволено=$TerminatedCount ($TerminatedPercent%), Всего активных=$TotalUsers"
 
-    # --- ФОРМИРОВАНИЕ ZABBIX DISCOVERY ---
-    Write-Host "[2/4] Формирование Zabbix Discovery..." -ForegroundColor Cyan
+    # --- ФОРМИРОВАНИЕ ЕДИНОГО ZABBIX DISCOVERY ---
+    Write-Host "[2/3] Формирование Zabbix Discovery JSON..." -ForegroundColor Cyan
 
     $discovery = @(
-        @{ '{#ABSENCETYPE}' = 'Отпуск' },
-        @{ '{#ABSENCETYPE}' = 'Больничный' }
+        @{ '{#EMPLOYEETYPE}' = 'Трудоустроенные_сегодня' },
+        @{ '{#EMPLOYEETYPE}' = 'Уволенные_сегодня' },
+        @{ '{#EMPLOYEETYPE}' = 'Процент_трудоустроенных' },
+        @{ '{#EMPLOYEETYPE}' = 'Процент_уволенных' },
+        @{ '{#EMPLOYEETYPE}' = 'Пользователей_всего' }
     )
 
     $payload = [ordered]@{
         discovery = $discovery
-        metrics = @{
-            VacationCount    = $VacationCount
-            SickCount        = $SickCount
-            VacationPercent  = $VacationPercent
-            SickPercent      = $SickPercent
+        counts = @{
+            Трудоустроенные_сегодня = $HiredCount
+            Уволенные_сегодня       = $TerminatedCount
+            Процент_трудоустроенных = $HiredPercent
+            Процент_уволенных       = $TerminatedPercent
+            Пользователей_всего     = $TotalUsers
         }
         metadata = @{
             TotalActiveUsers  = $TotalUsers
@@ -116,7 +95,7 @@ try {
 
     $json = $payload | ConvertTo-Json -Depth 4
 
-    # Сохранение JSON файла
+    # Сохранение итогового JSON файла
     $outputDir = Split-Path $OUTPUT_PATH -Parent
     if (-not (Test-Path $outputDir)) {
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
@@ -125,11 +104,11 @@ try {
     Write-Log "Файл Zabbix Discovery успешно сохранен: $OUTPUT_PATH"
 
     # --- ВЫВОД В КОНСОЛЬ ---
-    Write-Host "`n=========== ИТОГИ ДЛЯ ZABBIX ===========" -ForegroundColor Green
-    Write-Host "Всего сотрудников в банке: $TotalUsers" -ForegroundColor Yellow
-    Write-Host "В отпуске:   $VacationCount чел. ($VacationPercent %)" 
-    Write-Host "На больнич.: $SickCount чел. ($SickPercent %)"
-    Write-Host "==========================================" -ForegroundColor Green
+    Write-Host "`n=========== СВОДНЫЕ ИТОГИ ДВИЖЕНИЯ КАДРОВ ===========" -ForegroundColor Green
+    Write-Host "Всего активных сотрудников в банке: $TotalUsers" -ForegroundColor Yellow
+    Write-Host "Трудоустроено за сегодня (приём):   $HiredCount чел. ($HiredPercent %)" -ForegroundColor Green
+    Write-Host "Уволено за сегодня:                  $TerminatedCount чел. ($TerminatedPercent %)" -ForegroundColor Red
+    Write-Host "=====================================================" -ForegroundColor Green
 
     $timestop = Get-Date
     $TimeSum = $timestop - $timestart
