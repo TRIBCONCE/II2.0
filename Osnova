@@ -5,6 +5,7 @@ $today = Get-Date -Format dd.MM.yyyy
 $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
 $XLSX_PATH  = "\\p-rpait-syn01\c$\Scripts\AD_Division_Attr\Справочник.xlsx"
+$TARGET_BLOCK = "Блок информационной безопасности" # Целевой блок для сверки
 
 # Механизм взаимодействия с БД
 function Invoke-Sql([string]$q){
@@ -44,7 +45,7 @@ try {
 
     Write-Host "[2/4] Получение данных из БД 1С..." -ForegroundColor Cyan
     
-    # 2.1 Вспомогательный запрос для AD (проверка уволенных)
+    # 2.1 Вспомогательный хэш для проверки статуса AD (кто НЕ уволен в 1С)
     $qActive1C = "SELECT DISTINCT Tab_Numb FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
     $dtActive1C = Invoke-Sql $qActive1C
     $active1CHash = @{}
@@ -54,7 +55,7 @@ try {
         }
     }
 
-    # 2.2 Основной запрос 1С (с добавлением Tab_Numb и fio)
+    # 2.2 Основной запрос к представлению 1С
     $sql1C = @"
     SELECT department, dep, dep1, dokko, Tab_Numb, fio
     FROM IC.v_Empl_info
@@ -66,12 +67,34 @@ try {
     $dt = Invoke-Sql $sql1C
     $Users1C = $dt.Rows
 
-    # Собираем валидных сотрудников 1С в хэш-таблицу по табельному номеру
+    # Функция определения блока
+    function Resolve-Block {
+        param($E, $Dict)
+        foreach ($f in @("department","dep","dep1")) {
+            $v = ([string]$E.$f).Trim()
+            if ($v) {
+                $k = $v.ToLower()
+                foreach ($sheet in @("department","dep","dep1")) {
+                    $b = $Dict[$sheet][$k]
+                    if ($b) { return $b }
+                }
+            }
+        }
+        if (([string]$E.dokko).Trim()) { return "Дополнительные офисы" }
+        return "(не указано)"
+    }
+
+    # Фильтруем и собираем сотрудников 1С СТРОГО из Блока информационной безопасности
     $Valid1CUsers = @{}
     foreach ($User in $Users1C) {
-        $tab1C = "$($User.Tab_Numb)".Trim()
-        if ($tab1C) {
-            $Valid1CUsers[$tab1C] = $User
+        $block = Resolve-Block -E $User -Dict $dict
+        
+        # Проверяем совпадение с целевым блоком ИБ
+        if ($block -eq $TARGET_BLOCK) {
+            $tab1C = "$($User.Tab_Numb)".Trim()
+            if ($tab1C) {
+                $Valid1CUsers[$tab1C] = $User
+            }
         }
     }
 
@@ -83,6 +106,7 @@ try {
     $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
     $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
 
+    # Запрашиваем пользователей, у которых заполнен division
     $AllUsersAD = Get-ADUser `
         -Filter "division -like '*'" `
         -Credential $ab_creds `
@@ -94,16 +118,21 @@ try {
     $ExcludeSamAccountsHash = @{}
     foreach ($x in $ExcludeSamAccounts) { if ($x.Trim()) { $ExcludeSamAccountsHash[$x.Trim()] = $true } }
 
-    # Собираем валидных пользователей AD в хэш-таблицу
+    # Фильтруем и собираем пользователей AD СТРОГО из Блока информационной безопасности
     $ValidADUsers = @{}
     
     foreach ($User in $AllUsersAD) {
+        $div = ([string]$User.division).Trim()
+        
+        # Фильтр по Блоку информационной безопасности в AD
+        if ($div -ne $TARGET_BLOCK) { continue }
+
         $sam = ([string]$User.samaccountname).Trim()
         $name = $User.name
         $dn = $User.DistinguishedName
         $tabAD = "$($User.wWWHomePage)".Trim()
 
-        # Исключения
+        # Исключения (сервисные, тестовые, админские УЗ)
         if (
             $User.whenCreated -gt $LimitDate -or
             (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) -or
@@ -115,71 +144,67 @@ try {
             $dn -like "*сторон*"
         ) { continue }
 
-        # Статус
+        # Статус безопасности (учитываем отключенных в AD, если они активны в 1С)
         if ($User.Enabled -eq $false) {
-            if (-not $active1CHash.ContainsKey($tabAD)) { continue } # Отключен и уволен -> пропускаем
+            if (-not $active1CHash.ContainsKey($tabAD)) { continue } 
         }
 
-        # Если прошел все проверки AD, добавляем в список валидных
         $ValidADUsers[$tabAD] = $User
     }
 
-    Write-Host "[4/4] Сверка данных (AD vs 1C)..." -ForegroundColor Cyan
+    Write-Host "[4/4] Сверка данных по блоку ИБ..." -ForegroundColor Cyan
     
     $Discrepancies = New-Object System.Collections.ArrayList
 
-    # 1. Ищем тех, кто есть в AD, но нет в 1C
+    # 1. Анализ: Есть в AD (ИБ), но отсутствует в 1С (ИБ)
     foreach ($key in $ValidADUsers.Keys) {
         if (-not $Valid1CUsers.ContainsKey($key)) {
             $u = $ValidADUsers[$key]
             
-            $reason = if (-not $key) { "Пустой табельный номер в AD" } else { "Отсутствует или отфильтрован в 1С (декрет, совместитель и т.д.)" }
+            $reason = if (-not $key) { "Пустой табельный номер в AD" } else { "В 1С числится в другом подразделении, в декрете или оформлен как совместитель" }
             
             [void]$Discrepancies.Add([PSCustomObject]@{
-                'Табельный' = if($key){$key}else{"Нет"}
-                'ФИО'       = $u.name
-                'Где найден' = "Только в AD"
+                'Табельный'         = if($key){$key}else{"Нет"}
+                'ФИО'               = $u.name
+                'Где найден'        = "Только в AD"
                 'Причина / Отличие' = $reason
             })
         }
     }
 
-    # 2. Ищем тех, кто есть в 1C, но нет в AD
+    # 2. Анализ: Есть в 1С (ИБ), но отсутствует в AD (ИБ)
     foreach ($key in $Valid1CUsers.Keys) {
         if (-not $ValidADUsers.ContainsKey($key)) {
             $u = $Valid1CUsers[$key]
             [void]$Discrepancies.Add([PSCustomObject]@{
-                'Табельный' = $key
-                'ФИО'       = $u.fio
-                'Где найден' = "Только в 1С"
-                'Причина / Отличие' = "Нет учетной записи в AD (или пустой division / отфильтрована как сервис)"
+                'Табельный'         = $key
+                'ФИО'               = $u.fio
+                'Где найден'        = "Только в 1С"
+                'Причина / Отличие' = "В AD указан другой division, учетка отфильтрована (как сервис) или отсутствует"
             })
         }
     }
 
-    # --- ВЫВОД РЕЗУЛЬТАТОВ ---
-    Write-Host "`n=================== ОТЛИЧАЮЩИЕСЯ ПОЛЬЗОВАТЕЛИ ===================" -ForegroundColor Yellow
+    # --- ВЫВОД РЕЗУЛЬТАТОВ В КОНСОЛЬ ---
+    Write-Host "`n=================== РАСХОЖДЕНИЯ: БЛОК ИНФОРМАЦИОННОЙ БЕЗОПАСНОСТИ ===================" -ForegroundColor Yellow
     
     if ($Discrepancies.Count -gt 0) {
-        Write-Host "Найдено расхождений: $($Discrepancies.Count)`n" -ForegroundColor Red
-        
-        # Сортируем по табельному и выводим таблицу
+        Write-Host "Найдено расхождений по блоку ИБ: $($Discrepancies.Count)`n" -ForegroundColor Red
         $Discrepancies | Sort-Object 'Где найден', 'ФИО' | Format-Table -AutoSize
-        
     } else {
-        Write-Host "Расхождений не найдено! Списки из AD и 1С полностью совпадают." -ForegroundColor Green
+        Write-Host "Идеально! Расхождений по Блоку информационной безопасности не обнаружено." -ForegroundColor Green
     }
-    Write-Host "=================================================================" -ForegroundColor Yellow
+    Write-Host "=====================================================================================" -ForegroundColor Yellow
 
-    # Итоговые счетчики для понимания масштаба
-    Write-Host "Итого валидных пользователей в AD: $($ValidADUsers.Count)" -ForegroundColor Cyan
-    Write-Host "Итого валидных сотрудников в 1С:  $($Valid1CUsers.Count)" -ForegroundColor Cyan
+    # Итоговая статистика по блоку
+    Write-Host "Успешно сопоставлено сотрудников в 1С (ИБ):  $($Valid1CUsers.Count)" -ForegroundColor Cyan
+    Write-Host "Успешно сопоставлено учетных записей в AD (ИБ):  $($ValidADUsers.Count)" -ForegroundColor Cyan
 
     $timestop = Get-Date
     $TimeSum = $timestop - $timestart
-    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor DarkCyan
+    Write-Host "`nВремя выполнения сверки: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor DarkCyan
 
 } catch {
-    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "`nОШИБКА ВЫПОЛНЕНИЯ: $($_.Exception.Message)" -ForegroundColor Red
     throw
 }
