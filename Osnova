@@ -5,7 +5,7 @@ $today = Get-Date -Format dd.MM.yyyy
 $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
 $XLSX_PATH  = "\\p-rpait-syn01\c$\Scripts\AD_Division_Attr\Справочник.xlsx"
-$TARGET_BLOCK = "Блок информационной безопасности" # Целевой блок для сверки
+$TARGET_BLOCK = "Блок информационной безопасности"
 
 # Механизм взаимодействия с БД
 function Invoke-Sql([string]$q){
@@ -45,7 +45,7 @@ try {
 
     Write-Host "[2/4] Получение данных из БД 1С..." -ForegroundColor Cyan
     
-    # 2.1 Вспомогательный хэш для проверки статуса AD (кто НЕ уволен в 1С)
+    # Вспомогательный хэш для проверки статуса AD
     $qActive1C = "SELECT DISTINCT Tab_Numb FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
     $dtActive1C = Invoke-Sql $qActive1C
     $active1CHash = @{}
@@ -55,7 +55,7 @@ try {
         }
     }
 
-    # 2.2 Основной запрос к представлению 1С
+    # Основной запрос к представлению 1С
     $sql1C = @"
     SELECT department, dep, dep1, dokko, Tab_Numb, fio
     FROM IC.v_Empl_info
@@ -67,7 +67,6 @@ try {
     $dt = Invoke-Sql $sql1C
     $Users1C = $dt.Rows
 
-    # Функция определения блока
     function Resolve-Block {
         param($E, $Dict)
         foreach ($f in @("department","dep","dep1")) {
@@ -84,12 +83,9 @@ try {
         return "(не указано)"
     }
 
-    # Фильтруем и собираем сотрудников 1С СТРОГО из Блока информационной безопасности
     $Valid1CUsers = @{}
     foreach ($User in $Users1C) {
         $block = Resolve-Block -E $User -Dict $dict
-        
-        # Проверяем совпадение с целевым блоком ИБ
         if ($block -eq $TARGET_BLOCK) {
             $tab1C = "$($User.Tab_Numb)".Trim()
             if ($tab1C) {
@@ -106,7 +102,6 @@ try {
     $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
     $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
 
-    # Запрашиваем пользователей, у которых заполнен division
     $AllUsersAD = Get-ADUser `
         -Filter "division -like '*'" `
         -Credential $ab_creds `
@@ -118,13 +113,11 @@ try {
     $ExcludeSamAccountsHash = @{}
     foreach ($x in $ExcludeSamAccounts) { if ($x.Trim()) { $ExcludeSamAccountsHash[$x.Trim()] = $true } }
 
-    # Фильтруем и собираем пользователей AD СТРОГО из Блока информационной безопасности
     $ValidADUsers = @{}
     
     foreach ($User in $AllUsersAD) {
         $div = ([string]$User.division).Trim()
         
-        # Фильтр по Блоку информационной безопасности в AD
         if ($div -ne $TARGET_BLOCK) { continue }
 
         $sam = ([string]$User.samaccountname).Trim()
@@ -132,7 +125,6 @@ try {
         $dn = $User.DistinguishedName
         $tabAD = "$($User.wWWHomePage)".Trim()
 
-        # Исключения (сервисные, тестовые, админские УЗ)
         if (
             $User.whenCreated -gt $LimitDate -or
             (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) -or
@@ -144,7 +136,6 @@ try {
             $dn -like "*сторон*"
         ) { continue }
 
-        # Статус безопасности (учитываем отключенных в AD, если они активны в 1С)
         if ($User.Enabled -eq $false) {
             if (-not $active1CHash.ContainsKey($tabAD)) { continue } 
         }
@@ -152,15 +143,36 @@ try {
         $ValidADUsers[$tabAD] = $User
     }
 
-    Write-Host "[4/4] Сверка данных по блоку ИБ..." -ForegroundColor Cyan
+    Write-Host "[4/4] Сверка данных по блоку ИБ и вывод списков..." -ForegroundColor Cyan
+
+    # =================================================================================
+    # --- ДОБАВЛЕННЫЙ БЛОК: ВЫВОД ПОЛНЫХ СПИСКОВ СО ВСЕМИ АТРИБУТАМИ В КОНСОЛЬ ---
+    # =================================================================================
+    
+    Write-Host "`n=========== ПОЛНЫЙ СПИСОК 1С: $TARGET_BLOCK ===========" -ForegroundColor Magenta
+    if ($Valid1CUsers.Count -gt 0) {
+        # Выводим все столбцы, которые мы запросили в SELECT
+        $Valid1CUsers.Values | Select-Object fio, Tab_Numb, department, dep, dep1, dokko | Format-Table -AutoSize
+    } else {
+        Write-Host "В 1С не найдено сотрудников для данного блока." -ForegroundColor DarkGray
+    }
+
+    Write-Host "`n=========== ПОЛНЫЙ СПИСОК AD: $TARGET_BLOCK ===========" -ForegroundColor Magenta
+    if ($ValidADUsers.Count -gt 0) {
+        # Выводим все атрибуты, которые мы явно запрашивали через -Properties
+        $ValidADUsers.Values | Select-Object name, samaccountname, wWWHomePage, division, employeeType, initials, whenCreated, Enabled, DistinguishedName | Format-Table -AutoSize
+    } else {
+        Write-Host "В AD не найдено пользователей для данного блока." -ForegroundColor DarkGray
+    }
+    # =================================================================================
+
     
     $Discrepancies = New-Object System.Collections.ArrayList
 
-    # 1. Анализ: Есть в AD (ИБ), но отсутствует в 1С (ИБ)
+    # Анализ: Есть в AD (ИБ), но отсутствует в 1С (ИБ)
     foreach ($key in $ValidADUsers.Keys) {
         if (-not $Valid1CUsers.ContainsKey($key)) {
             $u = $ValidADUsers[$key]
-            
             $reason = if (-not $key) { "Пустой табельный номер в AD" } else { "В 1С числится в другом подразделении, в декрете или оформлен как совместитель" }
             
             [void]$Discrepancies.Add([PSCustomObject]@{
@@ -172,7 +184,7 @@ try {
         }
     }
 
-    # 2. Анализ: Есть в 1С (ИБ), но отсутствует в AD (ИБ)
+    # Анализ: Есть в 1С (ИБ), но отсутствует в AD (ИБ)
     foreach ($key in $Valid1CUsers.Keys) {
         if (-not $ValidADUsers.ContainsKey($key)) {
             $u = $Valid1CUsers[$key]
@@ -185,8 +197,8 @@ try {
         }
     }
 
-    # --- ВЫВОД РЕЗУЛЬТАТОВ В КОНСОЛЬ ---
-    Write-Host "`n=================== РАСХОЖДЕНИЯ: БЛОК ИНФОРМАЦИОННОЙ БЕЗОПАСНОСТИ ===================" -ForegroundColor Yellow
+    # --- ВЫВОД РАСХОЖДЕНИЙ В КОНСОЛЬ ---
+    Write-Host "`n=================== РАСХОЖДЕНИЯ ===================" -ForegroundColor Yellow
     
     if ($Discrepancies.Count -gt 0) {
         Write-Host "Найдено расхождений по блоку ИБ: $($Discrepancies.Count)`n" -ForegroundColor Red
@@ -194,7 +206,7 @@ try {
     } else {
         Write-Host "Идеально! Расхождений по Блоку информационной безопасности не обнаружено." -ForegroundColor Green
     }
-    Write-Host "=====================================================================================" -ForegroundColor Yellow
+    Write-Host "===================================================" -ForegroundColor Yellow
 
     # Итоговая статистика по блоку
     Write-Host "Успешно сопоставлено сотрудников в 1С (ИБ):  $($Valid1CUsers.Count)" -ForegroundColor Cyan
