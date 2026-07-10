@@ -20,7 +20,7 @@ function Write-Log {
     Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
 }
 
-# Измененный механизм взаимодействия с БД (на основе твоего примера Invoke-Sql)
+# Механизм взаимодействия с БД
 function Invoke-Sql([string]$q){
     $cs = "Server=$SQL_SERVER;Database=$SQL_DB;User Id=$SqlUser;Password=$SqlPass;"
     $cn = New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
@@ -30,25 +30,43 @@ function Invoke-Sql([string]$q){
 }
 
 try {
-    Import-Module ImportExcel -ErrorAction Stop
-
-    Write-Host "`n[1/3] Чтение справочника Excel..." -ForegroundColor Cyan
-    # --- Справочник (имя колонки с названием = имя листа) ---
+    Write-Host "`n[1/3] Чтение справочника Excel (через COM-объект)..." -ForegroundColor Cyan
+    
+    # --- Справочник Excel (через COM-объект, как было в твоем оригинале) ---
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
     $dict = @{}
-    foreach ($sheetName in @("department","dep","dep1")) {
-        $sheetDict = @{}
-        foreach ($row in (Import-Excel -Path $XLSX_PATH -WorksheetName $sheetName -ErrorAction Stop)) {
-            $block = ([string]$row.Block).Trim()
-            $name  = ([string]$row.$sheetName).Trim()
-            if ($block -and $name) { $sheetDict[$name.ToLower()] = $block }
+
+    try {
+        $workbook = $excel.Workbooks.Open($XLSX_PATH)
+
+        foreach ($sheetName in @("department", "dep", "dep1")) {
+            $worksheet = $workbook.Worksheets.Item($sheetName)
+            $sheetDict = @{}
+
+            $row = 2
+            while ($worksheet.Cells.Item($row, 1).Text -ne "") {
+                $block = $worksheet.Cells.Item($row, 1).Text.Trim()
+                $name  = $worksheet.Cells.Item($row, 2).Text.Trim()
+
+                if ($block -and $name) {
+                    $sheetDict[$name.ToLower()] = $block
+                }
+                $row++
+            }
+            $dict[$sheetName] = $sheetDict
         }
-        $dict[$sheetName] = $sheetDict
+        $workbook.Close($false)
+    } finally {
+        $excel.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
     }
 
     Write-Host "[2/3] Получение данных из БД 1С..." -ForegroundColor Cyan
     Write-Log "Запуск сбора данных по блокам из БД 1С..."
 
-    # --- Сотрудники из БД (используется компактный вызов Invoke-Sql без ручных параметров) ---
+    # --- Сотрудники из БД ---
     $sql = @"
     SELECT department, dep, dep1, dokko
     FROM $SQL_VIEW
