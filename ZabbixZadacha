@@ -1,218 +1,25 @@
-Вот код подсчёта пользователей из эктив директори 
-cls
-
-$timestart = Get-Date
-$today = Get-Date -Format dd.MM.yyyy
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
-
-$LogPath = "C:\Scripts\Zabbix_division_objects\AllUsersBlocksDiscoveryLOG.log"
-
-$ScriptStatus = "SUCCESS"
-
 function Write-Log {
-    param(
-        [string]$Message
-    )
+    param([string]$Message)
     $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
     Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
 }
 
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-
-    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
-    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
-
-    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
-    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
-
-    $AllUsersOn = Get-ADUser `
-        -Filter "Enabled -eq 'True' -and (division -like '*')" `
-        -Credential $ab_creds `
-        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials
-
-    $LimitDate = (Get-Date).AddDays(-3)
-
-    # Исключения по initials
-    $ExcludeInitials = @("abdt","vnsov","1/40")
-
-    # Ручные исключения по логинам SamAccountName
-    # Эти УЗ вообще не будут попадать в счетчики
-    $ExcludeSamAccounts = @(
-        "TantushjanAM"
-    )
-
-    $ExcludeSamAccountsHash = @{}
-    foreach ($x in $ExcludeSamAccounts) {
-        $x = ([string]$x).Trim()
-        if ($x) {
-            $ExcludeSamAccountsHash[$x] = $true
-        }
-    }
-
-    $DivisionCount = @{}
-
-    # Счётчик исключённых
-    $ExcludedCount = 0
-
-    # + ДОБАВЛЕНО: Создаем список для сбора пользователей "Аппарат правления"
-    $ApparatUsers = New-Object System.Collections.ArrayList
-
-    foreach ($User in $AllUsersOn) {
-
-        $sam = ([string]$User.samaccountname).Trim()
-        $name = $User.name
-        $dn = $User.DistinguishedName
-        $desk = $User.Description
-        if (
-                $User.whenCreated -gt $LimitDate -or
-                (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) -or
-                $ExcludeInitials -contains ([string]$User.initials).Trim() -or
-                $ExcludeSamAccountsHash.ContainsKey($sam) -or
-
-                $sam -like "Health*" -or
-                $sam -like "audit*" -or
-                $sam -like "esas*" -or
-                $sam -like "a-*" -or
-                $sam -like "z-*" -or
-                $name -like "*`$*" -or
-                $name -like "*Администратор*" -or
-                $name -like "*Тестовая*" -or
-                $dn -like "*Отключенные пользователи*" -or
-                $dn -like "*Отключенные объекты*" -or
-                $dn -like "*сторон*"
-        ) {
-                $ExcludedCount++
-                continue
-        }
-
-        $div = $User.division
-
-        if ($div) {
-            if ($DivisionCount.ContainsKey($div)) {
-                $DivisionCount[$div]++
-            }
-            else {
-                $DivisionCount[$div] = 1
-            }
-        }
-        else {
-            $emptyKey = "(не указано)"
-
-            if ($DivisionCount.ContainsKey($emptyKey)) {
-                $DivisionCount[$emptyKey]++
-            }
-            else {
-                $DivisionCount[$emptyKey] = 1
-            }
-        }
-
-        # + ДОБАВЛЕНО: Если пользователь прошел все фильтры и его блок "Аппарат правления" - сохраняем его параметры
-        if (([string]$div).Trim() -eq "Информационно-технологический блок") {
-            [void]$ApparatUsers.Add([PSCustomObject]@{
-                Name              = $User.name
-                SamAccountName    = $sam
-                Division          = $div
-                EmployeeType      = $User.employeeType
-                Initials          = $User.initials
-                WhenCreated       = if ($User.whenCreated) { $User.whenCreated.ToString("dd.MM.yyyy HH:mm") } else { "" }
-                DistinguishedName = $dn
-            })
-        }
-    }
-
-    $discovery = foreach ($k in $DivisionCount.Keys) {
-        @{ '{#DIVISION}' = $k }
-    }
-
-    $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
-
-    if ($null -eq $RealUsersCount) {
-        $RealUsersCount = 0
-    }
-
-    $payload = [ordered]@{
-        discovery = @($discovery)
-        counts = $DivisionCount
-        metadata = @{
-            TotalActiveUsers  = $AllUsersOn.Count
-            ExcludedUsers     = $ExcludedCount
-            RealUsers         = $RealUsersCount
-            UniqueDivisions   = $DivisionCount.Count
-            GeneratedAt       = $time
-            ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
-        }
-    }
-
-    $json = $payload | ConvertTo-Json -Depth 4
-
-    #$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
-
-
-    # + ДОБАВЛЕНО: Вывод списка пользователей "Аппарат правления" в консоль
-    if ($ApparatUsers.Count -gt 0) {
-        Write-Host "`n=========== ПОЛЬЗОВАТЕЛИ БЛОКА 'АППАРАТ ПРАВЛЕНИЯ' ===========" -ForegroundColor Cyan
-        $ApparatUsers | Format-Table -AutoSize
-        Write-Host "Итого в Аппарате правления (после фильтрации): $($ApparatUsers.Count)" -ForegroundColor Yellow
-        Write-Host "================================================================`n" -ForegroundColor Cyan
-    } else {
-        Write-Host "`n[!] В блоке 'Аппарат правления' не найдено ни одного пользователя подходящего под условия.`n" -ForegroundColor Red
-    }
-
-
-    Write-Host "Подсчёт по блокам" -ForegroundColor Green
-    Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
-
-    $DivisionCount.GetEnumerator() |
-        Sort-Object Value -Descending |
-        ForEach-Object {
-            if ($RealUsersCount -gt 0) {
-                $percent = "{0:P2}" -f ($_.Value / $RealUsersCount)
-            }
-            else {
-                $percent = "0,00%"
-            }
-        }
-
-    $DivisionCount.GetEnumerator() |
-        Sort-Object Value -Descending |
-        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
-                     @{Label="Кол-во"; Expression={$_.Value}; Width=10},
-                     @{Label="%"; Expression={
-                         if ($RealUsersCount -gt 0) {
-                             "{0:P2}" -f ($_.Value / $RealUsersCount)
-                         }
-                         else {
-                             "0,00%"
-                         }
-                     }; Width=10} -AutoSize
-
-    Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
-    Write-Host "Исключено (служебные/админские/вендоры/ручные исключения): $ExcludedCount" -ForegroundColor Magenta
-    Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
-
-
-    $timestop = Get-Date
-    $TimeSum = $timestop - $timestart
-
-    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
-    Write-Host "Файл сохранён." -ForegroundColor Green
-
+function Invoke-Sql([string]$q){
+    $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
+    $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
+    $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
+    $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+    $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
 }
-catch {
-    $ScriptStatus = "ERROR"
-    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
-    throw
-}
-В эти подсчёты надо включить пользователей которые отлючены в эктив директори но они не увалены 
+
 try {
     Import-Module ActiveDirectory -ErrorAction Stop
 
     Write-Host "`n[1/3] Запрос к БД 1С для получения работающих сотрудников..." -ForegroundColor Cyan
-    # Шаг 1: Собираем из 1С все табельные номера сотрудников, у которых ОТСУТСТВУЕТ дата увольнения (UvDate IS NULL)
+    # Шаг 1: Выгружаем активные табельные номера из 1С (те, кто НЕ уволен)
     $qActive1C = "SELECT DISTINCT Tab_Numb FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
     $dtActive1C = Invoke-Sql $qActive1C
-    
+
     $active1CHash = @{}
     if ($dtActive1C -and $dtActive1C.Rows) {
         foreach ($row in $dtActive1C.Rows) {
@@ -221,75 +28,72 @@ try {
         }
     }
 
-    # Шаг 2: Подключение к AD и получение отключенных пользователей
-    Write-Host "[2/3] Получение отключенных пользователей из Active Directory..." -ForegroundColor Cyan
-    
+    Write-Host "[2/3] Получение ВСЕХ пользователей из Active Directory..." -ForegroundColor Cyan
+
     $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
     $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
 
     $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
     $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
 
-    # ДОБАВЛЕНО свойство wWWHomePage для получения табельного номера
-    $AllUsersOn = Get-ADUser `
-        -Filter "Enabled -ne 'True' -and (division -like '*')" `
+    # Шаг 2: Выгружаем ВСЕХ пользователей (и включенных, и отключенных)
+    # Добавлено свойство Enabled и wWWHomePage (табельный)
+    $AllUsers = Get-ADUser `
+        -Filter * `
         -Credential $ab_creds `
-        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials, wWWHomePage
+        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials, wWWHomePage, Enabled
 
     $LimitDate = (Get-Date).AddDays(-3)
-
-    # Исключения по initials
-    $ExcludeInitials = @("abdt","vnsov","1/40")
-
-    # Ручные исключения по логинам SamAccountName
-    $ExcludeSamAccounts = @(
-        "TantushjanAM"
-    )
-
-    $ExcludeSamAccountsHash = @{}
-    foreach ($x in $ExcludeSamAccounts) {
-        $x = ([string]$x).Trim()
-        if ($x) { $ExcludeSamAccountsHash[$x] = $true }
-    }
-
     $DivisionCount = @{}
     $ExcludedCount = 0
+    
+    # Счетчики для статистики
+    $CountActiveAD = 0
+    $CountDisabledButActive1C = 0
 
-    # Список для сбора пользователей целевого блока
-    $ApparatUsers = New-Object System.Collections.ArrayList
-
-    foreach ($User in $AllUsersOn) {
+    foreach ($User in $AllUsers) {
 
         $sam = ([string]$User.samaccountname).Trim()
         $name = $User.name
         $dn = $User.DistinguishedName
-        $tab = "$($User.wWWHomePage)".Trim() # Получаем табельный номер из карточки AD
+        $tab = "$($User.wWWHomePage)".Trim()
 
+        # 1. ОБЩИЕ ИСКЛЮЧЕНИЯ (админы, сервисные УЗ, тестовые и т.д.)
         if (
-                $User.whenCreated -gt $LimitDate -or
-                (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) -or
-                $ExcludeInitials -contains ([string]$User.initials).Trim() -or
-                $ExcludeSamAccountsHash.ContainsKey($sam) -or
-
-                $sam -like "Health*" -or
-                $sam -like "audit*" -or
-                $sam -like "esas*" -or
-                $sam -like "a-*" -or
-                $sam -like "z-*" -or
-                $name -like "*`$*" -or
-                $name -like "*Администратор*" -or
-                $name -like "*Тестовая*" -or
-               # $dn -like "*Отключенные пользователи*" -or
-               # $dn -like "*Отключенные объекты*" -or
-                $dn -like "*сторон*" -or
-                
-                # ДОБАВЛЕНО УСЛОВИЕ: Если табельного номера НЕТ среди активных в 1С (значит у него заполнена UvDate или его нет в базе), исключаем его
-                (-not $active1CHash.ContainsKey($tab))
+            $User.whenCreated -gt $LimitDate -or
+            ([string]$User.employeeType).Trim().ToLower() -eq "service" -or
+            $sam -like "Health*" -or
+            $sam -like "audit*" -or
+            $sam -like "esas*" -or
+            $sam -like "a-*" -or
+            $sam -like "z-*" -or
+            $name -like "*`$*" -or
+            $name -like "*Администратор*" -or
+            $name -like "*Тестовая*" -or
+            $dn -like "*Отключенные пользователи*" -or
+            $dn -like "*сторон*"
         ) {
-                $ExcludedCount++
-                continue
+            $ExcludedCount++
+            continue
         }
 
+        # 2. ПРОВЕРКА СТАТУСА (Объединение логики)
+        if ($User.Enabled -eq $true) {
+            # Если активен в AD -> считаем
+            $CountActiveAD++
+        } else {
+            # Если отключен в AD -> проверяем по 1С
+            if ($active1CHash.ContainsKey($tab)) {
+                # Не уволен в 1С -> считаем
+                $CountDisabledButActive1C++
+            } else {
+                # Отключен в AD и уволен/отсутствует в 1С -> исключаем
+                $ExcludedCount++
+                continue
+            }
+        }
+
+        # 3. ПОДСЧЕТ ПО БЛОКАМ
         $div = $User.division
 
         if ($div) {
@@ -301,34 +105,22 @@ try {
             if ($DivisionCount.ContainsKey($emptyKey)) { $DivisionCount[$emptyKey]++ }
             else { $DivisionCount[$emptyKey] = 1 }
         }
-
-        # Если пользователь прошел все фильтры и его блок совпадает — сохраняем параметры
-        if (([string]$div).Trim() -eq "Информационно-технологический блок") {
-            [void]$ApparatUsers.Add([PSCustomObject]@{
-                Name              = $User.name
-                SamAccountName    = $sam
-                TabNumber         = $tab
-                Division          = $div
-                EmployeeType      = $User.employeeType
-                Initials          = $User.initials
-                WhenCreated       = if ($User.whenCreated) { $User.whenCreated.ToString("dd.MM.yyyy HH:mm") } else { "" }
-                DistinguishedName = $dn
-            })
-        }
-    }
-
-    $discovery = foreach ($k in $DivisionCount.Keys) {
-        @{ '{#DIVISION}' = $k }
     }
 
     $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
     if ($null -eq $RealUsersCount) { $RealUsersCount = 0 }
 
+    Write-Host "[3/3] Формирование Zabbix Discovery JSON..." -ForegroundColor Cyan
+
+    $discovery = foreach ($k in $DivisionCount.Keys) {
+        @{ '{#DIVISION}' = $k }
+    }
+
     $payload = [ordered]@{
         discovery = @($discovery)
         counts = $DivisionCount
         metadata = @{
-            TotalActiveUsers  = $AllUsersOn.Count
+            TotalProcessed    = $AllUsers.Count
             ExcludedUsers     = $ExcludedCount
             RealUsers         = $RealUsersCount
             UniqueDivisions   = $DivisionCount.Count
@@ -338,20 +130,13 @@ try {
     }
 
     $json = $payload | ConvertTo-Json -Depth 4
-    #$outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
-
-    # --- ВЫВОД В КОНСОЛЬ ДЕТАЛИЗАЦИИ ---
-    if ($ApparatUsers.Count -gt 0) {
-        Write-Host "`n=========== ПОЛЬЗОВАТЕЛИ БЛОКА 'ИНФОРМАЦИОННО-ТЕХНОЛОГИЧЕСКИЙ БЛОК' ===========" -ForegroundColor Cyan
-        $ApparatUsers | Format-Table -AutoSize
-        Write-Host "Итого в блоке (после фильтрации и проверки по 1С): $($ApparatUsers.Count)" -ForegroundColor Yellow
-        Write-Host "================================================================================`n" -ForegroundColor Cyan
-    } else {
-        Write-Host "`n[!] В блоке 'Информационно-технологический блок' не найдено подходящих пользователей (активных в 1С).`n" -ForegroundColor Red
-    }
+    
+   # $outputDir = Split-Path $OUTPUT_PATH -Parent
+   # if (-not (Test-Path $outputDir)) { New-Item -ItemType Directory -Path $outputDir -Force | Out-Null }
+   # [System.IO.File]::WriteAllText($OUTPUT_PATH, $json, [System.Text.UTF8Encoding]::new($false))
 
     # --- ВЫВОД СТАТИСТИКИ ПО БЛОКАМ ---
-    Write-Host "Подсчёт по блокам" -ForegroundColor Green
+    Write-Host "`n=========== ПОДСЧЕТ ПО БЛОКАМ ===========" -ForegroundColor Green
     Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
 
     $DivisionCount.GetEnumerator() |
@@ -362,9 +147,15 @@ try {
                          if ($RealUsersCount -gt 0) { "{0:P2}" -f ($_.Value / $RealUsersCount) } else { "0,00%" }
                      }; Width=10} -AutoSize
 
-    Write-Host "Всего отключенных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
-    Write-Host "Исключено (служебные/тестовые/уволенные по данным 1С): $ExcludedCount" -ForegroundColor Magenta
-    Write-Host "Реальных пользователей для анализа (отключены в AD, но числятся в 1С): $RealUsersCount" -ForegroundColor Green
+    # --- ИТОГОВЫЕ СВОДНЫЕ ДАННЫЕ В КОНСОЛЬ ---
+    Write-Host "=================== СВОДНЫЕ СЧЕТЧИКИ ===================" -ForegroundColor Green
+    Write-Host "Всего учетных записей обработано в AD:     $($AllUsers.Count)" -ForegroundColor Yellow
+    Write-Host "Исключено (служебные/уволенные/тестовые):  $ExcludedCount" -ForegroundColor Magenta
+    Write-Host "Из них активных в AD:                      $CountActiveAD" -ForegroundColor Cyan
+    Write-Host "Из них отключенных в AD, но активных в 1С: $CountDisabledButActive1C" -ForegroundColor Cyan
+    Write-Host "--------------------------------------------------------" -ForegroundColor Green
+    Write-Host "ИТОГО РЕАЛЬНЫХ ПОЛЬЗОВАТЕЛЕЙ ДЛЯ ZABBIX:   $RealUsersCount" -ForegroundColor Green
+    Write-Host "========================================================" -ForegroundColor Green
 
     $timestop = Get-Date
     $TimeSum = $timestop - $timestart
@@ -376,4 +167,3 @@ catch {
     Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
     throw
 }
-и вевести так же в консоль это цельное количество 
