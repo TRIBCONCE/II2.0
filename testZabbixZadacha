@@ -1,8 +1,58 @@
+ $AllUsersOn = Get-ADUser `
+        -Filter { enabled -eq $true } `
+        -Credential $ab_creds `
+        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType
 
-ОШИБКА: The specified module 'ImportExcel' was not loaded because no valid module file was found in any module directory.
-Import-Module : The specified module 'ImportExcel' was not loaded because no valid module file was found in any module directory.
-At line:44 char:5
-+     Import-Module ImportExcel -ErrorAction Stop
-+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : ResourceUnavailable: (ImportExcel:String) [Import-Module], FileNotFoundException
-    + FullyQualifiedErrorId : Modules_ModuleNotFound,Microsoft.PowerShell.Commands.ImportModuleCommand
+    $LimitDate = (Get-Date).AddDays(-3)
+
+    $DivisionCount = @{}
+
+    # Счётчик исключённых
+    $ExcludedCount = 0
+
+    foreach ($User in $AllUsersOn) {
+
+        $sam = $User.samaccountname
+        $name = $User.name
+        $dn = $User.DistinguishedName
+
+        if (
+            $User.whenCreated -gt $LimitDate -or
+            $User.employeeType -eq "service" -or
+
+            $sam -like "Health*" -or
+            $sam -like "audit*" -or
+            $sam -like "esas*" -or
+            $sam -like "a-*" -or
+            $sam -like "z-*" -or
+            $name -like "*`$*" -or
+            $name -like "*Администратор*" -or
+            $name -like "*Тестовая*" -or
+            $dn -like "*Отключенные пользователи*" -or
+            $dn -like "*сторон*"
+        ) {
+            $ExcludedCount++
+            continue
+        }
+
+        $div = $User.division
+
+        if ($div) {
+            if ($DivisionCount.ContainsKey($div)) {
+                $DivisionCount[$div]++
+            }
+            else {
+                $DivisionCount[$div] = 1
+            }
+        }
+        else {
+            $emptyKey = "(не указано)"
+
+            if ($DivisionCount.ContainsKey($emptyKey)) {
+                $DivisionCount[$emptyKey]++
+            }
+            else {
+                $DivisionCount[$emptyKey] = 1
+            }
+        }
+    }
