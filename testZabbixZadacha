@@ -1,244 +1,158 @@
 cls
+Import-Module ActiveDirectory -ErrorAction Stop
 
-$timestart = Get-Date
-$today = Get-Date -Format dd.MM.yyyy
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+# --- Настройки подключения к AD (при необходимости раскомментируй) ---
+# $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+# $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+# $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+# $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
 
-$XLSX_PATH  = "\\p-rpait-syn01\c$\Scripts\AD_Division_Attr\Справочник.xlsx"
-$TARGET_BLOCK = "Блок информационной безопасности"
+# =========================================================================
+# ЧАСТЬ 1: Массив табельных номеров для проверки
+# =========================================================================
+$MyTabNumbers = @(
+    "10234",
+    "10567",
+    "11045"
+    # Добавляй сюда любые табельные номера из 1С, которые хочешь проанализировать
+)
 
-# Механизм взаимодействия с БД
-function Invoke-Sql([string]$q){
-    $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
-    $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
-    $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
-    $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-    $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
+# Очищаем массив от пробелов и пустых значений
+$SearchTabs = @($MyTabNumbers | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+
+if ($SearchTabs.Count -eq 0) {
+    Write-Host "Массив табельных номеров пуст! Нечего искать." -ForegroundColor Red
+    return
 }
 
-try {
-    Write-Host "`n[1/4] Чтение справочника Excel (через COM-объект)..." -ForegroundColor Cyan
-    $excel = New-Object -ComObject Excel.Application
-    $excel.Visible = $false
-    $excel.DisplayAlerts = $false
-    $dict = @{}
+# =========================================================================
+# ЧАСТЬ 2: Построение фильтров и запрос в AD
+# =========================================================================
+$LdapParts = foreach ($tab in $SearchTabs) { "(wWWHomePage=$tab)" }
+$FinalFilter = "(|{0})" -f ($LdapParts -join "")
 
-    try {
-        $workbook = $excel.Workbooks.Open($XLSX_PATH)
-        foreach ($sheetName in @("department", "dep", "dep1")) {
-            $worksheet = $workbook.Worksheets.Item($sheetName)
-            $sheetDict = @{}
-            $row = 2
-            while ($worksheet.Cells.Item($row, 1).Text -ne "") {
-                $block = $worksheet.Cells.Item($row, 1).Text.Trim()
-                $name  = $worksheet.Cells.Item($row, 2).Text.Trim()
-                if ($block -and $name) { $sheetDict[$name.ToLower()] = $block }
-                $row++
-            }
-            $dict[$sheetName] = $sheetDict
-        }
-        $workbook.Close($false)
-    } finally {
-        $excel.Quit()
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-    }
+Write-Host "[1/2] Поиск $($SearchTabs.Count) сотрудников в Active Directory..." -ForegroundColor Cyan
 
-    Write-Host "[2/4] Получение данных из БД 1С..." -ForegroundColor Cyan
-    
-    # Вспомогательный хэш для проверки статуса AD
-    $qActive1C = "SELECT DISTINCT Tab_Numb FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
-    $dtActive1C = Invoke-Sql $qActive1C
-    $active1CHash = @{}
-    if ($dtActive1C -and $dtActive1C.Rows) {
-        foreach ($row in $dtActive1C.Rows) {
-            $t = "$($row.Tab_Numb)".Trim(); if ($t) { $active1CHash[$t] = $true }
-        }
-    }
+$AdProperties = @(
+    "name", "samaccountname", "wWWHomePage", "division", 
+    "employeeType", "initials", "whenCreated", "Enabled", "mail", "DistinguishedName"
+)
 
-    # Основной запрос к представлению 1С
-    $sql1C = @"
-    SELECT department, dep, dep1, dokko, Tab_Numb, fio
-    FROM IC.v_Empl_info
-    WHERE DecrOtpusk = 0
-      AND (UvDate IS NULL OR UvDate > CAST(GETDATE() AS date))
-      AND Synonym = N'Основное место работы'
-      AND fio IS NOT NULL AND LTRIM(RTRIM(fio)) <> ''
-"@
-    $dt = Invoke-Sql $sql1C
-    $Users1C = $dt.Rows
-
-    function Resolve-Block {
-        param($E, $Dict)
-        foreach ($f in @("department","dep","dep1")) {
-            $v = ([string]$E.$f).Trim()
-            if ($v) {
-                $k = $v.ToLower()
-                foreach ($sheet in @("department","dep","dep1")) {
-                    $b = $Dict[$sheet][$k]
-                    if ($b) { return $b }
-                }
-            }
-        }
-        if (([string]$E.dokko).Trim()) { return "Дополнительные офисы" }
-        return "(не указано)"
-    }
-
-    $Valid1CUsers = @{}
-    foreach ($User in $Users1C) {
-        $block = Resolve-Block -E $User -Dict $dict
-        if ($block -eq $TARGET_BLOCK) {
-            $tab1C = "$($User.Tab_Numb)".Trim()
-            if ($tab1C) {
-                $Valid1CUsers[$tab1C] = $User
-            }
-        }
-    }
-
-    Write-Host "[3/4] Получение пользователей из Active Directory..." -ForegroundColor Cyan
-    Import-Module ActiveDirectory -ErrorAction Stop
-
-    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
-    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
-    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
-    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
-
-    $AllUsersAD = Get-ADUser `
-        -Filter "division -like '*'" `
-        -Credential $ab_creds `
-        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials, wWWHomePage, Enabled
-
-    $LimitDate = (Get-Date).AddDays(-3)
-    $ExcludeInitials = @("abdt","vnsov","1/40")
-    $ExcludeSamAccounts = @("TantushjanAM")
-    $ExcludeSamAccountsHash = @{}
-    foreach ($x in $ExcludeSamAccounts) { if ($x.Trim()) { $ExcludeSamAccountsHash[$x.Trim()] = $true } }
-
-    $ValidADUsers = @{}
-    $ExcludedADReasons = @{} # Словарь для записи точных причин исключения из AD
-    
-    foreach ($User in $AllUsersAD) {
-        $div = ([string]$User.division).Trim()
-        $sam = ([string]$User.samaccountname).Trim()
-        $name = $User.name
-        $dn = $User.DistinguishedName
-        $tabAD = "$($User.wWWHomePage)".Trim()
-        
-        $reason = "" # Сбрасываем причину для каждой итерации
-
-        # === КАСКАД ФИЛЬТРОВ С ФИКСАЦИЕЙ ПРИЧИНЫ ===
-        if ($div -ne $TARGET_BLOCK) {
-            $reason = "В AD прописан другой division: '$div'"
-        }
-        elseif ($User.whenCreated -gt $LimitDate) {
-            $reason = "УЗ создана менее 3 дней назад"
-        }
-        elseif (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) {
-            $reason = "Отфильтрована по employeeType '$($User.employeeType)'"
-        }
-        elseif ($ExcludeInitials -contains ([string]$User.initials).Trim()) {
-            $reason = "Отфильтрована по инициалам '$($User.initials)'"
-        }
-        elseif ($ExcludeSamAccountsHash.ContainsKey($sam)) {
-            $reason = "Ручное исключение (логин '$sam' в черном списке)"
-        }
-        elseif ($sam -like "Health*" -or $sam -like "audit*" -or $sam -like "esas*" -or $sam -like "a-*" -or $sam -like "z-*") {
-            $reason = "Служебный/тестовый логин ($sam)"
-        }
-        elseif ($name -like "*`$*" -or $name -like "*Администратор*" -or $name -like "*Тестовая*") {
-            $reason = "Служебное/тестовое ФИО ($name)"
-        }
-        elseif ($dn -like "*сторон*") {
-            $reason = "Находится в OU сторонних/отключенных объектов"
-        }
-        elseif ($User.Enabled -eq $false -and -not $active1CHash.ContainsKey($tabAD)) {
-            $reason = "Учетка отключена в AD и уволена (или отсутствует) в 1С"
-        }
-
-        # === ПРОВЕРКА РЕЗУЛЬТАТА ФИЛЬТРАЦИИ ===
-        if ($reason -eq "") {
-            # Причин для исключения нет -> Добавляем в Валидные
-            if ($tabAD) { $ValidADUsers[$tabAD] = $User }
-        } else {
-            # Есть причина -> Записываем причину исключения в словарь (если у УЗ есть табельный)
-            if ($tabAD) { $ExcludedADReasons[$tabAD] = $reason }
-        }
-    }
-
-    Write-Host "[4/4] Сверка данных по блоку ИБ и вывод списков..." -ForegroundColor Cyan
-
-    # --- ВЫВОД ПОЛНЫХ СПИСКОВ СО ВСЕМИ АТРИБУТАМИ ---
-    Write-Host "`n=========== ПОЛНЫЙ СПИСОК 1С: $TARGET_BLOCK ===========" -ForegroundColor Magenta
-    if ($Valid1CUsers.Count -gt 0) {
-        $Valid1CUsers.Values | Select-Object fio, Tab_Numb, department, dep, dep1, dokko | Format-Table -AutoSize
-    } else {
-        Write-Host "В 1С не найдено сотрудников для данного блока." -ForegroundColor DarkGray
-    }
-
-    Write-Host "`n=========== ПОЛНЫЙ СПИСОК AD: $TARGET_BLOCK ===========" -ForegroundColor Magenta
-    if ($ValidADUsers.Count -gt 0) {
-        $ValidADUsers.Values | Select-Object name, samaccountname, wWWHomePage, division, employeeType, initials, whenCreated, Enabled, DistinguishedName | Format-Table -AutoSize
-    } else {
-        Write-Host "В AD не найдено пользователей для данного блока." -ForegroundColor DarkGray
-    }
-    
-    $Discrepancies = New-Object System.Collections.ArrayList
-
-    # Анализ 1: Есть в AD (ИБ), но отсутствует в 1С (ИБ)
-    foreach ($key in $ValidADUsers.Keys) {
-        if (-not $Valid1CUsers.ContainsKey($key)) {
-            $u = $ValidADUsers[$key]
-            $reason = if (-not $key) { "Пустой табельный номер в AD" } else { "Отфильтрован в SQL 1С (декрет, уволен, внеш. совместитель и т.д.)" }
-            
-            [void]$Discrepancies.Add([PSCustomObject]@{
-                'Табельный'         = if($key){$key}else{"Нет"}
-                'ФИО'               = $u.name
-                'Где найден'        = "Только в AD"
-                'Причина / Отличие' = $reason
-            })
-        }
-    }
-
-    # Анализ 2: Есть в 1С (ИБ), но отсутствует в AD (ИБ)
-    foreach ($key in $Valid1CUsers.Keys) {
-        if (-not $ValidADUsers.ContainsKey($key)) {
-            $u = $Valid1CUsers[$key]
-            
-            # ДОБАВЛЕНО: Проверяем, есть ли записанная причина отказа для этого табельного
-            if ($ExcludedADReasons.ContainsKey($key)) {
-                $reason = "Забракован скриптом AD -> " + $ExcludedADReasons[$key]
-            } else {
-                $reason = "Учетки вообще нет в AD (или у неё пустой division / табельный)"
-            }
-
-            [void]$Discrepancies.Add([PSCustomObject]@{
-                'Табельный'         = $key
-                'ФИО'               = $u.fio
-                'Где найден'        = "Только в 1С"
-                'Причина / Отличие' = $reason
-            })
-        }
-    }
-
-    # --- ВЫВОД РАСХОЖДЕНИЙ В КОНСОЛЬ ---
-    Write-Host "`n=================== РАСХОЖДЕНИЯ ===================" -ForegroundColor Yellow
-    
-    if ($Discrepancies.Count -gt 0) {
-        Write-Host "Найдено расхождений по блоку ИБ: $($Discrepancies.Count)`n" -ForegroundColor Red
-        $Discrepancies | Sort-Object 'Где найден', 'ФИО' | Format-Table -AutoSize
-    } else {
-        Write-Host "Идеально! Расхождений по Блоку информационной безопасности не обнаружено." -ForegroundColor Green
-    }
-    Write-Host "===================================================" -ForegroundColor Yellow
-
-    # Итоговая статистика по блоку
-    Write-Host "Успешно сопоставлено сотрудников в 1С (ИБ):  $($Valid1CUsers.Count)" -ForegroundColor Cyan
-    Write-Host "Успешно сопоставлено учетных записей в AD (ИБ):  $($ValidADUsers.Count)" -ForegroundColor Cyan
-
-    $timestop = Get-Date
-    $TimeSum = $timestop - $timestart
-    Write-Host "`nВремя выполнения сверки: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor DarkCyan
-
-} catch {
-    Write-Host "`nОШИБКА ВЫПОЛНЕНИЯ: $($_.Exception.Message)" -ForegroundColor Red
-    throw
+$ADParams = @{
+    LDAPFilter = $FinalFilter
+    Properties = $AdProperties
 }
+# $ADParams.Credential = $ab_creds 
+
+$FoundUsers = Get-ADUser @ADParams
+Write-Host "[2/2] Из AD успешно получено записей: $($FoundUsers.Count)`n" -ForegroundColor Cyan
+
+# =========================================================================
+# ЧАСТЬ 3: Анализ и применение правил фильтрации
+# =========================================================================
+$FoundTabsHash = @{}
+$LimitDate = (Get-Date).AddDays(-3)
+$ExcludeInitials = @("abdt","vnsov","1/40")
+$ExcludeSamAccountsHash = @{"TantushjanAM"=$true}
+
+$ValidUsers    = New-Object System.Collections.ArrayList
+$ExcludedUsers = New-Object System.Collections.ArrayList
+
+foreach ($User in $FoundUsers) {
+    $tab = "$($User.wWWHomePage)".Trim()
+    if ($tab) { $FoundTabsHash[$tab] = $true }
+
+    $div  = ([string]$User.division).Trim()
+    $sam  = ([string]$User.samaccountname).Trim()
+    $name = $User.name
+    $dn   = $User.DistinguishedName
+    
+    $reason = "" # Сбрасываем причину
+
+    # --- КАСКАД ПРОВЕРОК (Твои фильтры) ---
+    if (-not $div) {
+        $reason = "Пустой атрибут division (подразделение не указано)"
+    }
+    elseif ($User.whenCreated -gt $LimitDate) {
+        $reason = "УЗ создана менее 3 дней назад"
+    }
+    elseif (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) {
+        $reason = "Отфильтрована по employeeType '$($User.employeeType)'"
+    }
+    elseif ($ExcludeInitials -contains ([string]$User.initials).Trim()) {
+        $reason = "Отфильтрована по инициалам '$($User.initials)'"
+    }
+    elseif ($ExcludeSamAccountsHash.ContainsKey($sam)) {
+        $reason = "Ручное исключение (логин '$sam' в черном списке)"
+    }
+    elseif ($sam -like "Health*" -or $sam -like "audit*" -or $sam -like "esas*" -or $sam -like "a-*" -or $sam -like "z-*") {
+        $reason = "Служебный/тестовый логин ($sam)"
+    }
+    elseif ($name -like "*`$*" -or $name -like "*Администратор*" -or $name -like "*Тестовая*") {
+        $reason = "Служебное/тестовое ФИО ($name)"
+    }
+    elseif ($dn -like "*сторон*") {
+        $reason = "Находится в OU сторонних/отключенных объектов"
+    }
+    elseif ($User.Enabled -eq $false) {
+        # Поскольку тут нет прямой связи с базой 1С для проверки на увольнение,
+        # мы просто констатируем факт, что учетка отключена.
+        $reason = "Учетная запись отключена (Enabled = False)"
+    }
+
+    # Формируем итоговый объект для отчета
+    $obj = [PSCustomObject]@{
+        'Табельный'    = $tab
+        'ФИО'          = $name
+        'Логин'        = $sam
+        'Активен'      = $User.Enabled
+        'Подразделение'= $div
+        'Причина'      = $reason
+    }
+
+    # Распределяем по спискам
+    if ($reason -eq "") {
+        $obj.Причина = "✔ ВАЛИДНА (Прошла все проверки)"
+        [void]$ValidUsers.Add($obj)
+    } else {
+        [void]$ExcludedUsers.Add($obj)
+    }
+}
+
+# =========================================================================
+# ЧАСТЬ 4: Вывод результатов
+# =========================================================================
+
+# 1. Валидные учетки (Зеленые)
+if ($ValidUsers.Count -gt 0) {
+    Write-Host "=========== ВАЛИДНЫЕ СОТРУДНИКИ (ПОПАДУТ В СТАТИСТИКУ) ===========" -ForegroundColor Green
+    $ValidUsers | Sort-Object 'Табельный' | Format-Table -AutoSize
+}
+
+# 2. Забракованные учетки (Желтые)
+if ($ExcludedUsers.Count -gt 0) {
+    Write-Host "`n=========== ИСКЛЮЧЕННЫЕ СОТРУДНИКИ (ЕСТЬ В AD, НО ЗАБРАКОВАНЫ ФИЛЬТРАМИ) ===========" -ForegroundColor Yellow
+    $ExcludedUsers | Sort-Object 'Табельный' | Format-Table -AutoSize
+}
+
+# 3. Не найдены в AD (Красные)
+Write-Host "`n=========== РАСХОЖДЕНИЯ (ВООБЩЕ НЕТ В AD ПО ТАБЕЛЬНОМУ) ===========" -ForegroundColor Magenta
+$NotFoundCount = 0
+foreach ($tab in $SearchTabs) {
+    if (-not $FoundTabsHash.ContainsKey($tab)) {
+        Write-Host "[!] Табельный номер $tab ОТСУТСТВУЕТ в Active Directory" -ForegroundColor Red
+        $NotFoundCount++
+    }
+}
+
+if ($NotFoundCount -eq 0) {
+    Write-Host "Все запрошенные табельные номера существуют в AD." -ForegroundColor Green
+}
+
+# Итоговое резюме
+Write-Host "`n=================== ИТОГИ ===================" -ForegroundColor Cyan
+Write-Host "Всего запрошено:  $($SearchTabs.Count)"
+Write-Host "Идеальных УЗ:     $($ValidUsers.Count)" -ForegroundColor Green
+Write-Host "Отфильтровано:    $($ExcludedUsers.Count)" -ForegroundColor Yellow
+Write-Host "Вообще не найдено:$NotFoundCount" -ForegroundColor Red
+Write-Host "=============================================" -ForegroundColor Cyan
