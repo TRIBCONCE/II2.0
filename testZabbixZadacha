@@ -1,58 +1,116 @@
- $AllUsersOn = Get-ADUser `
-        -Filter { enabled -eq $true } `
-        -Credential $ab_creds `
-        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType
+cls
+Import-Module ActiveDirectory -ErrorAction Stop
 
-    $LimitDate = (Get-Date).AddDays(-3)
+# --- Настройки подключения к AD (при необходимости раскомментируй) ---
+# $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+# $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+# $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+# $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
 
-    $DivisionCount = @{}
+# =========================================================================
+# ЧАСТЬ 1: Твой массив табельных номеров для поиска отличий
+# =========================================================================
+$MyTabNumbers = @(
+    "10234",
+    "10567",
+    "11045"
+    # Добавляй сюда любые табельные номера из 1С
+)
 
-    # Счётчик исключённых
-    $ExcludedCount = 0
+# Очищаем массив от пробелов и пустых значений
+$SearchTabs = @($MyTabNumbers | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
 
-    foreach ($User in $AllUsersOn) {
+if ($SearchTabs.Count -eq 0) {
+    Write-Host "Массив табельных номеров пуст! Нечего искать." -ForegroundColor Red
+    return
+}
 
-        $sam = $User.samaccountname
-        $name = $User.name
-        $dn = $User.DistinguishedName
+# =========================================================================
+# ЧАСТЬ 2: Динамическое построение LDAP-фильтра
+# =========================================================================
+# Строит фильтр вида: (|(wWWHomePage=10234)(wWWHomePage=10567)(wWWHomePage=11045))
+$LdapParts = foreach ($tab in $SearchTabs) {
+    "(wWWHomePage=$tab)"
+}
+$FinalFilter = "(|{0})" -f ($LdapParts -join "")
 
-        if (
-            $User.whenCreated -gt $LimitDate -or
-            $User.employeeType -eq "service" -or
+Write-Host "[1/2] Сформирован LDAP-фильтр для поиска $($SearchTabs.Count) сотрудников..." -ForegroundColor Cyan
 
-            $sam -like "Health*" -or
-            $sam -like "audit*" -or
-            $sam -like "esas*" -or
-            $sam -like "a-*" -or
-            $sam -like "z-*" -or
-            $name -like "*`$*" -or
-            $name -like "*Администратор*" -or
-            $name -like "*Тестовая*" -or
-            $dn -like "*Отключенные пользователи*" -or
-            $dn -like "*сторон*"
-        ) {
-            $ExcludedCount++
-            continue
-        }
+# =========================================================================
+# ЧАСТЬ 3: Запрос в Active Directory
+# =========================================================================
+# Свойства, которые нам нужны для анализа
+$AdProperties = @(
+    "name", 
+    "samaccountname", 
+    "wWWHomePage", 
+    "division", 
+    "employeeType", 
+    "initials", 
+    "whenCreated", 
+    "Enabled", 
+    "mail",
+    "DistinguishedName"
+)
 
-        $div = $User.division
+$ADParams = @{
+    LDAPFilter = $FinalFilter
+    Properties = $AdProperties
+}
+# Если используешь учетные данные (creds), раскомментируй строку ниже:
+# $ADParams.Credential = $ab_creds 
 
-        if ($div) {
-            if ($DivisionCount.ContainsKey($div)) {
-                $DivisionCount[$div]++
-            }
-            else {
-                $DivisionCount[$div] = 1
-            }
-        }
-        else {
-            $emptyKey = "(не указано)"
+$FoundUsers = Get-ADUser @ADParams
 
-            if ($DivisionCount.ContainsKey($emptyKey)) {
-                $DivisionCount[$emptyKey]++
-            }
-            else {
-                $DivisionCount[$emptyKey] = 1
-            }
-        }
+# =========================================================================
+# ЧАСТЬ 4: Вывод результатов и анализ «Кого не нашли»
+# =========================================================================
+Write-Host "[2/2] Из AD успешно получено записей: $($FoundUsers.Count)`n" -ForegroundColor Cyan
+
+# Преобразуем результат в красивую хэш-таблицу для быстрого поиска
+$FoundTabsHash = @{}
+
+$FormattedUsers = foreach ($User in $FoundUsers) {
+    $tab = "$($User.wWWHomePage)".Trim()
+    if ($tab) {
+        $FoundTabsHash[$tab] = $true
     }
+
+    # Формируем объект со всеми параметрами для вывода в консоль
+    [PSCustomObject]@{
+        'Табельный (1С)' = $tab
+        'ФИО'            = $User.name
+        'Логин'          = $User.samaccountname
+        'Подразделение'  = $User.division
+        'Тип УЗ'         = $User.employeeType
+        'Инициалы'       = $User.initials
+        'Почта'          = $User.mail
+        'Создан'         = if ($User.whenCreated) { $User.whenCreated.ToString("dd.MM.yyyy") } else { "" }
+        'Активен в AD'   = $User.Enabled
+        'DN'             = $User.DistinguishedName
+    }
+}
+
+# 1. Выводим полную информацию тех, кого нашли в AD
+Write-Host "=========== НАЙДЕННЫЕ В AD СОТРУДНИКИ ===========" -ForegroundColor Green
+if ($FormattedUsers) {
+    $FormattedUsers | Sort-Object 'Табельный (1С)' | Format-Table -AutoSize
+} else {
+    Write-Host "В AD не найдено ни одной учетной записи из указанного массива!" -ForegroundColor Red
+}
+
+# 2. Поиск отличий: Кто был в твоем массиве, но в AD по табельнику вообще не нашелся
+Write-Host "`n=========== РАСХОЖДЕНИЯ (НЕТ В AD) ===========" -ForegroundColor Yellow
+$NotFoundCount = 0
+foreach ($tab in $SearchTabs) {
+    if (-not $FoundTabsHash.ContainsKey($tab)) {
+        Write-Host "[!] Табельный номер $tab присутствует в твоем массиве, но ОТСУТСТВУЕТ в Active Directory" -ForegroundColor Red
+        $NotFoundCount++
+    }
+}
+
+if ($NotFoundCount -eq 0) {
+    Write-Host "Отлично! Все табельные номера из массива стопроцентно присутствуют в AD." -ForegroundColor Green
+} else {
+    Write-Host "`nВсего не найдено в AD: $NotFoundCount чел." -ForegroundColor Yellow
+}
