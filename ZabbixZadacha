@@ -9,3 +9,25 @@
 Надо исправить вот это условие для этого понадобится ещё одна дополнительная таблица Empl_WT_USPS, надо оставить UvDate IS NULL и AND Synonym = N'Основное место работы' в одном блоке, условие с основным местом работы не подходит к UvDate > CAST(GETDATE() AS date) так как во вью этот параметр у таких сотрудников отсутствует  по этому надо проверку проводить подключая таблицу сотруднка вью и таблица имеют одинаковые Tab_Numb так вот параметр из таблицы Unit должен равняться 1
 
 всё условие будет таким UvDate > CAST(GETDATE() AS date) и из таблице у этого же сотрудника Unit=1 так же во всё sql условие надо исключить вообще всех сотрудников у которых Unit<1
+
+# 2.1 Вспомогательный хэш для проверки статуса AD (кто НЕ уволен в 1С)
+    $qActive1C = "SELECT DISTINCT Tab_Numb FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
+    $dtActive1C = Invoke-Sql $qActive1C
+    $active1CHash = @{}
+    if ($dtActive1C -and $dtActive1C.Rows) {
+        foreach ($row in $dtActive1C.Rows) {
+            $t = "$($row.Tab_Numb)".Trim(); if ($t) { $active1CHash[$t] = $true }
+        }
+    }
+
+    # 2.2 Основной запрос к представлению 1С
+    $sql1C = @"
+    SELECT department, dep, dep1, dokko, Tab_Numb, fio
+    FROM IC.v_Empl_info
+    WHERE DecrOtpusk = 0
+      AND (UvDate IS NULL OR UvDate > CAST(GETDATE() AS date))
+      AND Synonym = N'Основное место работы'
+      AND fio IS NOT NULL AND LTRIM(RTRIM(fio)) <> ''
+"@
+    $dt = Invoke-Sql $sql1C
+    $Users1C = $dt.Rows
