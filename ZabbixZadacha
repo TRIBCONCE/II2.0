@@ -1,4 +1,19 @@
-    $AllUsersOn = Get-ADUser `
+Functions
+sortSeries
+(
+
+asc
+)
+replaceAlias
+(
+
+/AD AllUsersBlocks:*/
+,
+
+)
+Вот такая функция в графана которая подтягивает данные из забикс мне надо исключить AD AllUsersBlocks:Все_пользователи
+
+$AllUsersOn = Get-ADUser `
         -Filter { enabled -eq $true } `
         -Credential $ab_creds `
         -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials
