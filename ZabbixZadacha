@@ -1,33 +1,194 @@
-    $sql = @"
-    SELECT department, dep, dep1, dokko
-    FROM IC.v_Empl_info
-    WHERE DecrOtpusk = 0
-      AND (UvDate IS NULL OR UvDate > CAST(GETDATE() AS date))
-      AND Synonym = N'Основное место работы'
-      AND fio IS NOT NULL AND LTRIM(RTRIM(fio)) <> ''
-"@
-Надо исправить вот это условие для этого понадобится ещё одна дополнительная таблица Empl_WT_USPS, надо оставить UvDate IS NULL и AND Synonym = N'Основное место работы' в одном блоке, условие с основным местом работы не подходит к UvDate > CAST(GETDATE() AS date) так как во вью этот параметр у таких сотрудников отсутствует  по этому надо проверку проводить подключая таблицу сотруднка вью и таблица имеют одинаковые Tab_Numb так вот параметр из таблицы Unit должен равняться 1
+$timestart = Get-Date
+$today = (Get-Date).Date
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
-всё условие будет таким UvDate > CAST(GETDATE() AS date) и из таблице у этого же сотрудника Unit=1 так же во всё sql условие надо исключить вообще всех сотрудников у которых Unit<1
+# --- Настройки путей и логирования ---
+$LogPath = "C:\Scripts\Zabbix_division_objects\AllUsersBlocksDiscoveryLOG.log"
+$OUTPUT_PATH = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
+$ScriptStatus = "SUCCESS"
 
-# 2.1 Вспомогательный хэш для проверки статуса AD (кто НЕ уволен в 1С)
+function Write-Log {
+    param([string]$Message)
+    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
+}
+
+function Invoke-Sql([string]$q){
+    $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
+    $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
+    $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
+    $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+    $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
+}
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+
+    Write-Host "`n[1/3] Запрос к БД 1С для получения работающих сотрудников..." -ForegroundColor Cyan
+    # Шаг 1: Выгружаем активные табельные номера из 1С (те, кто НЕ уволен)
     $qActive1C = "SELECT DISTINCT Tab_Numb FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
     $dtActive1C = Invoke-Sql $qActive1C
+
     $active1CHash = @{}
     if ($dtActive1C -and $dtActive1C.Rows) {
         foreach ($row in $dtActive1C.Rows) {
-            $t = "$($row.Tab_Numb)".Trim(); if ($t) { $active1CHash[$t] = $true }
+            $t = "$($row.Tab_Numb)".Trim()
+            if ($t) { $active1CHash[$t] = $true }
         }
     }
 
-    # 2.2 Основной запрос к представлению 1С
-    $sql1C = @"
-    SELECT department, dep, dep1, dokko, Tab_Numb, fio
-    FROM IC.v_Empl_info
-    WHERE DecrOtpusk = 0
-      AND (UvDate IS NULL OR UvDate > CAST(GETDATE() AS date))
-      AND Synonym = N'Основное место работы'
-      AND fio IS NOT NULL AND LTRIM(RTRIM(fio)) <> ''
-"@
-    $dt = Invoke-Sql $sql1C
-    $Users1C = $dt.Rows
+    Write-Host "[2/3] Получение ВСЕХ пользователей из Active Directory..." -ForegroundColor Cyan
+
+    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+
+    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+    #$ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+
+    # Шаг 2: Выгружаем ВСЕХ пользователей (и включенных, и отключенных)
+    # Добавлено свойство Enabled и wWWHomePage (табельный)
+    $AllUsers = Get-ADUser `
+        -Filter "division -like '*'" `
+        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials, wWWHomePage, Enabled
+
+    $LimitDate = (Get-Date).AddDays(-3)
+    $DivisionCount = @{}
+    $ExcludedCount = 0
+    $ExcludeInitials = @("vnsov","1/40")
+    # Счетчики для статистики
+    $CountActiveAD = 0
+    $CountDisabledButActive1C = 0
+
+    foreach ($User in $AllUsers) {
+
+        $sam = ([string]$User.samaccountname).Trim()
+        $name = $User.name
+        $dn = $User.DistinguishedName
+        $tab = "$($User.wWWHomePage)".Trim()
+        $Desk = $User.Description
+        # 1. ОБЩИЕ ИСКЛЮЧЕНИЯ (админы, сервисные УЗ, тестовые и т.д.)
+        if (
+			$User.whenCreated -gt $LimitDate -or
+			(@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) -or
+			$ExcludeInitials -contains ([string]$User.initials).Trim() -or
+			$ExcludeSamAccountsHash.ContainsKey($sam) -or
+
+			$sam -like "Health*" -or
+			$sam -like "audit*" -or
+			$sam -like "esas*" -or
+			$sam -like "a-*" -or
+			$sam -like "z-*" -or
+			$name -like "*`$*" -or
+			$name -like "*Администратор*" -or
+			$name -like "*Тестовая*" -or
+			$dn -like "*Отключенные пользователи*" -or
+			$dn -like "*сторон*"
+		) {
+			$ExcludedCount++
+			continue
+		}
+
+        # 2. ПРОВЕРКА СТАТУСА (Объединение логики)
+        if ($User.Enabled -eq $true) {
+            # Если активен в AD -> считаем
+            $CountActiveAD++
+        } else {
+            if($User.division -like '*')
+            {
+                # Если отключен в AD -> проверяем по 1С
+                if ($active1CHash.ContainsKey($tab)) {
+                    # Не уволен в 1С -> считаем
+                    $CountDisabledButActive1C++
+                } else {
+                    # Отключен в AD и уволен/отсутствует в 1С -> исключаем
+                    $ExcludedCount++
+                    continue
+                }
+            }
+        }
+
+        # 3. ПОДСЧЕТ ПО БЛОКАМ
+        $div = $User.division
+
+        if ($div) {
+            if ($DivisionCount.ContainsKey($div)) { $DivisionCount[$div]++ }
+            else { $DivisionCount[$div] = 1 }
+        }
+        else {
+            $emptyKey = "(не указано)"
+            if ($DivisionCount.ContainsKey($emptyKey)) { $DivisionCount[$emptyKey]++ }
+            else { $DivisionCount[$emptyKey] = 1 }
+        }
+    }
+
+    $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+    if ($null -eq $RealUsersCount) { $RealUsersCount = 0 }
+
+    Write-Host "[3/3] Формирование Zabbix Discovery JSON..." -ForegroundColor Cyan
+
+    $discovery = foreach ($k in $DivisionCount.Keys) {
+        @{ '{#DIVISION}' = $k }
+    }
+
+    $payload = [ordered]@{
+        discovery = @($discovery)
+        counts = $DivisionCount
+        metadata = @{
+            TotalProcessed    = $AllUsers.Count
+            ExcludedUsers     = $ExcludedCount
+            RealUsers         = $RealUsersCount
+            UniqueDivisions   = $DivisionCount.Count
+            GeneratedAt       = $time
+            ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+        }
+    }
+
+    $json = $payload | ConvertTo-Json -Depth 4
+    
+   # $outputDir = Split-Path $OUTPUT_PATH -Parent
+   # if (-not (Test-Path $outputDir)) { New-Item -ItemType Directory -Path $outputDir -Force | Out-Null }
+   # [System.IO.File]::WriteAllText($OUTPUT_PATH, $json, [System.Text.UTF8Encoding]::new($false))
+
+    # --- ВЫВОД СТАТИСТИКИ ПО БЛОКАМ ---
+    Write-Host "`n=========== ПОДСЧЕТ ПО БЛОКАМ ===========" -ForegroundColor Green
+    Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
+                     @{Label="Кол-во"; Expression={$_.Value}; Width=10},
+                     @{Label="%"; Expression={
+                         if ($RealUsersCount -gt 0) { "{0:P2}" -f ($_.Value / $RealUsersCount) } else { "0,00%" }
+                     }; Width=10} -AutoSize
+
+    # --- ИТОГОВЫЕ СВОДНЫЕ ДАННЫЕ В КОНСОЛЬ ---
+    Write-Host "=================== СВОДНЫЕ СЧЕТЧИКИ ===================" -ForegroundColor Green
+    Write-Host "Всего учетных записей обработано в AD:     $($AllUsers.Count)" -ForegroundColor Yellow
+    Write-Host "Исключено (служебные/уволенные/тестовые):  $ExcludedCount" -ForegroundColor Magenta
+    Write-Host "Из них активных в AD:                      $CountActiveAD" -ForegroundColor Cyan
+    Write-Host "Из них отключенных в AD, но активных в 1С: $CountDisabledButActive1C" -ForegroundColor Cyan
+    Write-Host "--------------------------------------------------------" -ForegroundColor Green
+    Write-Host "ИТОГО РЕАЛЬНЫХ ПОЛЬЗОВАТЕЛЕЙ ДЛЯ ZABBIX:   $RealUsersCount" -ForegroundColor Green
+    Write-Host "========================================================" -ForegroundColor Green
+
+    $timestop = Get-Date
+    $TimeSum = $timestop - $timestart
+    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+
+}
+catch {
+    $ScriptStatus = "ERROR"
+    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+    throw
+}
+
+ОШИБКА: You cannot call a method on a null-valued expression.
+You cannot call a method on a null-valued expression.
+At C:\Users\z-BorodinES\Desktop\ZabbixZadacha\TestAD2.ps1:83 char:13
++         if ($User.whenCreated -gt $LimitDate -or
++             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : InvokeMethodOnNull
+ 
+
+PS C:\Users\z-BorodinES> 
