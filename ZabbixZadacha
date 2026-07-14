@@ -1,73 +1,39 @@
-$timestart = Get-Date
-$today = (Get-Date).Date
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+    $AllUsersOn = Get-ADUser `
+        -Filter { enabled -eq $true } `
+        -Credential $ab_creds `
+        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials
 
-# --- Настройки путей и логирования ---
-$LogPath = "C:\Scripts\Zabbix_division_objects\AllUsersBlocksDiscoveryLOG.log"
-$OUTPUT_PATH = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
-$ScriptStatus = "SUCCESS"
+    $LimitDate = (Get-Date).AddDays(-3)
 
-function Write-Log {
-    param([string]$Message)
-    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
-    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
-}
+    # Исключения по initials
+    $ExcludeInitials = @("vnsov","1/40")
 
-function Invoke-Sql([string]$q){
-    $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
-    $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
-    $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
-    $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-    $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
-}
+    # Ручные исключения по логинам SamAccountName
+    # Эти УЗ вообще не будут попадать в счетчики
+    $ExcludeSamAccounts = @(
+        "TantushjanAM"
+    )
 
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-
-    Write-Host "`n[1/3] Запрос к БД 1С для получения работающих сотрудников..." -ForegroundColor Cyan
-    # Шаг 1: Выгружаем активные табельные номера из 1С (те, кто НЕ уволен)
-    $qActive1C = "SELECT DISTINCT Tab_Numb FROM IC.Empl_WT_USPS WHERE UvDate IS NULL"
-    $dtActive1C = Invoke-Sql $qActive1C
-
-    $active1CHash = @{}
-    if ($dtActive1C -and $dtActive1C.Rows) {
-        foreach ($row in $dtActive1C.Rows) {
-            $t = "$($row.Tab_Numb)".Trim()
-            if ($t) { $active1CHash[$t] = $true }
+    $ExcludeSamAccountsHash = @{}
+    foreach ($x in $ExcludeSamAccounts) {
+        $x = ([string]$x).Trim()
+        if ($x) {
+            $ExcludeSamAccountsHash[$x] = $true
         }
     }
 
-    Write-Host "[2/3] Получение ВСЕХ пользователей из Active Directory..." -ForegroundColor Cyan
-
-    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
-    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
-
-    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
-    #$ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
-
-    # Шаг 2: Выгружаем ВСЕХ пользователей (и включенных, и отключенных)
-    # Добавлено свойство Enabled и wWWHomePage (табельный)
-    $AllUsers = Get-ADUser `
-        -Filter "division -like '*'" `
-        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, initials, wWWHomePage, Enabled
-
-    $LimitDate = (Get-Date).AddDays(-3)
     $DivisionCount = @{}
-    $ExcludedCount = 0
-    $ExcludeInitials = @("vnsov","1/40")
-    # Счетчики для статистики
-    $CountActiveAD = 0
-    $CountDisabledButActive1C = 0
 
-    foreach ($User in $AllUsers) {
+    # Счётчик исключённых
+    $ExcludedCount = 0
+
+    foreach ($User in $AllUsersOn) {
 
         $sam = ([string]$User.samaccountname).Trim()
         $name = $User.name
         $dn = $User.DistinguishedName
-        $tab = "$($User.wWWHomePage)".Trim()
-        $Desk = $User.Description
-        # 1. ОБЩИЕ ИСКЛЮЧЕНИЯ (админы, сервисные УЗ, тестовые и т.д.)
-        if (
+
+		if (
 			$User.whenCreated -gt $LimitDate -or
 			(@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) -or
 			$ExcludeInitials -contains ([string]$User.initials).Trim() -or
@@ -88,53 +54,43 @@ try {
 			continue
 		}
 
-        # 2. ПРОВЕРКА СТАТУСА (Объединение логики)
-        if ($User.Enabled -eq $true) {
-            # Если активен в AD -> считаем
-            $CountActiveAD++
-        } else {
-            if($User.division -like '*')
-            {
-                # Если отключен в AD -> проверяем по 1С
-                if ($active1CHash.ContainsKey($tab)) {
-                    # Не уволен в 1С -> считаем
-                    $CountDisabledButActive1C++
-                } else {
-                    # Отключен в AD и уволен/отсутствует в 1С -> исключаем
-                    $ExcludedCount++
-                    continue
-                }
-            }
-        }
-
-        # 3. ПОДСЧЕТ ПО БЛОКАМ
         $div = $User.division
 
         if ($div) {
-            if ($DivisionCount.ContainsKey($div)) { $DivisionCount[$div]++ }
-            else { $DivisionCount[$div] = 1 }
+            if ($DivisionCount.ContainsKey($div)) {
+                $DivisionCount[$div]++
+            }
+            else {
+                $DivisionCount[$div] = 1
+            }
         }
         else {
             $emptyKey = "(не указано)"
-            if ($DivisionCount.ContainsKey($emptyKey)) { $DivisionCount[$emptyKey]++ }
-            else { $DivisionCount[$emptyKey] = 1 }
+
+            if ($DivisionCount.ContainsKey($emptyKey)) {
+                $DivisionCount[$emptyKey]++
+            }
+            else {
+                $DivisionCount[$emptyKey] = 1
+            }
         }
     }
 
-    $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
-    if ($null -eq $RealUsersCount) { $RealUsersCount = 0 }
-
-    Write-Host "[3/3] Формирование Zabbix Discovery JSON..." -ForegroundColor Cyan
-
     $discovery = foreach ($k in $DivisionCount.Keys) {
         @{ '{#DIVISION}' = $k }
+    }
+
+    $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+    if ($null -eq $RealUsersCount) {
+        $RealUsersCount = 0
     }
 
     $payload = [ordered]@{
         discovery = @($discovery)
         counts = $DivisionCount
         metadata = @{
-            TotalProcessed    = $AllUsers.Count
+            TotalActiveUsers  = $AllUsersOn.Count
             ExcludedUsers     = $ExcludedCount
             RealUsers         = $RealUsersCount
             UniqueDivisions   = $DivisionCount.Count
@@ -144,51 +100,77 @@ try {
     }
 
     $json = $payload | ConvertTo-Json -Depth 4
-    
-   # $outputDir = Split-Path $OUTPUT_PATH -Parent
-   # if (-not (Test-Path $outputDir)) { New-Item -ItemType Directory -Path $outputDir -Force | Out-Null }
-   # [System.IO.File]::WriteAllText($OUTPUT_PATH, $json, [System.Text.UTF8Encoding]::new($false))
 
-    # --- ВЫВОД СТАТИСТИКИ ПО БЛОКАМ ---
-    Write-Host "`n=========== ПОДСЧЕТ ПО БЛОКАМ ===========" -ForegroundColor Green
+    $outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
+
+    [System.IO.File]::WriteAllText(
+        $outputPath,
+        $json,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    # Логирование
+    Write-Log ""
+    Write-Log "СТАТУС: $ScriptStatus"
+    Write-Log "Подсчёт по блокам"
+    Write-Log "Всего уникальных подразделений: $($DivisionCount.Count)"
+
+    Write-Host "`nПодсчёт по блокам" -ForegroundColor Green
     Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        ForEach-Object {
+            if ($RealUsersCount -gt 0) {
+                $percent = "{0:P2}" -f ($_.Value / $RealUsersCount)
+            }
+            else {
+                $percent = "0,00%"
+            }
+
+            Write-Log ("{0,-60} {1,6} {2,8}" -f $_.Key, $_.Value, $percent)
+        }
 
     $DivisionCount.GetEnumerator() |
         Sort-Object Value -Descending |
         Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
                      @{Label="Кол-во"; Expression={$_.Value}; Width=10},
                      @{Label="%"; Expression={
-                         if ($RealUsersCount -gt 0) { "{0:P2}" -f ($_.Value / $RealUsersCount) } else { "0,00%" }
+                         if ($RealUsersCount -gt 0) {
+                             "{0:P2}" -f ($_.Value / $RealUsersCount)
+                         }
+                         else {
+                             "0,00%"
+                         }
                      }; Width=10} -AutoSize
 
-    # --- ИТОГОВЫЕ СВОДНЫЕ ДАННЫЕ В КОНСОЛЬ ---
-    Write-Host "=================== СВОДНЫЕ СЧЕТЧИКИ ===================" -ForegroundColor Green
-    Write-Host "Всего учетных записей обработано в AD:     $($AllUsers.Count)" -ForegroundColor Yellow
-    Write-Host "Исключено (служебные/уволенные/тестовые):  $ExcludedCount" -ForegroundColor Magenta
-    Write-Host "Из них активных в AD:                      $CountActiveAD" -ForegroundColor Cyan
-    Write-Host "Из них отключенных в AD, но активных в 1С: $CountDisabledButActive1C" -ForegroundColor Cyan
-    Write-Host "--------------------------------------------------------" -ForegroundColor Green
-    Write-Host "ИТОГО РЕАЛЬНЫХ ПОЛЬЗОВАТЕЛЕЙ ДЛЯ ZABBIX:   $RealUsersCount" -ForegroundColor Green
-    Write-Host "========================================================" -ForegroundColor Green
+    Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
+    Write-Host "Исключено (служебные/админские/вендоры/ручные исключения): $ExcludedCount" -ForegroundColor Magenta
+    Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
+
+    Write-Log "Всего активных пользователей в AD: $($AllUsersOn.Count)"
+    Write-Log "Исключено (служебные/админские/вендоры/ручные исключения): $ExcludedCount"
+    Write-Log "Реальных пользователей для анализа: $RealUsersCount"
 
     $timestop = Get-Date
     $TimeSum = $timestop - $timestart
-    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
 
+    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+    Write-Host "Файл сохранён." -ForegroundColor Green
+
+    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
 }
 catch {
     $ScriptStatus = "ERROR"
+    Write-Log ""
+    Write-Log "СТАТУС: ERROR"
+    Write-Log "Ошибка:"
+    Write-Log $_.Exception.Message
+    Write-Log "Полная информация:"
+    Write-Log $_
+
     Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+
     throw
-}
-
-ОШИБКА: You cannot call a method on a null-valued expression.
-You cannot call a method on a null-valued expression.
-At C:\Users\z-BorodinES\Desktop\ZabbixZadacha\TestAD2.ps1:83 char:13
-+         if ($User.whenCreated -gt $LimitDate -or
-+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : InvalidOperation: (:) [], ParentContainsErrorRecordException
-    + FullyQualifiedErrorId : InvokeMethodOnNull
- 
-
-PS C:\Users\z-BorodinES> 
+} 
+И так смотри в заббикс json нужно специально вставить параметр Все_пользователи тоесть блоки все считаются так же динамически но всегда должен быть этот параметр считается он вот - $AllUsersOn.Count
