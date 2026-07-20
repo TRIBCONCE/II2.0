@@ -1,38 +1,43 @@
-# 2.1 Вспомогательный хэш для проверки статуса AD (кто НЕ уволен в 1С)
-    # Обновлен под новые условия увольнения и Unit
-    $qActive1C = @"
-    SELECT DISTINCT Tab_Numb 
-    FROM IC.Empl_WT_USPS 
-    WHERE (
-        UvDate IS NULL 
-        OR (UvDate > CAST(GETDATE() AS date) AND Unit = 1)
-    )
-    AND Unit >= 1
-"@
-    $dtActive1C = Invoke-Sql $qActive1C
-    $active1CHash = @{}
-    if ($dtActive1C -and $dtActive1C.Rows) {
-        foreach ($row in $dtActive1C.Rows) {
-            $t = "$($row.Tab_Numb)".Trim(); if ($t) { $active1CHash[$t] = $true }
-        }
-    }
+Так срочно нужна новая выгрузка я вписываю в пременную имя группы надо выгрузить в csv файл всех пользователей этой группы В выгрузке должны быть фио, вкл/выкл, тн, почта, ext атрибуты, какой блок и должность группы в эктив директори 
+вот пример кода по другой выгрузке 
 
-    # 2.2 Основной запрос к представлению 1С (с новым условием и JOIN)
-    $sql1C = @"
-    SELECT e.department, e.dep, e.dep1, e.dokko, e.Tab_Numb, e.fio
-    FROM IC.v_Empl_info e
-    JOIN IC.Empl_WT_USPS t ON t.Tab_Numb = e.Tab_Numb
-    WHERE e.DecrOtpusk = 0
-      AND e.fio IS NOT NULL 
-      AND LTRIM(RTRIM(e.fio)) <> ''
-      -- Объединенный блок проверки дат увольнения и типов занятости
-      AND (
-          (e.UvDate IS NULL AND e.Synonym = N'Основное место работы')
-          OR 
-          (e.UvDate > CAST(GETDATE() AS date) AND t.Unit = 1)
-      )
-      -- Глобальное исключение сотрудников, у которых Unit < 1
-      AND t.Unit >= 1
-"@
-    $dt = Invoke-Sql $sql1C
-    $Users1C = $dt.Rows
+cls
+Import-Module ActiveDirectory
+$OutputFile = "C:\Users\z-BorodinES\Desktop\Пользователи без division.csv"
+$data = Get-ADUser -Filter "Enabled -eq 'True' -and (division -notlike '*')" -Properties SamAccountName, Name, Department, wWWHomePage, EmployeeID, Initials, DistinguishedName, EmployeeType | 
+Where-Object {
+    $_.EmployeeType -notin @('Vendor','Service') -and
+    $_.SamAccountName -notmatch '^(z-|a-)' -and
+    $_.SamAccountName -notlike '*$'
+} |
+Select-Object @{
+    Name = "Логин"
+    Expression = { $_.SamAccountName }
+}, @{
+    Name = "ФИО"
+    Expression = { $_.Name }
+}, @{
+    Name = "Департамент"
+    Expression = { $_.Department }
+}, @{
+    Name = "wwwhomepage"
+    Expression = { $_.wWWHomePage }
+}, @{
+    Name = "EmployeeID"
+    Expression = { $_.EmployeeID }
+}, @{
+    Name = "Initials"
+    Expression = { $_.Initials }
+},
+@{
+    Name = "OU"
+    Expression = {
+        $ouParts = $_.DistinguishedName -split ',' | Where-Object { $_ -match '^OU=' } | ForEach-Object { $_ -replace '^OU=' }
+        [array]::Reverse($ouParts)
+        $ouPath = $ouParts -join '/'
+        $ouPath -replace '^Головной офис/', ''
+    }
+}
+$data | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8 -Delimiter ";"
+Write-Host "Файл CSV сохранен: $OutputFile" -ForegroundColor Green
+Invoke-Item $OutputFile
