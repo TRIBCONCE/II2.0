@@ -1,40 +1,43 @@
-import logging
-import sys
-from functools import lru_cache
-from uuid import UUID
+# ===================== НАСТРОЙКИ (ТЕСТ) =====================
+$testLogins = @("твой_логин_здесь", "еще_один_тестовый_логин_если_нужно") 
+$logPath    = "C:\Path\To\TestLog.txt"   # Путь для тестового лога
 
-from pydantic import AnyHttpUrl, BaseSettings, Field
+# ===================== ОБРАБОТКА =====================
+$totalCount = $testLogins.Count
+$changedCount = 0
 
-# ── Логгер ──────────────────────────────────────────────────────
-def _setup_logger() -> logging.Logger:
-    logger = logging.getLogger("invite_bot")
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(
-            logging.Formatter("[%(asctime)s] %(levelname)s — %(message)s",
-                              datefmt="%Y-%m-%d %H:%M:%S")
-        )
-        logger.addHandler(handler)
-    return logger
+Write-Host "Запуск ТЕСТОВОГО скрипта. Всего логинов: $totalCount" -ForegroundColor Cyan
 
-# ── Pydantic Settings ───────────────────────────────────────────
-class ExpressSettings(BaseSettings):
-    uuid: UUID = Field(..., env="EXPRESS_UUID")
-    cts_url: AnyHttpUrl = Field(..., env="EXPRESS_URL")
-    secret_key: str = Field(..., env="EXPRESS_SECRET_KEY")
+foreach ($login in $testLogins) {
+    try {
+        $user = Get-ADUser -Identity $login -Properties pwdLastSet -ErrorAction Stop
+        
+        # Если pwdLastSet равен 0, значит юзер уже обязан сменить пароль
+        if ($user.pwdLastSet -eq 0) {
+            Write-Host "У пользователя $login галочка УЖЕ СТОИТ. Пропускаем." -ForegroundColor Yellow
+        } else {
+            Set-ADUser -Identity $login -ChangePasswordAtLogon $true
+            $changedCount++
+            Write-Host "Галочка успешно установлена для: $login" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "x Ошибка при обработке пользователя '$login': $_" -ForegroundColor Red
+    }
+}
 
-class Settings(BaseSettings):
-    express: ExpressSettings = Field(default_factory=ExpressSettings)
-    logger: logging.Logger = Field(default_factory=_setup_logger)
+# ===================== ЛОГИРОВАНИЕ =====================
+$currentDate = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+$logMessage = @"
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        arbitrary_types_allowed = True
+=============== ТЕСТОВЫЙ ПРОГОН ===============
+Дата запуска: $currentDate
+Всего тестовых логинов проверено: $totalCount
+Скольким логинам была поставлена галочка: $changedCount
+================================================
+"@
 
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
+# Дублируем в консоль
+Write-Host $logMessage -ForegroundColor Cyan
 
-settings = get_settings()
+# Пишем в тестовый лог-файл
+Add-Content -Path $logPath -Value $logMessage
