@@ -1,43 +1,75 @@
-Так срочно нужна новая выгрузка я вписываю в пременную имя группы надо выгрузить в csv файл всех пользователей этой группы В выгрузке должны быть фио, вкл/выкл, тн, почта, ext атрибуты, какой блок и должность группы в эктив директори 
-вот пример кода по другой выгрузке 
+# ===================== НАСТРОЙКИ =====================
+$usersListPath = "C:\Path\To\Logins.txt"        # Путь к txt файлу со списком логинов
+$logPath       = "C:\Path\To\PasswordLog.txt"   # Путь к txt файлу для записи логов
+$targetDate    = [datetime]::ParseExact("04.08.2026", "dd.MM.yyyy", $null)
+$maxToChange   = 100
 
-cls
-Import-Module ActiveDirectory
-$OutputFile = "C:\Users\z-BorodinES\Desktop\Пользователи без division.csv"
-$data = Get-ADUser -Filter "Enabled -eq 'True' -and (division -notlike '*')" -Properties SamAccountName, Name, Department, wWWHomePage, EmployeeID, Initials, DistinguishedName, EmployeeType | 
-Where-Object {
-    $_.EmployeeType -notin @('Vendor','Service') -and
-    $_.SamAccountName -notmatch '^(z-|a-)' -and
-    $_.SamAccountName -notlike '*$'
-} |
-Select-Object @{
-    Name = "Логин"
-    Expression = { $_.SamAccountName }
-}, @{
-    Name = "ФИО"
-    Expression = { $_.Name }
-}, @{
-    Name = "Департамент"
-    Expression = { $_.Department }
-}, @{
-    Name = "wwwhomepage"
-    Expression = { $_.wWWHomePage }
-}, @{
-    Name = "EmployeeID"
-    Expression = { $_.EmployeeID }
-}, @{
-    Name = "Initials"
-    Expression = { $_.Initials }
-},
-@{
-    Name = "OU"
-    Expression = {
-        $ouParts = $_.DistinguishedName -split ',' | Where-Object { $_ -match '^OU=' } | ForEach-Object { $_ -replace '^OU=' }
-        [array]::Reverse($ouParts)
-        $ouPath = $ouParts -join '/'
-        $ouPath -replace '^Головной офис/', ''
+# ===================== ЗАГРУЗКА И ПОИСК =====================
+# Читаем непустые строки (логины)
+$allLogins = Get-Content -Path $usersListPath | Where-Object { $_.Trim() -ne "" }
+$totalCount = $allLogins.Count
+
+Write-Host "Загружено логинов из файла: $totalCount" -ForegroundColor Cyan
+Write-Host "Анализируем пользователей. Пожалуйста, подождите..." -ForegroundColor Yellow
+
+$matchedUsers = @()
+
+foreach ($login in $allLogins) {
+    $login = $login.Trim()
+    try {
+        # Извлекаем PasswordLastSet и сырой атрибут pwdLastSet 
+        # (если pwdLastSet = 0, значит галочка уже стоит)
+        $user = Get-ADUser -Identity $login -Properties PasswordLastSet, pwdLastSet -ErrorAction Stop
+        
+        # Проверяем 3 условия:
+        # 1. Галочка не стоит (pwdLastSet -ne 0)
+        # 2. Пароль когда-либо задавался (PasswordLastSet -ne $null)
+        # 3. Дата последней смены МЕНЬШЕ 04.08.2026
+        if ($user.pwdLastSet -ne 0 -and $user.PasswordLastSet -ne $null -and $user.PasswordLastSet -lt $targetDate) {
+            $matchedUsers += $login
+        }
+    } catch {
+        Write-Host "x Ошибка при чтении $login (возможно, не найден в AD)" -ForegroundColor Red
     }
 }
-$data | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8 -Delimiter ";"
-Write-Host "Файл CSV сохранен: $OutputFile" -ForegroundColor Green
-Invoke-Item $OutputFile
+
+$matchedCount = $matchedUsers.Count
+Write-Host "Пользователей, подходящих под условие: $matchedCount`n" -ForegroundColor Cyan
+
+# ===================== УСТАНОВКА ГАЛОЧКИ =====================
+# Берем только первые 100 (или меньше, если подходящих не набралось 100)
+$usersToProcess = $matchedUsers | Select-Object -First $maxToChange
+$changedCount = 0
+
+if ($usersToProcess) {
+    Write-Host "Устанавливаем галочку ChangePasswordAtLogon (лимит $maxToChange)..." -ForegroundColor Yellow
+    foreach ($u in $usersToProcess) {
+        try {
+            Set-ADUser -Identity $u -ChangePasswordAtLogon $true
+            $changedCount++
+            Write-Host ". $u - Успешно" -ForegroundColor Green
+        } catch {
+            Write-Host "x Ошибка изменения для $u" -ForegroundColor Red
+        }
+    }
+} else {
+    Write-Host "Нет пользователей для изменения." -ForegroundColor Yellow
+}
+
+# ===================== ЛОГИРОВАНИЕ =====================
+$currentDate = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+$logMessage = @"
+
+========================================
+Дата запуска: $currentDate
+Всего логинов в файле: $totalCount
+Попадают под условие (дата < 04.08.2026 и нет галочки): $matchedCount
+Установлена галочка (по факту): $changedCount
+========================================
+"@
+
+# Дублируем в консоль
+Write-Host $logMessage -ForegroundColor Cyan
+
+# Пишем в лог-файл (добавляем в конец файла)
+Add-Content -Path $logPath -Value $logMessage
