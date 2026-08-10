@@ -40,6 +40,7 @@ Write-Host "Пользователей, подходящих под услови
 # Берем только первые 100 (или меньше, если подходящих не набралось 100)
 $usersToProcess = $matchedUsers | Select-Object -First $maxToChange
 $changedCount = 0
+$successfulLogins = @() # Массив для сбора логинов, которым реально проставилась галка
 
 if ($usersToProcess) {
     Write-Host "Устанавливаем галочку ChangePasswordAtLogon (лимит $maxToChange)..." -ForegroundColor Yellow
@@ -47,6 +48,7 @@ if ($usersToProcess) {
         try {
             Set-ADUser -Identity $u -ChangePasswordAtLogon $true
             $changedCount++
+            $successfulLogins += $u # Добавляем логин в список успешных
             Write-Host ". $u - Успешно" -ForegroundColor Green
         } catch {
             Write-Host "x Ошибка изменения для $u" -ForegroundColor Red
@@ -58,6 +60,14 @@ if ($usersToProcess) {
 
 # ===================== ЛОГИРОВАНИЕ =====================
 $currentDate = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+
+# Формируем красивый список логинов для лога
+$loginsListString = if ($successfulLogins.Count -gt 0) {
+    ($successfulLogins | ForEach-Object { "  - $_" }) -join "`r`n"
+} else {
+    "  (Нет измененных пользователей)"
+}
+
 $logMessage = @"
 
 ========================================
@@ -65,6 +75,8 @@ $logMessage = @"
 Всего логинов в файле: $totalCount
 Попадают под условие (дата < 04.08.2026 и нет галочки): $matchedCount
 Установлена галочка (по факту): $changedCount
+Список логинов, которым установлена галочка:
+$loginsListString
 ========================================
 "@
 
