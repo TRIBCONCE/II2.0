@@ -1,83 +1,98 @@
 # ===================== НАСТРОЙКИ =====================
-$usersListPath = "C:\Path\To\Logins.txt"        # Путь к txt файлу со списком логинов
-$logPath       = "C:\Path\To\PasswordLog.txt"   # Путь к txt файлу для записи логов
-$targetDate    = [datetime]::ParseExact("04.08.2026", "dd.MM.yyyy", $null)
-$maxToChange   = 100
+$usersListPath = "C:\Path\To\PlannedUsers.txt"         # Путь к файлу со списком (формат: - Login — ФИО)
+$reportPath    = "C:\Path\To\PasswordStatusReport.txt" # Путь для сохранения итогового отчета
 
-# ===================== ЗАГРУЗКА И ПОИСК =====================
-$allLogins = Get-Content -Path $usersListPath | Where-Object { $_.Trim() -ne "" }
-$totalCount = $allLogins.Count
+# ===================== ЗАГРУЗКА И ПАРСИНГ =====================
+# Читаем файл, отбрасываем пустые строки и строки, которые не похожи на список пользователей
+$rawLines = Get-Content -Path $usersListPath | Where-Object { $_.Trim() -ne "" -and $_ -match "-" }
+$totalChecked = 0
 
-Write-Host "Загружено логинов из файла: $totalCount" -ForegroundColor Cyan
-Write-Host "Анализируем пользователей. Пожалуйста, подождите..." -ForegroundColor Yellow
+Write-Host "Анализируем статусы паролей. В AD ничего не меняется..." -ForegroundColor Cyan
 
-$matchedUsers = @()
+# Массивы для сортировки пользователей
+$changedUsers = @()
+$notChangedUsers = @()
+$notFoundUsers = @()
 
-foreach ($login in $allLogins) {
-    $login = $login.Trim()
-    try {
-        # Запрашиваем PasswordLastSet, pwdLastSet и DisplayName (ФИО)
-        $user = Get-ADUser -Identity $login -Properties PasswordLastSet, pwdLastSet, DisplayName -ErrorAction Stop
+foreach ($line in $rawLines) {
+    # Регулярное выражение для извлечения логина из строки вида "  - BorodinES — Бородин Егор Сергеевич"
+    # Берем то, что находится между дефисом и длинным тире
+    if ($line -match '-\s*([^\s]+)\s*—') {
+        $login = $matches[1].Trim()
+        $totalChecked++
         
-        # Проверяем условия
-        if ($user.pwdLastSet -ne 0 -and $user.PasswordLastSet -ne $null -and $user.PasswordLastSet -lt $targetDate) {
-            # Сохраняем как объект с Логином и ФИО
-            $matchedUsers += [PSCustomObject]@{
-                Login    = $login
-                FullName = if ($user.DisplayName) { $user.DisplayName } else { "ФИО не указано" }
-            }
-        }
-    } catch {
-        Write-Host "x Ошибка при чтении $login (не найден в AD)" -ForegroundColor Red
-    }
-}
-
-$matchedCount = $matchedUsers.Count
-Write-Host "Пользователей, подходящих под условие: $matchedCount`n" -ForegroundColor Cyan
-
-# ===================== УСТАНОВКА ГАЛОЧКИ =====================
-$usersToProcess = $matchedUsers | Select-Object -First $maxToChange
-$changedCount = 0
-$successfulLogins = @()
-
-if ($usersToProcess) {
-    Write-Host "Устанавливаем галочку ChangePasswordAtLogon (лимит $maxToChange)..." -ForegroundColor Yellow
-    foreach ($u in $usersToProcess) {
         try {
-            # Ставим галочку
-            Set-ADUser -Identity $u.Login -ChangePasswordAtLogon $true
-            $changedCount++
-            $successfulLogins += $u
-            Write-Host ". $($u.Login) ($($u.FullName)) - Успешно" -ForegroundColor Green
+            # Запрашиваем данные из AD (ТОЛЬКО ЧТЕНИЕ)
+            $user = Get-ADUser -Identity $login -Properties pwdLastSet, PasswordLastSet, DisplayName -ErrorAction Stop
+            
+            # Если pwdLastSet равен 0, значит пароль ЕЩЕ НЕ ИЗМЕНЕН (галочка всё ещё висит)
+            if ($user.pwdLastSet -eq 0) {
+                $notChangedUsers += [PSCustomObject]@{
+                    Login    = $login
+                    FullName = if ($user.DisplayName) { $user.DisplayName } else { "ФИО не указано" }
+                }
+                Write-Host "x $login - Пароль не изменен" -ForegroundColor Yellow
+            } 
+            # Если pwdLastSet больше 0, значит ПАРОЛЬ ИЗМЕНЕН
+            else {
+                $changedUsers += [PSCustomObject]@{
+                    Login       = $login
+                    FullName    = if ($user.DisplayName) { $user.DisplayName } else { "ФИО не указано" }
+                    ChangedDate = $user.PasswordLastSet.ToString("dd.MM.yyyy HH:mm:ss")
+                }
+                Write-Host ". $login - Пароль изменен ($($user.PasswordLastSet))" -ForegroundColor Green
+            }
         } catch {
-            Write-Host "x Ошибка изменения для $($u.Login)" -ForegroundColor Red
+            $notFoundUsers += $login
+            Write-Host "! Ошибка: $login не найден в AD" -ForegroundColor Red
         }
     }
-} else {
-    Write-Host "Нет пользователей для изменения." -ForegroundColor Yellow
 }
 
-# ===================== ЛОГИРОВАНИЕ =====================
+# ===================== ФОРМИРОВАНИЕ ОТЧЕТА =====================
 $currentDate = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+$changedCount = $changedUsers.Count
+$notChangedCount = $notChangedUsers.Count
+$notFoundCount = $notFoundUsers.Count
 
-# Формируем список: Логин - ФИО
-$loginsListString = if ($successfulLogins.Count -gt 0) {
-    ($successfulLogins | ForEach-Object { "  - $($_.Login) — $($_.FullName)" }) -join "`r`n"
+# Блок с теми, кто поменял пароль (с точным временем)
+$changedListString = if ($changedCount -gt 0) {
+    ($changedUsers | ForEach-Object { "  - $($_.Login) — $($_.FullName) (Изменен: $($_.ChangedDate))" }) -join "`r`n"
 } else {
-    "  (Нет измененных пользователей)"
+    "  (Нет пользователей, сменивших пароль)"
 }
 
-$logMessage = @"
+# Блок с теми, кто НЕ поменял
+$notChangedListString = if ($notChangedCount -gt 0) {
+    ($notChangedUsers | ForEach-Object { "  - $($_.Login) — $($_.FullName)" }) -join "`r`n"
+} else {
+    "  (Все пользователи сменили пароль!)"
+}
 
-========================================
-Дата запуска: $currentDate
-Всего логинов в файле: $totalCount
-Попадают под условие (дата < 04.08.2026 и нет галочки): $matchedCount
-Установлена галочка (по факту): $changedCount
-Список пользователей, которым установлена галочка:
-$loginsListString
-========================================
+$reportMessage = @"
+
+================ СТАТУС СМЕНЫ ПАРОЛЕЙ ================
+Дата формирования отчета: $currentDate
+Всего корректных логинов в исходном файле: $totalChecked
+
+✅ Сменили пароль: $changedCount
+❌ ЕЩЕ НЕ сменили пароль: $notChangedCount
+⚠️ Ошибки поиска в AD: $notFoundCount
+
+======================================================
+СПИСОК ПОЛЬЗОВАТЕЛЕЙ, СМЕНИВШИХ ПАРОЛЬ:
+$changedListString
+
+======================================================
+СПИСОК ПОЛЬЗОВАТЕЛЕЙ, КОТОРЫЕ ЕЩЕ НЕ СМЕНИЛИ ПАРОЛЬ:
+$notChangedListString
+======================================================
 "@
 
-Write-Host $logMessage -ForegroundColor Cyan
-Add-Content -Path $logPath -Value $logMessage
+# Вывод в консоль
+Write-Host "`nГотово! Формируем отчет..." -ForegroundColor Cyan
+Write-Host $reportMessage -ForegroundColor White
+
+# Запись в файл
+Set-Content -Path $reportPath -Value $reportMessage -Encoding UTF8
+Write-Host "`nОтчет успешно сохранен в файл: $reportPath" -ForegroundColor Green
