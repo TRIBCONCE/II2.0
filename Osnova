@@ -28,7 +28,7 @@ function Invoke-Sql([string]$q) {
 Write-Host "Получение данных из БД..." -ForegroundColor Cyan
 # Запрос только тех, кто в отпуске на текущий день
 $qF = @"
-SELECT e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb
+SELECT e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, f.StartDate, f.EndDate
 FROM IC.Furlough_WT f
 JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
 WHERE e.UvDate IS NULL
@@ -39,14 +39,14 @@ ORDER BY e.LastName
 $F = Invoke-Sql $qF
 
 Write-Host "Получение данных из AD..." -ForegroundColor Cyan
-# Собираем данные из AD (добавлены атрибуты Division, Department, Title, HomeDirectory)
+# Собираем данные из AD
 $adByTab = @{}
 Get-ADUser -LDAPFilter "(&(wWWHomePage=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" `
   -Properties wWWHomePage, SamAccountName, Division, Department, Title, HomeDirectory -Server $AdServer -Credential $AdCred |
   Where-Object { $_.SamAccountName -notmatch '^(z|s|a)-' } |
   ForEach-Object {
     $t = "$($_.wWWHomePage)".Trim()
-    if ($t) { $adByTab[$t] = $_ } # Сохраняем пользователя в хеш по табельному
+    if ($t) { $adByTab[$t] = $_ }
   }
 
 Write-Host "Подготовка данных..." -ForegroundColor Cyan
@@ -67,6 +67,8 @@ foreach($r in $F.Rows) {
         Департамент     = if ($adUser -and $adUser.Department) { $adUser.Department } else { "" }
         Должность       = if ($adUser -and $adUser.Title) { $adUser.Title } else { "" }
         Основной_диск_N = if ($adUser -and $adUser.HomeDirectory) { $adUser.HomeDirectory } else { "" }
+        Начало_отпуска  = ([datetime]$r.StartDate).ToString("dd.MM.yyyy")
+        Конец_отпуска   = ([datetime]$r.EndDate).ToString("dd.MM.yyyy")
     }
 }
 
@@ -78,13 +80,12 @@ $excel.DisplayAlerts = $false
 
 try {
     $workbook = $excel.Workbooks.Open($ExcelPath)
-    $worksheet = $workbook.Sheets.Item(1) # Берем первый лист
+    $worksheet = $workbook.Sheets.Item(1)
 
-    # Очищаем старые данные со 2 строки до конца (чтобы не стереть твои заголовки)
+    # ПОЛНОЕ УДАЛЕНИЕ старых строк (вариант 2)
     $lastRow = $worksheet.UsedRange.Rows.Count
     if ($lastRow -ge 2) {
-        $rangeToClear = $worksheet.Range("A2:F$lastRow")
-        $rangeToClear.ClearContents()
+        $worksheet.Rows.Item("2:$lastRow").Delete()
     }
 
     # Построчно пишем новые данные
@@ -96,6 +97,8 @@ try {
         $worksheet.Cells.Item($row, 4).Value2 = $item.Департамент
         $worksheet.Cells.Item($row, 5).Value2 = $item.Должность
         $worksheet.Cells.Item($row, 6).Value2 = $item.Основной_диск_N
+        $worksheet.Cells.Item($row, 7).Value2 = $item.Начало_отпуска
+        $worksheet.Cells.Item($row, 8).Value2 = $item.Конец_отпуска
         $row++
     }
 
@@ -106,7 +109,6 @@ catch {
     Write-Host "[!] Ошибка при записи в Excel: $_" -ForegroundColor Red
 }
 finally {
-    # Корректное закрытие процесса Excel, чтобы он не зависал в памяти
     if ($workbook) { $workbook.Close($false) }
     $excel.Quit()
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
