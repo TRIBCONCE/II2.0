@@ -1,115 +1,80 @@
 Import-Module ActiveDirectory
 
-# --- 1. Настройки БД ---
-$SqlServer = "p-knot-db01.abb-win.akbars.ru"
-$SqlDb     = "DWDATA_ODS"
-$SqlUser   = "syncad"
-$SqlPass   = "скрыл"
+# Укажи полный путь к новому файлу
+$FilePath = "C:\Путь\К\Файлу\Новый_файл.xlsx"
 
-# --- 2. Настройки AD ---
-$AdServer = "abb-win.akbars.ru"
-$AdUser   = "abb-win\s-ad-expertise"
-$AdPass   = "скрыл"
-$AdCred   = New-Object System.Management.Automation.PSCredential($AdUser, (ConvertTo-SecureString $AdPass -AsPlainText -Force))
-
-# --- 3. ПУТЬ К ТВОЕМУ ГОТОВОМУ ФАЙЛУ EXCEL ---
-$ExcelPath = "C:\Путь\К\Твоему\Файлу\furlough_ad_template.xlsx"
-
-
-# Функция запроса к БД
-function Invoke-Sql([string]$q) {
-    $cs = "Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
-    $cn = New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
-    $cmd = $cn.CreateCommand(); $cmd.CommandText = $q
-    $da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-    $dt = New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
-}
-
-Write-Host "Получение данных из БД..." -ForegroundColor Cyan
-# Запрос только тех, кто в отпуске на текущий день
-$qF = @"
-SELECT e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, f.StartDate, f.EndDate
-FROM IC.Furlough_WT f
-JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
-WHERE e.UvDate IS NULL
-  AND f.StartDate <= CAST(GETDATE() AS date)
-  AND f.EndDate >= CAST(GETDATE() AS date)
-ORDER BY e.LastName
-"@
-$F = Invoke-Sql $qF
-
-Write-Host "Получение данных из AD..." -ForegroundColor Cyan
-# Собираем данные из AD
-$adByTab = @{}
-Get-ADUser -LDAPFilter "(&(wWWHomePage=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" `
-  -Properties wWWHomePage, SamAccountName, Division, Department, Title, HomeDirectory -Server $AdServer -Credential $AdCred |
-  Where-Object { $_.SamAccountName -notmatch '^(z|s|a)-' } |
-  ForEach-Object {
-    $t = "$($_.wWWHomePage)".Trim()
-    if ($t) { $adByTab[$t] = $_ }
-  }
-
-Write-Host "Подготовка данных..." -ForegroundColor Cyan
-# Формируем итоговый массив
-$ResultData = @()
-foreach($r in $F.Rows) {
-    $tab = "$($r.Tab_Numb)"
-    $adUser = $null
-    
-    if ($adByTab.ContainsKey($tab)) {
-        $adUser = $adByTab[$tab]
-    }
-
-    $ResultData += [PSCustomObject]@{
-        Блок            = if ($adUser -and $adUser.Division) { $adUser.Division } else { "" }
-        ФИО             = ("{0} {1} {2}" -f $r.LastName, $r.FirstName, $r.MiddleName).Trim()
-        Логин           = if ($adUser) { $adUser.SamAccountName } else { "" }
-        Департамент     = if ($adUser -and $adUser.Department) { $adUser.Department } else { "" }
-        Должность       = if ($adUser -and $adUser.Title) { $adUser.Title } else { "" }
-        Основной_диск_N = if ($adUser -and $adUser.HomeDirectory) { $adUser.HomeDirectory } else { "" }
-        Начало_отпуска  = ([datetime]$r.StartDate).ToString("dd.MM.yyyy")
-        Конец_отпуска   = ([datetime]$r.EndDate).ToString("dd.MM.yyyy")
-    }
-}
-
-Write-Host "Запись в Excel ($ExcelPath)..." -ForegroundColor Cyan
-# Работа с Excel через COM-объект
+# Запускаем Excel в фоновом режиме
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
 
 try {
-    $workbook = $excel.Workbooks.Open($ExcelPath)
-    $worksheet = $workbook.Sheets.Item(1)
+    Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($FilePath)
+    
+    # Обращаемся к листу Sheet1
+    $ws = $wb.Sheets.Item("Sheet1") 
+    
+    $lastRow = $ws.UsedRange.Rows.Count
+    
+    # Ищем, в каком по счету столбце находится заголовок "user_email"
+    $emailCol = 0
+    $lastCol = $ws.UsedRange.Columns.Count
+    for ($c = 1; $c -le $lastCol; $c++) {
+        if ($ws.Cells.Item(1, $c).Text -eq "user_email") {
+            $emailCol = $c
+            break
+        }
+    }
+    
+    if ($emailCol -eq 0) {
+        Write-Host "[!] Столбец 'user_email' не найден в первой строке! Скрипт остановлен." -ForegroundColor Red
+        return
+    }
+    
+    # Ставим заголовок в столбец J (10-й столбец)
+    $ws.Cells.Item(1, 10).Value2 = "Статус в AD"
 
-    # ПОЛНОЕ УДАЛЕНИЕ старых строк (вариант 2)
-    $lastRow = $worksheet.UsedRange.Rows.Count
-    if ($lastRow -ge 2) {
-        $worksheet.Rows.Item("2:$lastRow").Delete()
+    Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
+
+    for ($row = 2; $row -le $lastRow; $row++) {
+        $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
+        
+        # Пропускаем пустые ячейки
+        if ([string]::IsNullOrWhiteSpace($email)) {
+            continue
+        }
+        
+        # Ищем пользователя по почте
+        $adUser = Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled -ErrorAction SilentlyContinue | Select-Object -First 1
+        
+        if ($null -ne $adUser) {
+            if ($adUser.Enabled) {
+                $status = "активный"
+            } else {
+                $status = "не активен"
+            }
+        } else {
+            $status = "не найден"
+        }
+        
+        # Записываем результат в столбец J (10)
+        $ws.Cells.Item($row, 10).Value2 = $status
+        
+        # Вывод прогресса в консоль
+        Write-Host "Строка $row: $email -> $status"
     }
 
-    # Построчно пишем новые данные
-    $row = 2
-    foreach ($item in $ResultData) {
-        $worksheet.Cells.Item($row, 1).Value2 = $item.Блок
-        $worksheet.Cells.Item($row, 2).Value2 = $item.ФИО
-        $worksheet.Cells.Item($row, 3).Value2 = $item.Логин
-        $worksheet.Cells.Item($row, 4).Value2 = $item.Департамент
-        $worksheet.Cells.Item($row, 5).Value2 = $item.Должность
-        $worksheet.Cells.Item($row, 6).Value2 = $item.Основной_диск_N
-        $worksheet.Cells.Item($row, 7).Value2 = $item.Начало_отпуска
-        $worksheet.Cells.Item($row, 8).Value2 = $item.Конец_отпуска
-        $row++
-    }
-
-    $workbook.Save()
-    Write-Host "[+] Данные успешно обновлены!" -ForegroundColor Green
+    # Сохраняем изменения
+    $wb.Save()
+    Write-Host "`n[+] Готово! Статусы успешно записаны в столбец J." -ForegroundColor Green
 }
 catch {
-    Write-Host "[!] Ошибка при записи в Excel: $_" -ForegroundColor Red
+    Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
 }
 finally {
-    if ($workbook) { $workbook.Close($false) }
+    # Корректно закрываем процесс Excel
+    if ($null -ne $wb) { $wb.Close($false) }
     $excel.Quit()
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
     [System.GC]::Collect()
