@@ -1,9 +1,11 @@
 Import-Module ActiveDirectory
 
-# Укажи полный путь к твоему файлу
 $FilePath = "C:\Путь\К\Файлу\Сотрудники.xlsx"
 
-# Запускаем Excel в фоновом режиме
+# Указываем сервера/домены для поиска
+$Domain1 = "abb-win.akbars.ru"
+$Domain2 = "moffice"
+
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
@@ -11,11 +13,10 @@ $excel.DisplayAlerts = $false
 try {
     Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
     $wb = $excel.Workbooks.Open($FilePath)
-    $ws = $wb.Sheets.Item("Лист1") # Обращаемся к Лист1
+    $ws = $wb.Sheets.Item("Лист1") 
     
     $lastRow = $ws.UsedRange.Rows.Count
     
-    # Ищем, в каком по счету столбце находится заголовок "Значение"
     $emailCol = 0
     $lastCol = $ws.UsedRange.Columns.Count
     for ($c = 1; $c -le $lastCol; $c++) {
@@ -25,28 +26,33 @@ try {
         }
     }
     
-    # Если вдруг заголовок называется чуть иначе, по умолчанию ищем в столбце D (4)
     if ($emailCol -eq 0) {
-        Write-Host "[!] Столбец 'Значение' не найден в первой строке! Будем брать данные из 4-го столбца (D)." -ForegroundColor Yellow
+        Write-Host "[!] Столбец 'Значение' не найден! Берем 4-й столбец (D)." -ForegroundColor Yellow
         $emailCol = 4 
     }
     
-    # Ставим заголовок в столбец E (5)
     $ws.Cells.Item(1, 5).Value2 = "Статус в AD"
 
-    Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
+    Write-Host "Начинаем проверку почт в доменах $Domain1 и $Domain2..." -ForegroundColor Cyan
 
     for ($row = 2; $row -le $lastRow; $row++) {
         $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
         
-        # Пропускаем пустые ячейки
         if ([string]::IsNullOrWhiteSpace($email)) {
             continue
         }
         
-        # Ищем пользователя по почте (ErrorAction SilentlyContinue чтобы не спамило красным, если не найдет)
-        $adUser = Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled -ErrorAction SilentlyContinue | Select-Object -First 1
+        $adUser = $null
         
+        # 1. Ищем в первом домене (ABB-WIN)
+        $adUser = Get-ADUser -Filter "mail -eq '$email'" -Server $Domain1 -Properties Enabled -ErrorAction SilentlyContinue | Select-Object -First 1
+        
+        # 2. Если не нашли, ищем во втором домене (MOFFICE)
+        if ($null -eq $adUser) {
+            $adUser = Get-ADUser -Filter "mail -eq '$email'" -Server $Domain2 -Properties Enabled -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+        
+        # 3. Определяем статус
         if ($null -ne $adUser) {
             if ($adUser.Enabled) {
                 $status = "активный"
@@ -57,22 +63,17 @@ try {
             $status = "не найден"
         }
         
-        # Записываем результат в столбец E (5)
         $ws.Cells.Item($row, 5).Value2 = $status
-        
-        # Вывод прогресса в консоль
         Write-Host "Строка $row: $email -> $status"
     }
 
-    # Сохраняем изменения
     $wb.Save()
-    Write-Host "`n[+] Готово! Файл успешно обновлен и сохранен." -ForegroundColor Green
+    Write-Host "`n[+] Готово! Файл успешно обновлен." -ForegroundColor Green
 }
 catch {
     Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
 }
 finally {
-    # Корректно закрываем процесс Excel, чтобы не висел в памяти
     if ($null -ne $wb) { $wb.Close($false) }
     $excel.Quit()
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
