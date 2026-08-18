@@ -1,179 +1,81 @@
-cls
-# Furlough_collect_test.ps1 — сбор отпусков на ближайшие N дней (только чтение)
 Import-Module ActiveDirectory
-$SqlServer="p-knot-db01.abb-win.akbars.ru"; $SqlDb="DWDATA_ODS"
-$SqlUser="syncad"; $SqlPass="скрыл"; $Days=14
 
-# --- AD: домен abb-win.akbars.ru, запуск под СУЗ ---
-$AdServer="abb-win.akbars.ru"
-$AdUser="abb-win\s-ad-expertise"
-$AdPass="скрыл"   # TODO: вынести в XOR-схему перед продом
-$AdCred=New-Object System.Management.Automation.PSCredential($AdUser,(ConvertTo-SecureString $AdPass -AsPlainText -Force))
+# Укажи полный путь к твоему файлу
+$FilePath = "C:\Путь\К\Файлу\Сотрудники.xlsx"
 
-function Invoke-Sql([string]$q){
-  $cs="Server=$SqlServer;Database=$SqlDb;User Id=$SqlUser;Password=$SqlPass;"
-  $cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
-  $cmd=$cn.CreateCommand(); $cmd.CommandText=$q
-  $da=New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-  $dt=New-Object System.Data.DataTable; [void]$da.Fill($dt); $cn.Close(); ,$dt
-}
+# Запускаем Excel в фоновом режиме
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
 
-
-$qF=@"
-SELECT e.LastName,e.FirstName,e.MiddleName,e.Tab_Numb,e.IDPerson,
-       f.StartDate,f.EndDate,f.CountDay,f.FurloughTypeID
-FROM IC.Furlough_WT f
-JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
-WHERE e.UvDate IS NULL
-  AND f.StartDate <= CAST(GETDATE() AS date)
-  AND f.EndDate >= CAST(GETDATE() AS date)
-ORDER BY f.StartDate,e.LastName
-"@
-
-$qS=@"
-DECLARE @Today date = CAST(GETDATE() AS date);
-;WITH SickDays AS (
-  SELECT DISTINCT a.EmplID, CAST(a.[Day] AS date) AS SickDay
-  FROM [DWDATA_ODS].[IC].[Absent] a
-  WHERE a.TimeTypeID = '9A62E2C8-730F-11E7-80D4-005056926005'
-),
-MarkedDays AS (
-  SELECT EmplID, SickDay,
-    CASE WHEN LAG(SickDay) OVER (PARTITION BY EmplID ORDER BY SickDay)=DATEADD(day,-1,SickDay) THEN 0 ELSE 1 END AS IsNewPeriod
-  FROM SickDays
-),
-GroupedDays AS (
-  SELECT EmplID, SickDay,
-    SUM(IsNewPeriod) OVER (PARTITION BY EmplID ORDER BY SickDay ROWS UNBOUNDED PRECEDING) AS PeriodNo
-  FROM MarkedDays
-),
-SickPeriods AS (
-  SELECT EmplID, MIN(SickDay) AS SickFrom, MAX(SickDay) AS SickTo
-  FROM GroupedDays GROUP BY EmplID, PeriodNo
-)
-SELECT DISTINCT
-  e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, e.IDPerson,
-  p.SickFrom AS StartDate, p.SickTo AS EndDate,
-  DATEDIFF(day, p.SickFrom, p.SickTo) + 1 AS CountDay
-FROM SickPeriods p
-JOIN [DWDATA_ODS].[IC].[Empl_WT_USPS] e ON e.EmplID=p.EmplID
-WHERE @Today BETWEEN p.SickFrom AND p.SickTo AND e.UvDate IS NULL
-ORDER BY p.SickTo, e.LastName
-"@
-
-$qE="SELECT DISTINCT IDPerson,email FROM IC.v_Empl_info WHERE email IS NOT NULL AND LTRIM(RTRIM(email))<>''"
-
-$F = Invoke-Sql $qF
-$S = Invoke-Sql $qS
-$E = Invoke-Sql $qE
-
-
-# IDPerson -> список email из вьюхи 1C
-$mail=@{}
-foreach($r in $E.Rows){
-  $id="$($r.IDPerson)"
-  if(-not $mail.ContainsKey($id)){ $mail[$id]=New-Object System.Collections.ArrayList }
-  [void]$mail[$id].Add([string]$r.email)
-}
-
-# AD: собираем по всем активным УЗ -> хеш по табельнику
-$adByTab=@{}
-Get-ADUser -LDAPFilter "(&(wWWHomePage=*)(mail=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" `
-  -Properties mail,wWWHomePage,SamAccountName -Server $AdServer -Credential $AdCred |
-  Where-Object { $_.SamAccountName -notmatch '^(z|s|a)-' } |
-  ForEach-Object {
-    $t="$($_.wWWHomePage)".Trim()
-    if($t){
-      if(-not $adByTab.ContainsKey($t)){ $adByTab[$t]=New-Object System.Collections.ArrayList }
-      [void]$adByTab[$t].Add($_.mail)
-    }
-  }
-
-# Чтобы не дублировать код, выносим маппинг в отдельный блок скрипта (ScriptBlock)
-$ProcessRows = {
-    param($Rows, $TypeLabel)
-    foreach($r in $Rows){
-      $id="$($r.IDPerson)"; $tab="$($r.Tab_Numb)"
-      $list= if($mail.ContainsKey($id)){ @($mail[$id]) } else { @() }
-      $primary = $list | Select -First 1
-      $src = if($primary){"1C"}else{""}
-      
-      if(-not $primary){                       # fallback в AD по табельнику
-        if($adByTab.ContainsKey($tab)){
-          $adm=@($adByTab[$tab])
-          if($adm.Count -eq 1){ $primary=$adm[0]; $src="AD" }
-          else { $primary="AD_MULTI:"+($adm -join ","); $src="AD_MULTI" }
+try {
+    Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($FilePath)
+    $ws = $wb.Sheets.Item("Лист1") # Обращаемся к Лист1
+    
+    $lastRow = $ws.UsedRange.Rows.Count
+    
+    # Ищем, в каком по счету столбце находится заголовок "Значение"
+    $emailCol = 0
+    $lastCol = $ws.UsedRange.Columns.Count
+    for ($c = 1; $c -le $lastCol; $c++) {
+        if ($ws.Cells.Item(1, $c).Text -eq "Значение") {
+            $emailCol = $c
+            break
         }
-      }
-      
-      [PSCustomObject]@{
-        ФИО      = ("{0} {1} {2}" -f $r.LastName,$r.FirstName,$r.MiddleName).Trim()
-        Тип      = $TypeLabel
-        Почта    = $primary
-        Источник = $src
-        Табель   = $tab
-        Начало   = ([datetime]$r.StartDate).ToString("dd.MM.yyyy")
-        Конец    = ([datetime]$r.EndDate).ToString("dd.MM.yyyy")
-        Дней     = $r.CountDay
-        EmailCnt = @($list).Count
-        Emails   = ($list -join "; ")
-        IDPerson = $id
-      }
     }
+    
+    # Если вдруг заголовок называется чуть иначе, по умолчанию ищем в столбце D (4)
+    if ($emailCol -eq 0) {
+        Write-Host "[!] Столбец 'Значение' не найден в первой строке! Будем брать данные из 4-го столбца (D)." -ForegroundColor Yellow
+        $emailCol = 4 
+    }
+    
+    # Ставим заголовок в столбец E (5)
+    $ws.Cells.Item(1, 5).Value2 = "Статус в AD"
+
+    Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
+
+    for ($row = 2; $row -le $lastRow; $row++) {
+        $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
+        
+        # Пропускаем пустые ячейки
+        if ([string]::IsNullOrWhiteSpace($email)) {
+            continue
+        }
+        
+        # Ищем пользователя по почте (ErrorAction SilentlyContinue чтобы не спамило красным, если не найдет)
+        $adUser = Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled -ErrorAction SilentlyContinue | Select-Object -First 1
+        
+        if ($null -ne $adUser) {
+            if ($adUser.Enabled) {
+                $status = "активный"
+            } else {
+                $status = "не активен"
+            }
+        } else {
+            $status = "не найден"
+        }
+        
+        # Записываем результат в столбец E (5)
+        $ws.Cells.Item($row, 5).Value2 = $status
+        
+        # Вывод прогресса в консоль
+        Write-Host "Строка $row: $email -> $status"
+    }
+
+    # Сохраняем изменения
+    $wb.Save()
+    Write-Host "`n[+] Готово! Файл успешно обновлен и сохранен." -ForegroundColor Green
 }
-
-
-$rowsF = &$ProcessRows -Rows $F.Rows -TypeLabel 'Отпуск'
-$rowsS = &$ProcessRows -Rows $S.Rows -TypeLabel 'Больничный'
-
-# Вывод Отпусков
-Write-Host "`nОТПУСКА" -ForegroundColor Green
-if ($rowsF) {
-    $rowsF | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Format-Table -AutoSize
-    $noMailF = @($rowsF|?{-not $_.Почта})
-    Write-Host "Всего в отпуске: $($rowsF.Count) | без почты: $($noMailF.Count)" -ForegroundColor Cyan
-} else {
-    Write-Host "Сегодня нет сотрудников в отпуске." -ForegroundColor Yellow
+catch {
+    Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
 }
-
-# Вывод Больничных
-Write-Host "`nБОЛЬНИЧНЫЕ" -ForegroundColor Green
-if ($rowsS) {
-    $rowsS | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Format-Table -AutoSize
-    $noMailS = @($rowsS|?{-not $_.Почта})
-    Write-Host "Всего на больничном: $($rowsS.Count) | без почты: $($noMailS.Count)" -ForegroundColor Cyan
-} else {
-    Write-Host "Сегодня нет сотрудников на больничном." -ForegroundColor Yellow
+finally {
+    # Корректно закрываем процесс Excel, чтобы не висел в памяти
+    if ($null -ne $wb) { $wb.Close($false) }
+    $excel.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
 }
-
-
-# --- 5. ЭКСПОРТ В CSV ---
-
-$dir = if($PSScriptRoot){$PSScriptRoot} elseif($MyInvocation.MyCommand.Path){Split-Path $MyInvocation.MyCommand.Path} else {(Get-Location).Path}
-$st = Get-Date -Format yyyyMMdd
-$allRows = @()
-if($rowsF) { $allRows += $rowsF }
-if($rowsS) { $allRows += $rowsS }
-
-if ($rowsF) {
-    $rowsF | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Export-Csv (Join-Path $dir "furlough_$st.csv") -NoTypeInformation -Encoding UTF8
-}
-if ($rowsS) {
-    $rowsS | Select ФИО,Почта,Источник,Табель,Начало,Конец,Дней | Export-Csv (Join-Path $dir "sickleave_$st.csv") -NoTypeInformation -Encoding UTF8
-}
-
-# Проблемные email (выгружаем общим списком для всех)
-$ambig = @($allRows | ?{$_.EmailCnt -gt 1})
-$adMulti = @($allRows | ?{$_.Источник -eq 'AD_MULTI'})
-
-if($ambig.Count){
-  $ambig | Select ФИО,Тип,Табель,IDPerson,Emails | Export-Csv (Join-Path $dir "absences_ambiguous_$st.csv") -NoTypeInformation -Encoding UTF8
-  Write-Host "`n[!] Неоднозначные email (1С) -> absences_ambiguous_$st.csv" -ForegroundColor Yellow
-}
-if($adMulti.Count){
-  $adMulti | Select ФИО,Тип,Табель,Почта | Export-Csv (Join-Path $dir "absences_admulti_$st.csv") -NoTypeInformation -Encoding UTF8
-  Write-Host "[!] AD: несколько УЗ на табельник -> absences_admulti_$st.csv" -ForegroundColor Yellow
-}
-Смотри вот код который собирает информацию по людям которые сейчас в отпуске и делает выгрузку в забикс, так теперь у меня новая задача, нужна выгрузка по всем людям которые в отпуске, как я понимаю информация по ним берейтся из бд, но инфорамация по ним мне нужна из эктив директори 
-файл excel должен содержать вот такие заголовки 
-Блок	ФИО	Логин	Департамент	Должность	Основной диск N
