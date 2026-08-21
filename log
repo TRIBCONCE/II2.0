@@ -1,1 +1,2 @@
 abb-win.akbars.ru/Головной офис/Серверы и ресурсы/ABCloud/Файловые серверы ABCloud/Department FS Access Groups/R: Departments
+OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru
