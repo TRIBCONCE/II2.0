@@ -1,7 +1,20 @@
+Получение списка групп из AD...
+Get-ADGroup : Directory object not found
+At line:12 char:11
++ $groups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties i ...
++           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (:) [Get-ADGroup], ADIdentityNotFoundException
+    + FullyQualifiedErrorId : ActiveDirectoryCmdlet:Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException,Microsoft.ActiveDirectory.Management.Commands.GetADGroup
+ 
+Найдено групп: 0. Начинается проверка путей...
+Запись данных в Excel...
+Файл успешно сохранен: C:\Users\z-BorodinES\Desktop\Отчет_по_группам_FS.xlsx
+The object invoked has disconnected from its clients. (Exception from HRESULT: 0x80010108 (RPC_E_DISCONNECTED))
+At line:85 char:22
++     if ($workbook) { $workbook.Close($false) }
++                      ~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], COMException
+    + FullyQualifiedErrorId : System.Runtime.InteropServices.COMException
+ 
 
-At line:65 char:28
-+         Write-Host "Строка $row: $email -> $status"
-+                            ~~~~~
-Variable reference is not valid. ':' was not followed by a valid variable name character. Consider using ${} to delimit the name.
-    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
-    + FullyQualifiedErrorId : InvalidVariableReferenceWithDrive
+давай может не определять специально ou возможно группы безопасности и так все возьмуться без точного расположения
