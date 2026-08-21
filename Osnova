@@ -5,7 +5,6 @@ $OutputFile = "C:\Users\z-BorodinES\Desktop\Отчет_по_группам_FS.xl
 Write-Host "Получение списка групп из AD (ищем по всему домену)..." -ForegroundColor Cyan
 
 # Ищем группы по всему домену, у которых заполнено поле info (Notes)
-# Если нужны вообще все группы безопасности, замени фильтр на: -Filter 'GroupCategory -eq "Security"'
 $groups = Get-ADGroup -Filter "info -like '*'" -Properties info
 
 Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей..." -ForegroundColor Cyan
@@ -14,15 +13,24 @@ $ResultData = @()
 
 foreach ($group in $groups) {
     $groupName = $group.Name
-    $folderPath = $group.info
+    
+    # Убираем лишние пробелы по краям и заменяем переносы строк на пробелы, чтобы не ломать Excel
+    $folderPath = $group.info -replace "[\r\n]", " "
+    $folderPath = $folderPath.Trim()
 
     if ([string]::IsNullOrWhiteSpace($folderPath)) {
         $status = "Путь не указан"
     } else {
-        if (Test-Path -LiteralPath $folderPath) {
-            $status = "Существует"
-        } else {
-            $status = "Не существует"
+        try {
+            # Добавили -ErrorAction Stop. Если путь содержит спецсимволы, скрипт уйдет в catch
+            if (Test-Path -LiteralPath $folderPath -ErrorAction Stop) {
+                $status = "Существует"
+            } else {
+                $status = "Не существует"
+            }
+        } catch {
+            # Если Test-Path падает с ошибкой Illegal characters in path
+            $status = "Некорректный формат пути"
         }
     }
 
@@ -45,7 +53,7 @@ if ($groups.Count -gt 0) {
         $worksheet = $workbook.Sheets.Item(1)
 
         $worksheet.Cells.Item(1, 1).Value2 = "Имя группы"
-        $worksheet.Cells.Item(1, 2).Value2 = "Путь"
+        $worksheet.Cells.Item(1, 2).Value2 = "Путь (из Notes)"
         $worksheet.Cells.Item(1, 3).Value2 = "Статус пути"
 
         $worksheet.Rows.Item(1).Font.Bold = $true
@@ -74,7 +82,7 @@ if ($groups.Count -gt 0) {
         [System.GC]::WaitForPendingFinalizers()
     }
 
-    # Открываем файл ПОСЛЕ того, как COM-объект полностью закрыт
+    # Открываем файл ПОСЛЕ того, как COM-объект закрыт
     Invoke-Item $OutputFile
 } else {
     Write-Host "Не найдено ни одной группы с заполненным полем Notes. Excel файл не создан." -ForegroundColor Yellow
