@@ -1,82 +1,44 @@
+cls
 Import-Module ActiveDirectory
-
-$FilePath = "C:\Путь\К\Файлу\Сотрудники.xlsx"
-
-# Указываем сервера/домены для поиска
-$Domain1 = "abb-win.akbars.ru"
-$Domain2 = "moffice"
-
-$excel = New-Object -ComObject Excel.Application
-$excel.Visible = $false
-$excel.DisplayAlerts = $false
-
-try {
-    Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
-    $wb = $excel.Workbooks.Open($FilePath)
-    $ws = $wb.Sheets.Item("Лист1") 
-    
-    $lastRow = $ws.UsedRange.Rows.Count
-    
-    $emailCol = 0
-    $lastCol = $ws.UsedRange.Columns.Count
-    for ($c = 1; $c -le $lastCol; $c++) {
-        if ($ws.Cells.Item(1, $c).Text -eq "Значение") {
-            $emailCol = $c
-            break
-        }
+$OutputFile = "C:\Users\z-BorodinES\Desktop\Пользователи без division.csv"
+$data = Get-ADUser -Filter "Enabled -eq 'True' -and (division -notlike '*')" -Properties SamAccountName, Name, Department, wWWHomePage, EmployeeID, Initials, DistinguishedName, EmployeeType | 
+Where-Object {
+    $_.EmployeeType -notin @('Vendor','Service') -and
+    $_.SamAccountName -notmatch '^(z-|a-)' -and
+    $_.SamAccountName -notlike '*$'
+} |
+Select-Object @{
+    Name = "Логин"
+    Expression = { $_.SamAccountName }
+}, @{
+    Name = "ФИО"
+    Expression = { $_.Name }
+}, @{
+    Name = "Департамент"
+    Expression = { $_.Department }
+}, @{
+    Name = "wwwhomepage"
+    Expression = { $_.wWWHomePage }
+}, @{
+    Name = "EmployeeID"
+    Expression = { $_.EmployeeID }
+}, @{
+    Name = "Initials"
+    Expression = { $_.Initials }
+},
+@{
+    Name = "OU"
+    Expression = {
+        $ouParts = $_.DistinguishedName -split ',' | Where-Object { $_ -match '^OU=' } | ForEach-Object { $_ -replace '^OU=' }
+        [array]::Reverse($ouParts)
+        $ouPath = $ouParts -join '/'
+        $ouPath -replace '^Головной офис/', ''
     }
-    
-    if ($emailCol -eq 0) {
-        Write-Host "[!] Столбец 'Значение' не найден! Берем 4-й столбец (D)." -ForegroundColor Yellow
-        $emailCol = 4 
-    }
-    
-    $ws.Cells.Item(1, 5).Value2 = "Статус в AD"
-
-    Write-Host "Начинаем проверку почт в доменах $Domain1 и $Domain2..." -ForegroundColor Cyan
-
-    for ($row = 2; $row -le $lastRow; $row++) {
-        $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
-        
-        if ([string]::IsNullOrWhiteSpace($email)) {
-            continue
-        }
-        
-        $adUser = $null
-        
-        # 1. Ищем в первом домене (ABB-WIN)
-        $adUser = Get-ADUser -Filter "mail -eq '$email'" -Server $Domain1 -Properties Enabled -ErrorAction SilentlyContinue | Select-Object -First 1
-        
-        # 2. Если не нашли, ищем во втором домене (MOFFICE)
-        if ($null -eq $adUser) {
-            $adUser = Get-ADUser -Filter "mail -eq '$email'" -Server $Domain2 -Properties Enabled -ErrorAction SilentlyContinue | Select-Object -First 1
-        }
-        
-        # 3. Определяем статус
-        if ($null -ne $adUser) {
-            if ($adUser.Enabled) {
-                $status = "активный"
-            } else {
-                $status = "не активен"
-            }
-        } else {
-            $status = "не найден"
-        }
-        
-        $ws.Cells.Item($row, 5).Value2 = $status
-        Write-Host "Строка $row: $email -> $status"
-    }
-
-    $wb.Save()
-    Write-Host "`n[+] Готово! Файл успешно обновлен." -ForegroundColor Green
 }
-catch {
-    Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
-}
-finally {
-    if ($null -ne $wb) { $wb.Close($false) }
-    $excel.Quit()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
-}
+$data | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8 -Delimiter ";"
+Write-Host "Файл CSV сохранен: $OutputFile" -ForegroundColor Green
+Invoke-Item $OutputFile 
+
+Смотри это код выгрузки пользователей, предоставитл просто для понимания на каком языке делаю.
+Теперь задача такая мне нужно выгрузить все группы безопасности которые есть в эктив директори находятся они в аушке (Головной офис - Серверы и ресурсы - Файловые серверы ABCloud - Department FS Access Groups - R: Departments)
+Выгрузить группы нужно в xlsx файл первое поле Имя группы второе поле(в эктив директори это Notes) путь и третье поле существует ли этот путь надо кодом это проверить и прописать в xlsx существует не существует
