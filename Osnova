@@ -2,10 +2,13 @@ Import-Module ActiveDirectory
 
 $OutputFile = "C:\Users\z-BorodinES\Desktop\Отчет_по_группам_FS.xlsx"
 
-Write-Host "Получение списка групп из AD (ищем по всему домену)..." -ForegroundColor Cyan
+# Точный путь, скопированный из атрибутов AD
+$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
 
-# Ищем группы по всему домену, у которых заполнено поле info (Notes)
-$groups = Get-ADGroup -Filter "info -like '*'" -Properties info
+Write-Host "Получение списка групп из конкретной OU..." -ForegroundColor Cyan
+
+# Берем ВСЕ группы из указанной OU
+$groups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties info
 
 Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей..." -ForegroundColor Cyan
 
@@ -14,24 +17,30 @@ $ResultData = @()
 foreach ($group in $groups) {
     $groupName = $group.Name
     
-    # Убираем лишние пробелы по краям и заменяем переносы строк на пробелы, чтобы не ломать Excel
-    $folderPath = $group.info -replace "[\r\n]", " "
-    $folderPath = $folderPath.Trim()
+    # Очищаем путь от переносов строк и лишних пробелов, если поле info заполнено
+    if ($null -ne $group.info) {
+        $folderPath = $group.info -replace "[\r\n]", " "
+        $folderPath = $folderPath.Trim()
+    } else {
+        $folderPath = ""
+    }
 
     if ([string]::IsNullOrWhiteSpace($folderPath)) {
         $status = "Путь не указан"
-    } else {
+    # Проверяем, начинается ли строка с \\ или //
+    } elseif ($folderPath.StartsWith("\") -or $folderPath.StartsWith("//")) {
         try {
-            # Добавили -ErrorAction Stop. Если путь содержит спецсимволы, скрипт уйдет в catch
             if (Test-Path -LiteralPath $folderPath -ErrorAction Stop) {
                 $status = "Существует"
             } else {
                 $status = "Не существует"
             }
         } catch {
-            # Если Test-Path падает с ошибкой Illegal characters in path
             $status = "Некорректный формат пути"
         }
+    } else {
+        # Если строка начинается не с двойного слеша — сразу бракуем
+        $status = "Некорректный формат пути"
     }
 
     $ResultData += [PSCustomObject]@{
@@ -85,5 +94,5 @@ if ($groups.Count -gt 0) {
     # Открываем файл ПОСЛЕ того, как COM-объект закрыт
     Invoke-Item $OutputFile
 } else {
-    Write-Host "Не найдено ни одной группы с заполненным полем Notes. Excel файл не создан." -ForegroundColor Yellow
+    Write-Host "Не найдено ни одной группы в указанной OU. Проверь путь SearchBase." -ForegroundColor Yellow
 }
