@@ -1,158 +1,120 @@
-cls
-Import-Module ActiveDirectory -ErrorAction Stop
+# ===================== НАСТРОЙКИ =====================
+Import-Module ActiveDirectory
 
-# --- Настройки подключения к AD (при необходимости раскомментируй) ---
-# $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
-# $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
-# $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
-# $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+$usersListPath = "C:\Users\z-BorodinES\Desktop\Polz.txt"      # Путь к текстовому файлу со списком (Логин — ФИО)
+$reportPath    = "C:\Users\z-BorodinES\Desktop\Otchet.txt"    # Куда сохранить итоговый отчет
 
-# =========================================================================
-# ЧАСТЬ 1: Массив табельных номеров для проверки
-# =========================================================================
-$MyTabNumbers = @(
-    "10234",
-    "10567",
-    "11045"
-    # Добавляй сюда любые табельные номера из 1С, которые хочешь проанализировать
-)
+# Настройки подключения к БД
+$SqlServer = "p-knot-db01.abb-win.akbars.ru"
+$SqlDb     = "DWDATA_ODS"
+$SqlUser   = "syncad"
+$SqlPass   = "скрыл" # Замените на реальный пароль перед запуском
 
-# Очищаем массив от пробелов и пустых значений
-$SearchTabs = @($MyTabNumbers | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+# ===================== ЗАГРУЗКА ДАННЫХ ИЗ SQL БД =====================
+Write-Host "Подключение к базе данных SQL..." -ForegroundColor Cyan
 
-if ($SearchTabs.Count -eq 0) {
-    Write-Host "Массив табельных номеров пуст! Нечего искать." -ForegroundColor Red
-    return
-}
+$1cDict = @{}
+$connectionString = "Server=$SqlServer;Database=$SqlDb;User ID=$SqlUser;Password=$SqlPass;"
+$query = "SELECT email, UvDate FROM v_Empl_info WHERE email IS NOT NULL"
 
-# =========================================================================
-# ЧАСТЬ 2: Построение фильтров и запрос в AD
-# =========================================================================
-$LdapParts = foreach ($tab in $SearchTabs) { "(wWWHomePage=$tab)" }
-$FinalFilter = "(|{0})" -f ($LdapParts -join "")
+try {
+    # Открываем соединение и выполняем запрос
+    $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+    $connection.Open()
 
-Write-Host "[1/2] Поиск $($SearchTabs.Count) сотрудников в Active Directory..." -ForegroundColor Cyan
+    $command = New-Object System.Data.SqlClient.SqlCommand($query, $connection)
+    $reader = $command.ExecuteReader()
 
-$AdProperties = @(
-    "name", "samaccountname", "wWWHomePage", "division", 
-    "employeeType", "initials", "whenCreated", "Enabled", "mail", "DistinguishedName"
-)
-
-$ADParams = @{
-    LDAPFilter = $FinalFilter
-    Properties = $AdProperties
-}
-# $ADParams.Credential = $ab_creds 
-
-$FoundUsers = Get-ADUser @ADParams
-Write-Host "[2/2] Из AD успешно получено записей: $($FoundUsers.Count)`n" -ForegroundColor Cyan
-
-# =========================================================================
-# ЧАСТЬ 3: Анализ и применение правил фильтрации
-# =========================================================================
-$FoundTabsHash = @{}
-$LimitDate = (Get-Date).AddDays(-3)
-$ExcludeInitials = @("abdt","vnsov","1/40")
-$ExcludeSamAccountsHash = @{"TantushjanAM"=$true}
-
-$ValidUsers    = New-Object System.Collections.ArrayList
-$ExcludedUsers = New-Object System.Collections.ArrayList
-
-foreach ($User in $FoundUsers) {
-    $tab = "$($User.wWWHomePage)".Trim()
-    if ($tab) { $FoundTabsHash[$tab] = $true }
-
-    $div  = ([string]$User.division).Trim()
-    $sam  = ([string]$User.samaccountname).Trim()
-    $name = $User.name
-    $dn   = $User.DistinguishedName
+    # Считываем данные и формируем быстрый словарь
+    while ($reader.Read()) {
+        $email = $reader["email"].ToString().Trim().ToLower()
+        $uvDate = $reader["UvDate"].ToString().Trim()
+        
+        if (-not [string]::IsNullOrWhiteSpace($email)) {
+            $1cDict[$email] = $uvDate
+        }
+    }
     
-    $reason = "" # Сбрасываем причину
+    $reader.Close()
+    $connection.Close()
+    Write-Host "Данные из БД успешно загружены!" -ForegroundColor Green
+} catch {
+    Write-Host "Ошибка подключения или чтения БД: $($_.Exception.Message)" -ForegroundColor Red
+    exit # Прерываем скрипт, если база недоступна
+}
 
-    # --- КАСКАД ПРОВЕРОК (Твои фильтры) ---
-    if (-not $div) {
-        $reason = "Пустой атрибут division (подразделение не указано)"
-    }
-    elseif ($User.whenCreated -gt $LimitDate) {
-        $reason = "УЗ создана менее 3 дней назад"
-    }
-    elseif (@("service","vendor") -contains ([string]$User.employeeType).Trim().ToLower()) {
-        $reason = "Отфильтрована по employeeType '$($User.employeeType)'"
-    }
-    elseif ($ExcludeInitials -contains ([string]$User.initials).Trim()) {
-        $reason = "Отфильтрована по инициалам '$($User.initials)'"
-    }
-    elseif ($ExcludeSamAccountsHash.ContainsKey($sam)) {
-        $reason = "Ручное исключение (логин '$sam' в черном списке)"
-    }
-    elseif ($sam -like "Health*" -or $sam -like "audit*" -or $sam -like "esas*" -or $sam -like "a-*" -or $sam -like "z-*") {
-        $reason = "Служебный/тестовый логин ($sam)"
-    }
-    elseif ($name -like "*`$*" -or $name -like "*Администратор*" -or $name -like "*Тестовая*") {
-        $reason = "Служебное/тестовое ФИО ($name)"
-    }
-    elseif ($dn -like "*сторон*") {
-        $reason = "Находится в OU сторонних/отключенных объектов"
-    }
-    elseif ($User.Enabled -eq $false) {
-        # Поскольку тут нет прямой связи с базой 1С для проверки на увольнение,
-        # мы просто констатируем факт, что учетка отключена.
-        $reason = "Учетная запись отключена (Enabled = False)"
-    }
+# ===================== АНАЛИЗ ПОЛЬЗОВАТЕЛЕЙ =====================
+Write-Host "Чтение файла пользователей и поиск в AD/БД..." -ForegroundColor Cyan
+$rawLines = Get-Content -Path $usersListPath | Where-Object { $_.Trim() -ne "" }
 
-    # Формируем итоговый объект для отчета
-    $obj = [PSCustomObject]@{
-        'Табельный'    = $tab
-        'ФИО'          = $name
-        'Логин'        = $sam
-        'Активен'      = $User.Enabled
-        'Подразделение'= $div
-        'Причина'      = $reason
-    }
+$firedUsers = @()
+$activeUsers = @()
+$errors = @()
 
-    # Распределяем по спискам
-    if ($reason -eq "") {
-        $obj.Причина = "✔ ВАЛИДНА (Прошла все проверки)"
-        [void]$ValidUsers.Add($obj)
+foreach ($line in $rawLines) {
+    # Извлекаем логин и ФИО (разделитель — тире или дефис)
+    if ($line -match '^(.+?)\s*[-—]\s*(.+)$') {
+        $login = $matches[1].Trim()
+        $fio   = $matches[2].Trim()
     } else {
-        [void]$ExcludedUsers.Add($obj)
+        $login = $line.Trim()
+        $fio   = ""
+    }
+    
+    try {
+        # 1. Запрашиваем email из AD по логину
+        $adUser = Get-ADUser -Identity $login -Properties mail -ErrorAction Stop
+        $email = $adUser.mail
+
+        if ([string]::IsNullOrWhiteSpace($email)) {
+            $errors += "$login — $fio (В AD не указан Email)"
+            continue
+        }
+
+        # 2. Ищем пользователя в словаре, загруженном из SQL
+        $searchEmail = $email.Trim().ToLower()
+        
+        if ($1cDict.ContainsKey($searchEmail)) {
+            $uvDate = $1cDict[$searchEmail]
+            
+            # 3. Проверяем наличие даты увольнения (UvDate)
+            if (-not [string]::IsNullOrWhiteSpace($uvDate)) {
+                # UvDate заполнен -> уволен
+                $firedUsers += "$login — $fio (с $uvDate)"
+            } else {
+                # UvDate пустой -> работает (не уволен)
+                $activeUsers += "$login — $fio"
+            }
+        } else {
+            $errors += "$login — $fio (Email '$email' не найден в представлении v_Empl_info)"
+        }
+
+    } catch {
+        $errors += "$login — $fio (Логин не найден в AD)"
     }
 }
 
-# =========================================================================
-# ЧАСТЬ 4: Вывод результатов
-# =========================================================================
+# ===================== ФОРМИРОВАНИЕ ОТЧЕТА =====================
+$firedCount = $firedUsers.Count
+$activeCount = $activeUsers.Count
 
-# 1. Валидные учетки (Зеленые)
-if ($ValidUsers.Count -gt 0) {
-    Write-Host "=========== ВАЛИДНЫЕ СОТРУДНИКИ (ПОПАДУТ В СТАТИСТИКУ) ===========" -ForegroundColor Green
-    $ValidUsers | Sort-Object 'Табельный' | Format-Table -AutoSize
+$firedListString = if ($firedCount -gt 0) { $firedUsers -join "`r`n" } else { "Нет уволенных" }
+$activeListString = if ($activeCount -gt 0) { $activeUsers -join "`r`n" } else { "Нет неуволенных" }
+
+# Формируем текст строго по вашему шаблону
+$reportMessage = @"
+Уволенные($firedCount):
+$firedListString
+
+Не уволенные($activeCount):
+$activeListString
+"@
+
+# Добавляем блок с ошибками в конец файла (если кто-то не найден в AD или БД)
+if ($errors.Count -gt 0) {
+    $reportMessage += "`r`n`r`nОШИБКИ ПОИСКА:`r`n" + ($errors -join "`r`n")
 }
 
-# 2. Забракованные учетки (Желтые)
-if ($ExcludedUsers.Count -gt 0) {
-    Write-Host "`n=========== ИСКЛЮЧЕННЫЕ СОТРУДНИКИ (ЕСТЬ В AD, НО ЗАБРАКОВАНЫ ФИЛЬТРАМИ) ===========" -ForegroundColor Yellow
-    $ExcludedUsers | Sort-Object 'Табельный' | Format-Table -AutoSize
-}
-
-# 3. Не найдены в AD (Красные)
-Write-Host "`n=========== РАСХОЖДЕНИЯ (ВООБЩЕ НЕТ В AD ПО ТАБЕЛЬНОМУ) ===========" -ForegroundColor Magenta
-$NotFoundCount = 0
-foreach ($tab in $SearchTabs) {
-    if (-not $FoundTabsHash.ContainsKey($tab)) {
-        Write-Host "[!] Табельный номер $tab ОТСУТСТВУЕТ в Active Directory" -ForegroundColor Red
-        $NotFoundCount++
-    }
-}
-
-if ($NotFoundCount -eq 0) {
-    Write-Host "Все запрошенные табельные номера существуют в AD." -ForegroundColor Green
-}
-
-# Итоговое резюме
-Write-Host "`n=================== ИТОГИ ===================" -ForegroundColor Cyan
-Write-Host "Всего запрошено:  $($SearchTabs.Count)"
-Write-Host "Идеальных УЗ:     $($ValidUsers.Count)" -ForegroundColor Green
-Write-Host "Отфильтровано:    $($ExcludedUsers.Count)" -ForegroundColor Yellow
-Write-Host "Вообще не найдено:$NotFoundCount" -ForegroundColor Red
-Write-Host "=============================================" -ForegroundColor Cyan
+# Сохраняем в файл
+Set-Content -Path $reportPath -Value $reportMessage -Encoding UTF8
+Write-Host "`nГотово! Отчет сохранен: $reportPath" -ForegroundColor Green
