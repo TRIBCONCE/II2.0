@@ -1,42 +1,74 @@
 # ===================== ЗАГРУЗКА ДАННЫХ ИЗ SQL БД =====================
-Write-Host "Подключение к базе данных SQL и загрузка ФИО..." -ForegroundColor Cyan
+Write-Host "Подключение к базе данных SQL и загрузка данных..." -ForegroundColor Cyan
 
-$dbDict = @{}
+$dbDict = @{}       # Словарь уволенных (ФИО -> Дата увольнения)
+$vacationDict = @{} # Словарь отпусков (ФИО -> Строка с датами отпуска)
+
 $connectionString = "Server=$SqlServer;Database=$SqlDb;User ID=$SqlUser;Password=$SqlPass;"
-
-$query = "SELECT LastName, FirstName, MiddleName, UvDate FROM v_Empl_info WHERE LastName IS NOT NULL"
 
 try {
     $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
     $connection.Open()
 
-    $command = New-Object System.Data.SqlClient.SqlCommand($query, $connection)
-    $reader = $command.ExecuteReader()
+    # --- ЗАПРОС 1: Сбор данных об увольнениях ---
+    $queryUv = "SELECT LastName, FirstName, MiddleName, UvDate FROM v_Empl_info WHERE LastName IS NOT NULL"
+    $commandUv = New-Object System.Data.SqlClient.SqlCommand($queryUv, $connection)
+    $readerUv = $commandUv.ExecuteReader()
 
-    while ($reader.Read()) {
-        $ln = $reader["LastName"].ToString().Trim()
-        $fn = $reader["FirstName"].ToString().Trim()
-        $mn = $reader["MiddleName"].ToString().Trim()
-        $uvDate = $reader["UvDate"].ToString().Trim()
+    while ($readerUv.Read()) {
+        $ln = $readerUv["LastName"].ToString().Trim()
+        $fn = $readerUv["FirstName"].ToString().Trim()
+        $mn = $readerUv["MiddleName"].ToString().Trim()
+        $uvDate = $readerUv["UvDate"].ToString().Trim()
         
-        # Склеиваем ФИО в одну строку и убираем лишние пробелы (если нет отчества)
         $fullFio = "$ln $fn $mn".Trim() -replace '\s+', ' '
         
         if (-not [string]::IsNullOrWhiteSpace($fullFio)) {
             $dbDict[$fullFio.ToLower()] = $uvDate
         }
     }
-    
-    $reader.Close()
+    $readerUv.Close()
+    Write-Host "Данные об увольнениях загружены." -ForegroundColor Green
+
+    # --- ЗАПРОС 2: Сбор данных об отпусках на текущий день ---
+    # CONVERT(varchar, ..., 104) отформатирует дату как ДД.ММ.ГГГГ прямо на стороне SQL
+    $queryVacation = @"
+        SELECT e.LastName, e.FirstName, e.MiddleName, 
+               CONVERT(varchar, f.StartDate, 104) AS StartDateStr, 
+               CONVERT(varchar, f.EndDate, 104) AS EndDateStr
+        FROM IC.Furlough_WT f
+        JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
+        WHERE e.UvDate IS NULL
+          AND f.StartDate <= CAST(GETDATE() AS date)
+          AND f.EndDate >= CAST(GETDATE() AS date)
+"@
+    $commandVac = New-Object System.Data.SqlClient.SqlCommand($queryVacation, $connection)
+    $readerVac = $commandVac.ExecuteReader()
+
+    while ($readerVac.Read()) {
+        $ln = $readerVac["LastName"].ToString().Trim()
+        $fn = $readerVac["FirstName"].ToString().Trim()
+        $mn = $readerVac["MiddleName"].ToString().Trim()
+        $sDate = $readerVac["StartDateStr"].ToString().Trim()
+        $eDate = $readerVac["EndDateStr"].ToString().Trim()
+        
+        $fullFio = "$ln $fn $mn".Trim() -replace '\s+', ' '
+        
+        if (-not [string]::IsNullOrWhiteSpace($fullFio)) {
+            $vacationDict[$fullFio.ToLower()] = "в отпуске с $sDate по $eDate"
+        }
+    }
+    $readerVac.Close()
+    Write-Host "Данные об отпусках загружены." -ForegroundColor Green
+
     $connection.Close()
-    Write-Host "Данные из БД успешно загружены (Записей: $($dbDict.Count))!" -ForegroundColor Green
 } catch {
     Write-Host "Ошибка подключения или чтения БД: $($_.Exception.Message)" -ForegroundColor Red
     exit
 }
 
 # ===================== АНАЛИЗ ПОЛЬЗОВАТЕЛЕЙ =====================
-Write-Host "Сверка пользователей AD с базой 1С по ФИО..." -ForegroundColor Cyan
+Write-Host "Сверка пользователей AD с базами 1С..." -ForegroundColor Cyan
 $rawLines = Get-Content -Path $usersListPath | Where-Object { $_.Trim() -ne "" }
 
 $firedUsers = @()
@@ -44,11 +76,10 @@ $activeUsers = @()
 $errors = @()
 
 foreach ($line in $rawLines) {
-    # 1. Очищаем строку от начального дефиса и пробелов (если они есть)
-    # Превращает " - AbdullinMR — Абд Мар" просто в "AbdullinMR — Абд Мар"
+    # 1. Очищаем строку от начального дефиса и пробелов
     $cleanLine = $line -replace '^\s*-\s*', ''
 
-    # 2. Извлекаем логин (берем все до первого пробела с тире/дефисом)
+    # 2. Извлекаем логин
     if ($cleanLine -match '^([^\s]+)\s*[-—]\s*(.+)$') {
         $login = $matches[1].Trim()
     } else {
@@ -56,7 +87,7 @@ foreach ($line in $rawLines) {
     }
     
     try {
-        # Запрашиваем пользователя в AD (тянем DisplayName)
+        # Запрашиваем ФИО в AD
         $adUser = Get-ADUser -Identity $login -Properties DisplayName -ErrorAction Stop
         $adFio = $adUser.DisplayName
 
@@ -65,17 +96,24 @@ foreach ($line in $rawLines) {
             continue
         }
 
-        # Ищем ФИО в словаре из 1С
+        # Ищем ФИО в словарях 1С
         $searchFio = $adFio.Trim().ToLower() -replace '\s+', ' '
         
+        # Сначала проверяем увольнение
         if ($dbDict.ContainsKey($searchFio)) {
             $uvDate = $dbDict[$searchFio]
             
-            # Проверяем наличие даты увольнения (UvDate)
             if (-not [string]::IsNullOrWhiteSpace($uvDate)) {
-                $firedUsers += "$login — $adFio (с $uvDate)"
+                # Пользователь уволен
+                $firedUsers += "$login — $adFio (уволен с $uvDate)"
             } else {
-                $activeUsers += "$login — $adFio"
+                # Пользователь НЕ уволен -> проверяем отпуск
+                if ($vacationDict.ContainsKey($searchFio)) {
+                    $vacInfo = $vacationDict[$searchFio]
+                    $activeUsers += "$login — $adFio ($vacInfo)"
+                } else {
+                    $activeUsers += "$login — $adFio"
+                }
             }
         } else {
             $errors += "$login — $adFio (ФИО не найдено в базе 1С)"
