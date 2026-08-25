@@ -1,214 +1,115 @@
-# ==============================================================================
-# НАСТРОЙКИ ПУТЕЙ
-# ==============================================================================
-$SourceExcelPath = "C:\Temp\SourceGroups.xlsx" # Путь к исходному файлу
-$TargetExcelPath = "C:\Temp\FoundGroups.xlsx"  # Путь для нового файла
+cls
+Import-Module ActiveDirectory
 
-# ==============================================================================
-# ФУНКЦИЯ ДЛЯ ПОИСКА В ШИРИНУ (BFS)
-# ==============================================================================
-function Get-FolderWithGroupBFS {
-    param (
-        [string]$BasePath,
-        [string]$GroupName,
-        [int]$MaxDepth = 5,           
-        [int]$TimeoutSeconds = 120    
-    )
+$OutputFile = "C:\Users\z-BorodinES\Desktop\Отчёт_по_группам_AD.xlsx"
 
-    $startTime = Get-Date
+# Точный путь, скопированный из атрибутов AD
+$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+
+Write-Host "Получение списка групп из конкретной OU..." -ForegroundColor Cyan
+
+# Берем ВСЕ группы из указанной OU, запрашиваем info (Notes) и CanonicalName (Object)
+$groups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties info, CanonicalName
+
+Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей..." -ForegroundColor Cyan
+
+$ResultData = @()
+
+foreach ($group in $groups) {
+    $groupName = $group.Name
+    $objectPath = $group.CanonicalName
     
-    $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
-    $queue.Enqueue([PSCustomObject]@{ Path = $BasePath; Depth = 0 })
-
-    while ($queue.Count -gt 0) {
-        if ((Get-Date) - $startTime -gt [timespan]::FromSeconds($TimeoutSeconds)) {
-            return "TIMEOUT" 
-        }
-
-        $current = $queue.Dequeue()
-        $currentPath = $current.Path
-        $currentDepth = $current.Depth
-
-        try {
-            $acl = (Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop).GetAccessControl('Access')
-            
-            $hasGroup = $acl.Access | Where-Object { $_.IdentityReference.Value -match "\\$GroupName$" }
-
-            if ($hasGroup) {
-                return $currentPath 
-            }
-
-            if ($currentDepth -ge $MaxDepth) {
-                continue 
-            }
-
-            $subFolders = [System.IO.Directory]::EnumerateDirectories($currentPath)
-            foreach ($folder in $subFolders) {
-                $queue.Enqueue([PSCustomObject]@{ Path = $folder; Depth = $currentDepth + 1 })
-            }
-        }
-        catch {
-            # Пропускаем папки без доступа
-        }
+    # Очищаем путь от переносов строк и лишних пробелов, если поле info заполнено
+    if ($null -ne $group.info) {
+        $folderPath = $group.info -replace "[\r\n]", " "
+        $folderPath = $folderPath.Trim()
+    } else {
+        $folderPath = ""
     }
-    return $null
-}
 
-# ==============================================================================
-# ОСНОВНАЯ ЛОГИКА
-# ==============================================================================
-
-Write-Host "Запуск Excel..." -ForegroundColor Cyan
-$excel = New-Object -ComObject Excel.Application
-$excel.Visible = $false
-$excel.DisplayAlerts = $false
-
-try {
-    Write-Host "Чтение исходного файла $SourceExcelPath..." -ForegroundColor Cyan
-    $wbSource = $excel.Workbooks.Open($SourceExcelPath)
-    $wsSource = $wbSource.Worksheets.Item(1)
-    $lastRow = $wsSource.Cells.SpecialCells(11).Row 
-
-    $results = @()
-
-    for ($i = 2; $i -le $lastRow; $i++) {
-        $groupName = $wsSource.Cells.Item($i, 1).Text
-        $rawObjectPath = $wsSource.Cells.Item($i, 4).Text
-
-        if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
-
-        Write-Host "Обработка [$i / $lastRow]: $groupName"
-
-        # --- ШАГ 1: Базовая очистка ---
-        $cleanPath = $rawObjectPath.Replace("/", "\")
-        $escapedGroup = [regex]::Escape($groupName)
-        $cleanPath = $cleanPath -replace "\\$escapedGroup\\?$", ""
-        
-        # Попытка 1: Формируем стандартный путь (допускаем, что скрытых символов нет)
-        $standardPath = $cleanPath
-        if ($standardPath -match "^R:\\") {
-            $standardPath = $standardPath -replace "^R:\\", "\\abb-win.akbars.ru\departments\"
-        }
-        $standardPath = $standardPath.TrimEnd("\").Trim()
-
-        $hasHiddenChar = $false
-        $finalBasePath = ""
-
-        # --- ШАГ 2: Интеллектуальная проверка пути ---
-        if (Test-Path -LiteralPath $standardPath -PathType Any) {
-            # Путь рабочий без изменений
-            $finalBasePath = $standardPath
-        } else {
-            # Попытка 2: Ищем в строке начало диска или UNC-пути и отсекаем весь мусор ДО него
-            # (?s) позволяет регулярке корректно работать даже если есть переносы строк
-            if ($cleanPath -match '(?s)([a-zA-Z]:\\.*|\\\\.*)') {
+    if ([string]::IsNullOrWhiteSpace($folderPath)) {
+        $status = "Путь не указан"
+    } 
+    else {
+        # Попытка 1: проверяем путь "как есть"
+        if ($folderPath.StartsWith("\") -and (Test-Path -LiteralPath $folderPath -ErrorAction SilentlyContinue)) {
+            $status = "Существует"
+        } 
+        else {
+            # Попытка 2: Ищем \\ и отсекаем весь возможный мусор/скрытые символы ДО него
+            # Регулярка '(\\\\.*)' захватывает всё, начиная с \\ и до конца строки
+            if ($folderPath -match '(\\\\.*)') {
                 $fixedPath = $matches[1]
                 
-                if ($fixedPath -match "^R:\\") {
-                    $fixedPath = $fixedPath -replace "^R:\\", "\\abb-win.akbars.ru\departments\"
+                # Проверяем очищенный путь
+                if (Test-Path -LiteralPath $fixedPath -ErrorAction SilentlyContinue) {
+                    $status = "Путь существует необходимо убрать символ в начале"
+                    $folderPath = $fixedPath # Перезаписываем переменную, чтобы в Excel ушел чистый путь
+                } 
+                else {
+                    $status = "Не существует"
                 }
-                $fixedPath = $fixedPath.TrimEnd("\").Trim()
-
-                # Если очищенный путь отличается и он СУЩЕСТВУЕТ
-                if ($fixedPath -ne $standardPath -and (Test-Path -LiteralPath $fixedPath -PathType Any)) {
-                    $hasHiddenChar = $true
-                    $finalBasePath = $fixedPath
-                }
-            }
-        }
-
-        # --- ШАГ 3: Поиск группы и формирование статусов ---
-        $status = ""
-        $details = ""
-
-        if (-not $finalBasePath) {
-            $status = "Путь не корректен"
-            $details = "Путь не корректен(базовая папка не найдена: $standardPath)"
-            Write-Host "  -> $status" -ForegroundColor Red
-        }
-        else {
-            if ($hasHiddenChar) {
-                Write-Host "  -> Найден скрытый символ! Ищу по исправленному пути..." -ForegroundColor Cyan
-            } else {
-                Write-Host "  -> Базовый путь найден, ищу..." -ForegroundColor Yellow
-            }
-
-            # Запускаем BFS поиск по рабочему базовому пути
-            $foundLocation = Get-FolderWithGroupBFS -BasePath $finalBasePath -GroupName $groupName
-            
-            # Определяем, нашли группу или нет
-            if ($foundLocation -eq "TIMEOUT") {
-                $details = "Превышено время поиска (>120 сек). Требуется ручной поиск."
-                $baseStatus = "Группа не найдена"
-            }
-            elseif ($foundLocation) {
-                $details = $foundLocation
-                $baseStatus = "Найдено"
-            }
+            } 
             else {
-                $details = "Не найдено в пределах 5 уровней вложенности."
-                $baseStatus = "Группа не найдена"
+                # Если в строке вообще нет \\ (например, написана какая-то текстовая заметка или C:\)
+                $status = "Некорректный формат пути"
             }
-
-            # Итоговый статус (приоритет у скрытого символа)
-            if ($hasHiddenChar) {
-                $status = "Путь существует необходимо убрать символ в начале"
-                $details = "[Скрытый символ] $details"
-                Write-Host "  -> НАЙДЕНО (был скрытый символ)" -ForegroundColor Green
-            } else {
-                $status = $baseStatus
-                if ($baseStatus -eq "Найдено") {
-                    Write-Host "  -> НАЙДЕНО" -ForegroundColor Green
-                } else {
-                    Write-Host "  -> $baseStatus" -ForegroundColor DarkYellow
-                }
-            }
-        }
-
-        $results += [PSCustomObject]@{
-            GroupName = $groupName
-            Status    = $status
-            Details   = $details
         }
     }
 
-    $wbSource.Close($false)
-
-    # --- Создание нового Excel файла ---
-    Write-Host "Создание нового файла $TargetExcelPath..." -ForegroundColor Cyan
-    $wbTarget = $excel.Workbooks.Add()
-    $wsTarget = $wbTarget.Worksheets.Item(1)
-
-    $wsTarget.Cells.Item(1, 1) = "Имя группы"
-    $wsTarget.Cells.Item(1, 2) = "Статус"
-    $wsTarget.Cells.Item(1, 3) = "Точное расположение / Описание"
-    
-    $wsTarget.Range("A1:C1").Font.Bold = $true
-
-    $rowTarget = 2
-    foreach ($item in $results) {
-        $wsTarget.Cells.Item($rowTarget, 1) = $item.GroupName
-        $wsTarget.Cells.Item($rowTarget, 2) = $item.Status
-        $wsTarget.Cells.Item($rowTarget, 3) = $item.Details
-        $rowTarget++
+    $ResultData += [PSCustomObject]@{
+        GroupName  = $groupName
+        Path       = $folderPath
+        Status     = $status
+        ObjectPath = $objectPath
     }
-
-    [void]$wsTarget.Columns.AutoFit()
-
-    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
-    $wbTarget.SaveAs($TargetExcelPath)
-    $wbTarget.Close($true)
-
-    Write-Host "Готово! Результат сохранен в: $TargetExcelPath" -ForegroundColor Green
 }
-catch {
-    Write-Error "Произошла ошибка: $_"
-}
-finally {
-    if ($excel) {
+
+if ($groups.Count -gt 0) {
+    Write-Host "Запись данных в Excel..." -ForegroundColor Cyan
+
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
+
+    try {
+        $workbook = $excel.Workbooks.Add()
+        $worksheet = $workbook.Sheets.Item(1)
+
+        $worksheet.Cells.Item(1, 1).Value2 = "Имя группы"
+        $worksheet.Cells.Item(1, 2).Value2 = "Путь (из Notes)"
+        $worksheet.Cells.Item(1, 3).Value2 = "Статус пути"
+        $worksheet.Cells.Item(1, 4).Value2 = "Путь из Object"
+
+        $worksheet.Rows.Item(1).Font.Bold = $true
+
+        $row = 2
+        foreach ($item in $ResultData) {
+            $worksheet.Cells.Item($row, 1).Value2 = $item.GroupName
+            $worksheet.Cells.Item($row, 2).Value2 = $item.Path
+            $worksheet.Cells.Item($row, 3).Value2 = $item.Status
+            $worksheet.Cells.Item($row, 4).Value2 = $item.ObjectPath
+            $row++
+        }
+
+        [void]$worksheet.Columns.AutoFit()
+
+        $workbook.SaveAs($OutputFile)
+        Write-Host "Файл успешно сохранен: $OutputFile" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "[!] Произошла ошибка при работе с Excel: $_" -ForegroundColor Red
+    }
+    finally {
+        if ($null -ne $workbook) { $workbook.Close($false) }
         $excel.Quit()
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     }
+
+    # Открываем файл ПОСЛЕ того, как COM-объект закрыт
+    Invoke-Item $OutputFile
+} else {
+    Write-Host "Не найдено ни одной группы в указанной OU. Проверь путь SearchBase." -ForegroundColor Yellow
 }
