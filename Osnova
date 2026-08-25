@@ -7,7 +7,7 @@ $SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файлов�
 
 Write-Host "Получение списка групп из конкретной OU..." -ForegroundColor Cyan
 
-# Добавили CanonicalName (это и есть путь из вкладки Object)
+# Берем ВСЕ группы из указанной OU, запрашиваем info (Notes) и CanonicalName (Object)
 $groups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties info, CanonicalName
 
 Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей..." -ForegroundColor Cyan
@@ -28,8 +28,8 @@ foreach ($group in $groups) {
 
     if ([string]::IsNullOrWhiteSpace($folderPath)) {
         $status = "Путь не указан"
-    # Проверяем, начинается ли строка с \\ или // (с учетом возможных пробелов в начале)
-    } elseif ($folderPath -match "^[\\/]{2}") {
+    # Строгая проверка: строка должна начинаться ровно с \\
+    } elseif ($folderPath.StartsWith("\\")) {
         try {
             if (Test-Path -LiteralPath $folderPath -ErrorAction Stop) {
                 $status = "Существует"
@@ -37,10 +37,11 @@ foreach ($group in $groups) {
                 $status = "Не существует"
             }
         } catch {
+            # Если Test-Path всё же споткнется о какие-то внутренние символы
             $status = "Некорректный формат пути"
         }
     } else {
-        # Если строка начинается не с двойного слеша — сразу бракуем
+        # Всё, что не начинается с \\ (например, комментарии или локальные пути C:\)
         $status = "Некорректный формат пути"
     }
 
@@ -63,7 +64,6 @@ if ($groups.Count -gt 0) {
         $workbook = $excel.Workbooks.Add()
         $worksheet = $workbook.Sheets.Item(1)
 
-        # Добавили четвертый заголовок
         $worksheet.Cells.Item(1, 1).Value2 = "Имя группы"
         $worksheet.Cells.Item(1, 2).Value2 = "Путь (из Notes)"
         $worksheet.Cells.Item(1, 3).Value2 = "Статус пути"
