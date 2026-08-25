@@ -11,7 +11,7 @@ Write-Host "Получение списка групп из конкретной
 # Берем ВСЕ группы из указанной OU, запрашиваем info (Notes) и CanonicalName (Object)
 $groups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties info, CanonicalName
 
-Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей..." -ForegroundColor Cyan
+Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей и прав доступа..." -ForegroundColor Cyan
 
 $ResultData = @()
 
@@ -19,7 +19,7 @@ foreach ($group in $groups) {
     $groupName = $group.Name
     $objectPath = $group.CanonicalName
     
-    # Очищаем путь от переносов строк и лишних пробелов, если поле info заполнено
+    # Очищаем путь от переносов строк и обычных пробелов
     if ($null -ne $group.info) {
         $folderPath = $group.info -replace "[\r\n]", " "
         $folderPath = $folderPath.Trim()
@@ -31,29 +31,53 @@ foreach ($group in $groups) {
         $status = "Путь не указан"
     } 
     else {
-        # Попытка 1: проверяем путь "как есть"
-        if ($folderPath.StartsWith("\") -and (Test-Path -LiteralPath $folderPath -ErrorAction SilentlyContinue)) {
-            $status = "Существует"
+        $workingPath = ""
+        $hasHiddenChar = $false
+
+        # Ищем начало UNC-пути \\ и забираем всё до конца строки
+        if ($folderPath -match '(\\\\.*)') {
+            $cleanUNC = $matches[1]
+            
+            # Если оригинальная строка отличается от чистого пути (есть скрытые спецсимволы в начале)
+            if ($folderPath -ne $cleanUNC) {
+                $hasHiddenChar = $true
+            }
+            
+            # Проверяем доступность папки по чистому пути
+            if (Test-Path -LiteralPath $cleanUNC -ErrorAction SilentlyContinue) {
+                $workingPath = $cleanUNC
+            } else {
+                $status = "Не существует"
+            }
         } 
         else {
-            # Попытка 2: Ищем \\ и отсекаем весь возможный мусор/скрытые символы ДО него
-            # Регулярка '(\\\\.*)' захватывает всё, начиная с \\ и до конца строки
-            if ($folderPath -match '(\\\\.*)') {
-                $fixedPath = $matches[1]
+            # Если в строке вообще нет \\
+            $status = "Некорректный формат пути"
+        }
+
+        # Если путь существует, проверяем, назначена ли на него группа
+        if ($workingPath -ne "") {
+            try {
+                # Быстро читаем ACL папки
+                $acl = (Get-Item -LiteralPath $workingPath -Force -ErrorAction Stop).GetAccessControl('Access')
                 
-                # Проверяем очищенный путь
-                if (Test-Path -LiteralPath $fixedPath -ErrorAction SilentlyContinue) {
-                    $status = "Путь существует необходимо убрать символ в начале"
-                    $folderPath = $fixedPath # Перезаписываем переменную, чтобы в Excel ушел чистый путь
-                } 
-                else {
-                    $status = "Не существует"
+                # Экранируем спецсимволы в имени группы (на всякий случай) и ищем её в правах
+                $escapedGroup = [regex]::Escape($groupName)
+                $hasGroup = $acl.Access | Where-Object { $_.IdentityReference.Value -match "\\$escapedGroup$" }
+
+                if ($hasGroup) {
+                    $status = if ($hasHiddenChar) { "Путь существует необходимо убрать символ в начале" } else { "Существует" }
+                } else {
+                    $status = if ($hasHiddenChar) { "Путь существует (надо убрать символ), но группа не соответствует пути" } else { "Путь существует но группа не соответствует пути" }
                 }
             } 
-            else {
-                # Если в строке вообще нет \\ (например, написана какая-то текстовая заметка или C:\)
-                $status = "Некорректный формат пути"
+            catch {
+                # Если у тебя (от чьего имени запущен скрипт) нет прав на чтение свойств безопасности этой папки
+                $status = if ($hasHiddenChar) { "Путь существует (надо убрать символ), но нет доступа для проверки прав" } else { "Путь существует, но нет доступа для проверки прав" }
             }
+            
+            # Перезаписываем путь для Excel, чтобы туда попала чистая рабочая версия (без скрытых символов)
+            $folderPath = $workingPath
         }
     }
 
@@ -108,7 +132,6 @@ if ($groups.Count -gt 0) {
         [System.GC]::WaitForPendingFinalizers()
     }
 
-    # Открываем файл ПОСЛЕ того, как COM-объект закрыт
     Invoke-Item $OutputFile
 } else {
     Write-Host "Не найдено ни одной группы в указанной OU. Проверь путь SearchBase." -ForegroundColor Yellow
