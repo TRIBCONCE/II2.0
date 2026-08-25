@@ -4,7 +4,6 @@ Write-Host "Подключение к базе данных SQL и загруз�
 $dbDict = @{}
 $connectionString = "Server=$SqlServer;Database=$SqlDb;User ID=$SqlUser;Password=$SqlPass;"
 
-# Берем Фамилию, Имя, Отчество и дату увольнения. 
 $query = "SELECT LastName, FirstName, MiddleName, UvDate FROM v_Empl_info WHERE LastName IS NOT NULL"
 
 try {
@@ -20,12 +19,10 @@ try {
         $mn = $reader["MiddleName"].ToString().Trim()
         $uvDate = $reader["UvDate"].ToString().Trim()
         
-        # Склеиваем ФИО в одну строку (например: "Иванов Иван Иванович")
-        # И используем регулярку -replace '\s+', ' ', чтобы убрать двойные пробелы, если Отчества нет
+        # Склеиваем ФИО в одну строку и убираем лишние пробелы (если нет отчества)
         $fullFio = "$ln $fn $mn".Trim() -replace '\s+', ' '
         
         if (-not [string]::IsNullOrWhiteSpace($fullFio)) {
-            # Сохраняем в словарь в нижнем регистре для точного сравнения
             $dbDict[$fullFio.ToLower()] = $uvDate
         }
     }
@@ -47,15 +44,19 @@ $activeUsers = @()
 $errors = @()
 
 foreach ($line in $rawLines) {
-    # Извлекаем логин (разделитель — тире или дефис)
-    if ($line -match '^(.+?)\s*[-—]\s*(.+)$') {
+    # 1. Очищаем строку от начального дефиса и пробелов (если они есть)
+    # Превращает " - AbdullinMR — Абд Мар" просто в "AbdullinMR — Абд Мар"
+    $cleanLine = $line -replace '^\s*-\s*', ''
+
+    # 2. Извлекаем логин (берем все до первого пробела с тире/дефисом)
+    if ($cleanLine -match '^([^\s]+)\s*[-—]\s*(.+)$') {
         $login = $matches[1].Trim()
     } else {
-        $login = $line.Trim()
+        $login = $cleanLine.Trim()
     }
     
     try {
-        # 1. Запрашиваем пользователя в AD (обязательно тянем DisplayName)
+        # Запрашиваем пользователя в AD (тянем DisplayName)
         $adUser = Get-ADUser -Identity $login -Properties DisplayName -ErrorAction Stop
         $adFio = $adUser.DisplayName
 
@@ -64,14 +65,13 @@ foreach ($line in $rawLines) {
             continue
         }
 
-        # 2. Ищем ФИО в словаре из 1С
-        # Приводим к нижнему регистру и убираем лишние пробелы
+        # Ищем ФИО в словаре из 1С
         $searchFio = $adFio.Trim().ToLower() -replace '\s+', ' '
         
         if ($dbDict.ContainsKey($searchFio)) {
             $uvDate = $dbDict[$searchFio]
             
-            # 3. Проверяем наличие даты увольнения (UvDate)
+            # Проверяем наличие даты увольнения (UvDate)
             if (-not [string]::IsNullOrWhiteSpace($uvDate)) {
                 $firedUsers += "$login — $adFio (с $uvDate)"
             } else {
@@ -82,7 +82,7 @@ foreach ($line in $rawLines) {
         }
 
     } catch {
-        $errors += "$login (Логин не найден в AD)"
+        $errors += "$line (Логин '$login' не найден в AD)"
     }
 }
 
@@ -101,11 +101,9 @@ $firedListString
 $activeListString
 "@
 
-# Логируем тех, кого не удалось сопоставить
 if ($errors.Count -gt 0) {
     $reportMessage += "`r`n`r`nОШИБКИ ПОИСКА (несовпадение ФИО или отсутствие в AD):`r`n" + ($errors -join "`r`n")
 }
 
-# Сохраняем в файл
 Set-Content -Path $reportPath -Value $reportMessage -Encoding UTF8
 Write-Host "`nГотово! Отчет сохранен: $reportPath" -ForegroundColor Green
