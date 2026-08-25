@@ -1,2 +1,125 @@
-abb-win.akbars.ru/Головной офис/Серверы и ресурсы/ABCloud/Файловые серверы ABCloud/Department FS Access Groups/R: Departments
-OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru
+Смотри у меня есть txt файл логинов пользователей мне надо срочно сделать отчёт по ним кто из них сменил пароль и когда 
+отчёт вот такой 
+================ СТАТУС СМЕНЫ ПАРОЛЕЙ ================
+Дата формирования отчета: 17.08.2026 09:43:47
+Всего корректных логинов в исходном файле: 231
+
+ Сменили пароль: 191
+ ЕЩЕ НЕ сменили пароль: 40
+ Ошибки поиска в AD: 0
+
+======================================================
+СПИСОК ПОЛЬЗОВАТЕЛЕЙ, СМЕНИВШИХ ПАРОЛЬ:
+  - AbdullinMR — Абд Мар Рус (Изменен: 17.08.2026 07:40:26)
+
+txt файлн выглядит вот так:
+AbdullinMR
+AbubakirovaRI
+AbzalovaRF
+AfoninaIJU
+AjupovaNR
+akhiarovaa
+AkhmadievAF
+AkhmadullinISh
+AkhmetovaAR
+AndreevaDV
+
+код но с другим файлом выглядит вот так можешь его как образец взять 
+# ===================== НАСТРОЙКИ =====================
+$usersListPath = "C:\Users\z-BorodinES\Desktop\Polz4.txt"         # Путь к файлу со списком (формат: - Login — ФИО)
+$reportPath    = "C:\Users\z-BorodinES\Desktop\Otchet4.txt" # Путь для сохранения итогового отчета
+
+# ===================== ЗАГРУЗКА И ПАРСИНГ =====================
+# Читаем файл, отбрасываем пустые строки и строки, которые не похожи на список пользователей
+$rawLines = Get-Content -Path $usersListPath | Where-Object { $_.Trim() -ne "" -and $_ -match "-" }
+$totalChecked = 0
+
+Write-Host "Анализируем статусы паролей. В AD ничего не меняется..." -ForegroundColor Cyan
+
+# Массивы для сортировки пользователей
+$changedUsers = @()
+$notChangedUsers = @()
+$notFoundUsers = @()
+
+foreach ($line in $rawLines) {
+    # Регулярное выражение для извлечения логина из строки вида "  - BorodinES — Бородин Егор Сергеевич"
+    # Берем то, что находится между дефисом и длинным тире
+    if ($line -match '-\s*([^\s]+)\s*—') {
+        $login = $matches[1].Trim()
+        $totalChecked++
+        
+        try {
+            # Запрашиваем данные из AD (ТОЛЬКО ЧТЕНИЕ)
+            $user = Get-ADUser -Identity $login -Properties pwdLastSet, PasswordLastSet, DisplayName -ErrorAction Stop
+            
+            # Если pwdLastSet равен 0, значит пароль ЕЩЕ НЕ ИЗМЕНЕН (галочка всё ещё висит)
+            if ($user.pwdLastSet -eq 0) {
+                $notChangedUsers += [PSCustomObject]@{
+                    Login    = $login
+                    FullName = if ($user.DisplayName) { $user.DisplayName } else { "ФИО не указано" }
+                }
+                Write-Host "x $login - Пароль не изменен" -ForegroundColor Yellow
+            } 
+            # Если pwdLastSet больше 0, значит ПАРОЛЬ ИЗМЕНЕН
+            else {
+                $changedUsers += [PSCustomObject]@{
+                    Login       = $login
+                    FullName    = if ($user.DisplayName) { $user.DisplayName } else { "ФИО не указано" }
+                    ChangedDate = $user.PasswordLastSet.ToString("dd.MM.yyyy HH:mm:ss")
+                }
+                Write-Host ". $login - Пароль изменен ($($user.PasswordLastSet))" -ForegroundColor Green
+            }
+        } catch {
+            $notFoundUsers += $login
+            Write-Host "! Ошибка: $login не найден в AD" -ForegroundColor Red
+        }
+    }
+}
+
+# ===================== ФОРМИРОВАНИЕ ОТЧЕТА =====================
+$currentDate = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+$changedCount = $changedUsers.Count
+$notChangedCount = $notChangedUsers.Count
+$notFoundCount = $notFoundUsers.Count
+
+# Блок с теми, кто поменял пароль (с точным временем)
+$changedListString = if ($changedCount -gt 0) {
+    ($changedUsers | ForEach-Object { "  - $($_.Login) — $($_.FullName) (Изменен: $($_.ChangedDate))" }) -join "`r`n"
+} else {
+    "  (Нет пользователей, сменивших пароль)"
+}
+
+# Блок с теми, кто НЕ поменял
+$notChangedListString = if ($notChangedCount -gt 0) {
+    ($notChangedUsers | ForEach-Object { "  - $($_.Login) — $($_.FullName)" }) -join "`r`n"
+} else {
+    "  (Все пользователи сменили пароль!)"
+}
+
+$reportMessage = @"
+
+================ СТАТУС СМЕНЫ ПАРОЛЕЙ ================
+Дата формирования отчета: $currentDate
+Всего корректных логинов в исходном файле: $totalChecked
+
+ Сменили пароль: $changedCount
+ ЕЩЕ НЕ сменили пароль: $notChangedCount
+ Ошибки поиска в AD: $notFoundCount
+
+======================================================
+СПИСОК ПОЛЬЗОВАТЕЛЕЙ, СМЕНИВШИХ ПАРОЛЬ:
+$changedListString
+
+======================================================
+СПИСОК ПОЛЬЗОВАТЕЛЕЙ, КОТОРЫЕ ЕЩЕ НЕ СМЕНИЛИ ПАРОЛЬ:
+$notChangedListString
+======================================================
+"@
+
+# Вывод в консоль
+Write-Host "`nГотово! Формируем отчет..." -ForegroundColor Cyan
+Write-Host $reportMessage -ForegroundColor White
+
+# Запись в файл
+Set-Content -Path $reportPath -Value $reportMessage -Encoding UTF8
+Write-Host "`nОтчет успешно сохранен в файл: $reportPath" -ForegroundColor Green
