@@ -1,56 +1,174 @@
-cls
-Import-Module ActiveDirectory
+# ==============================================================================
+# НАСТРОЙКИ ПУТЕЙ
+# ==============================================================================
+$SourceExcelPath = "C:\Temp\SourceGroups.xlsx" # Путь к исходному файлу
+$TargetExcelPath = "C:\Temp\FoundGroups.xlsx"  # Путь для нового файла
 
-# === ВПИШИТЕ ИМЯ ГРУППЫ СЮДА ===
-$GroupName = "ИМЯ_ВАШЕЙ_ГРУППЫ"
-$OutputFile = "C:\Users\z-BorodinES\Desktop\Выгрузка_$GroupName.csv"
+# ==============================================================================
+# ФУНКЦИЯ ДЛЯ ПОИСКА В ШИРИНУ (С ЛИМИТАМИ И УСКОРЕНИЕМ .NET)
+# ==============================================================================
+function Get-FolderWithGroupBFS {
+    param (
+        [string]$BasePath,
+        [string]$GroupName,
+        [int]$MaxDepth = 5,           # Искать максимум на 5 уровней вглубь
+        [int]$TimeoutSeconds = 120    # Таймаут 2 минуты
+    )
 
-# Указываем свойства, которые нужно вытащить из AD
-$Properties = @(
-    "Name", 
-    "Enabled", 
-    "EmployeeID", 
-    "EmailAddress", 
-    "Title", 
-    "Division", 
-    "Department", 
-    "extensionAttribute1", 
-    "extensionAttribute2"
-)
+    $startTime = Get-Date
+    
+    $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
+    $queue.Enqueue([PSCustomObject]@{ Path = $BasePath; Depth = 0 })
 
-# Получаем состав группы, оставляем только пользователей (отсекаем вложенные группы) и собираем данные
-$data = Get-ADGroupMember -Identity $GroupName | 
-    Where-Object { $_.objectClass -eq 'user' } | 
-    Get-ADUser -Properties $Properties | 
-    Select-Object @{
-        Name = "ФИО"
-        Expression = { $_.Name }
-    }, @{
-        Name = "Статус (вкл/выкл)"
-        Expression = { if ($_.Enabled) { "Вкл" } else { "Выкл" } }
-    }, @{
-        Name = "ТН"
-        Expression = { $_.EmployeeID }
-    }, @{
-        Name = "Почта"
-        Expression = { $_.EmailAddress }
-    }, @{
-        Name = "Блок"
-        Expression = { $_.Division } # Если блок хранится в Department, поменяйте на $_.Department
-    }, @{
-        Name = "Должность"
-        Expression = { $_.Title }
-    }, @{
-        Name = "Ext Атрибут 1"
-        Expression = { $_.extensionAttribute1 }
-    }, @{
-        Name = "Ext Атрибут 2"
-        Expression = { $_.extensionAttribute2 }
+    while ($queue.Count -gt 0) {
+        if ((Get-Date) - $startTime -gt [timespan]::FromSeconds($TimeoutSeconds)) {
+            return "TIMEOUT" # Возвращаем спец-флаг при таймауте
+        }
+
+        $current = $queue.Dequeue()
+        $currentPath = $current.Path
+        $currentDepth = $current.Depth
+
+        try {
+            $acl = (Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop).GetAccessControl('Access')
+            
+            $hasGroup = $acl.Access | Where-Object { $_.IdentityReference.Value -match "\\$GroupName$" }
+
+            if ($hasGroup) {
+                return $currentPath # Группа найдена
+            }
+
+            if ($currentDepth -ge $MaxDepth) {
+                continue 
+            }
+
+            # Быстрое чтение подпапок
+            $subFolders = [System.IO.Directory]::EnumerateDirectories($currentPath)
+            foreach ($folder in $subFolders) {
+                $queue.Enqueue([PSCustomObject]@{ Path = $folder; Depth = $currentDepth + 1 })
+            }
+        }
+        catch {
+            # Пропускаем папки без доступа
+        }
     }
 
-# Выгружаем в CSV
-$data | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8 -Delimiter ";"
-Write-Host "Файл CSV сохранен: $OutputFile" -ForegroundColor Green
+    return $null # Не нашли
+}
 
-# Открываем файл
-Invoke-Item $OutputFile
+# ==============================================================================
+# ОСНОВНАЯ ЛОГИКА
+# ==============================================================================
+
+Write-Host "Запуск Excel..." -ForegroundColor Cyan
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+
+try {
+    Write-Host "Чтение исходного файла $SourceExcelPath..." -ForegroundColor Cyan
+    $wbSource = $excel.Workbooks.Open($SourceExcelPath)
+    $wsSource = $wbSource.Worksheets.Item(1)
+    $lastRow = $wsSource.Cells.SpecialCells(11).Row 
+
+    $results = @()
+
+    for ($i = 2; $i -le $lastRow; $i++) {
+        $groupName = $wsSource.Cells.Item($i, 1).Text
+        $rawObjectPath = $wsSource.Cells.Item($i, 4).Text
+
+        if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
+
+        Write-Host "Обработка группы [$i / $lastRow]: $groupName"
+
+        # --- Очистка и преобразование пути ---
+        $cleanPath = $rawObjectPath.Replace("/", "\")
+        $escapedGroup = [regex]::Escape($groupName)
+        $cleanPath = $cleanPath -replace "\\$escapedGroup\\?$", ""
+        
+        if ($cleanPath -match "^R:\\") {
+            $cleanPath = $cleanPath -replace "^R:\\", "\\abb-win.akbars.ru\departments\"
+        }
+        $cleanPath = $cleanPath.TrimEnd("\")
+
+        # --- Проверка пути и поиск ---
+        $status = ""
+        $details = ""
+
+        if (-not (Test-Path -LiteralPath $cleanPath -PathType Any)) {
+            $status = "Путь не корректен"
+            $details = "Путь не корректен(базовая папка не найдена: $cleanPath)"
+            Write-Host "  -> $status" -ForegroundColor Red
+        }
+        else {
+            Write-Host "  -> Базовый путь найден, ищу (макс 5 уровней, до 2 мин)..." -ForegroundColor Yellow
+            $foundLocation = Get-FolderWithGroupBFS -BasePath $cleanPath -GroupName $groupName
+
+            if ($foundLocation -eq "TIMEOUT") {
+                $status = "Группа не найдена"
+                $details = "Превышено время поиска (>120 сек). Требуется ручной поиск."
+                Write-Host "  -> Таймаут 2 минуты превышен" -ForegroundColor Magenta
+            }
+            elseif ($foundLocation) {
+                $status = "Найдено"
+                $details = $foundLocation
+                Write-Host "  -> НАЙДЕНО: $details" -ForegroundColor Green
+            }
+            else {
+                $status = "Группа не найдена"
+                $details = "Не найдено в пределах 5 уровней вложенности."
+                Write-Host "  -> Не найдено" -ForegroundColor DarkYellow
+            }
+        }
+
+        # Собираем данные для трех столбцов
+        $results += [PSCustomObject]@{
+            GroupName = $groupName
+            Status    = $status
+            Details   = $details
+        }
+    }
+
+    $wbSource.Close($false)
+
+    # --- Создание нового Excel файла ---
+    Write-Host "Создание нового файла $TargetExcelPath..." -ForegroundColor Cyan
+    $wbTarget = $excel.Workbooks.Add()
+    $wsTarget = $wbTarget.Worksheets.Item(1)
+
+    # Заголовки (3 столбца)
+    $wsTarget.Cells.Item(1, 1) = "Имя группы"
+    $wsTarget.Cells.Item(1, 2) = "Статус"
+    $wsTarget.Cells.Item(1, 3) = "Точное расположение / Описание"
+    
+    $wsTarget.Range("A1:C1").Font.Bold = $true
+
+    # Запись данных
+    $rowTarget = 2
+    foreach ($item in $results) {
+        $wsTarget.Cells.Item($rowTarget, 1) = $item.GroupName
+        $wsTarget.Cells.Item($rowTarget, 2) = $item.Status
+        $wsTarget.Cells.Item($rowTarget, 3) = $item.Details
+        $rowTarget++
+    }
+
+    # Автоподбор ширины для всех 3 столбцов
+    [void]$wsTarget.Columns.AutoFit()
+
+    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
+    $wbTarget.SaveAs($TargetExcelPath)
+    $wbTarget.Close($true)
+
+    Write-Host "Готово! Результат сохранен в: $TargetExcelPath" -ForegroundColor Green
+}
+catch {
+    Write-Error "Произошла ошибка: $_"
+}
+finally {
+    if ($excel) {
+        $excel.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
+}
