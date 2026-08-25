@@ -1,50 +1,45 @@
-# ===================== НАСТРОЙКИ =====================
-Import-Module ActiveDirectory
-
-$usersListPath = "C:\Users\z-BorodinES\Desktop\Polz.txt"      # Путь к текстовому файлу со списком (Логин — ФИО)
-$reportPath    = "C:\Users\z-BorodinES\Desktop\Otchet.txt"    # Куда сохранить итоговый отчет
-
-# Настройки подключения к БД
-$SqlServer = "p-knot-db01.abb-win.akbars.ru"
-$SqlDb     = "DWDATA_ODS"
-$SqlUser   = "syncad"
-$SqlPass   = "скрыл" # Замените на реальный пароль перед запуском
-
 # ===================== ЗАГРУЗКА ДАННЫХ ИЗ SQL БД =====================
-Write-Host "Подключение к базе данных SQL..." -ForegroundColor Cyan
+Write-Host "Подключение к базе данных SQL и загрузка ФИО..." -ForegroundColor Cyan
 
-$1cDict = @{}
+$dbDict = @{}
 $connectionString = "Server=$SqlServer;Database=$SqlDb;User ID=$SqlUser;Password=$SqlPass;"
-$query = "SELECT email, UvDate FROM v_Empl_info WHERE email IS NOT NULL"
+
+# Берем Фамилию, Имя, Отчество и дату увольнения. 
+$query = "SELECT LastName, FirstName, MiddleName, UvDate FROM v_Empl_info WHERE LastName IS NOT NULL"
 
 try {
-    # Открываем соединение и выполняем запрос
     $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
     $connection.Open()
 
     $command = New-Object System.Data.SqlClient.SqlCommand($query, $connection)
     $reader = $command.ExecuteReader()
 
-    # Считываем данные и формируем быстрый словарь
     while ($reader.Read()) {
-        $email = $reader["email"].ToString().Trim().ToLower()
+        $ln = $reader["LastName"].ToString().Trim()
+        $fn = $reader["FirstName"].ToString().Trim()
+        $mn = $reader["MiddleName"].ToString().Trim()
         $uvDate = $reader["UvDate"].ToString().Trim()
         
-        if (-not [string]::IsNullOrWhiteSpace($email)) {
-            $1cDict[$email] = $uvDate
+        # Склеиваем ФИО в одну строку (например: "Иванов Иван Иванович")
+        # И используем регулярку -replace '\s+', ' ', чтобы убрать двойные пробелы, если Отчества нет
+        $fullFio = "$ln $fn $mn".Trim() -replace '\s+', ' '
+        
+        if (-not [string]::IsNullOrWhiteSpace($fullFio)) {
+            # Сохраняем в словарь в нижнем регистре для точного сравнения
+            $dbDict[$fullFio.ToLower()] = $uvDate
         }
     }
     
     $reader.Close()
     $connection.Close()
-    Write-Host "Данные из БД успешно загружены!" -ForegroundColor Green
+    Write-Host "Данные из БД успешно загружены (Записей: $($dbDict.Count))!" -ForegroundColor Green
 } catch {
     Write-Host "Ошибка подключения или чтения БД: $($_.Exception.Message)" -ForegroundColor Red
-    exit # Прерываем скрипт, если база недоступна
+    exit
 }
 
 # ===================== АНАЛИЗ ПОЛЬЗОВАТЕЛЕЙ =====================
-Write-Host "Чтение файла пользователей и поиск в AD/БД..." -ForegroundColor Cyan
+Write-Host "Сверка пользователей AD с базой 1С по ФИО..." -ForegroundColor Cyan
 $rawLines = Get-Content -Path $usersListPath | Where-Object { $_.Trim() -ne "" }
 
 $firedUsers = @()
@@ -52,45 +47,42 @@ $activeUsers = @()
 $errors = @()
 
 foreach ($line in $rawLines) {
-    # Извлекаем логин и ФИО (разделитель — тире или дефис)
+    # Извлекаем логин (разделитель — тире или дефис)
     if ($line -match '^(.+?)\s*[-—]\s*(.+)$') {
         $login = $matches[1].Trim()
-        $fio   = $matches[2].Trim()
     } else {
         $login = $line.Trim()
-        $fio   = ""
     }
     
     try {
-        # 1. Запрашиваем email из AD по логину
-        $adUser = Get-ADUser -Identity $login -Properties mail -ErrorAction Stop
-        $email = $adUser.mail
+        # 1. Запрашиваем пользователя в AD (обязательно тянем DisplayName)
+        $adUser = Get-ADUser -Identity $login -Properties DisplayName -ErrorAction Stop
+        $adFio = $adUser.DisplayName
 
-        if ([string]::IsNullOrWhiteSpace($email)) {
-            $errors += "$login — $fio (В AD не указан Email)"
+        if ([string]::IsNullOrWhiteSpace($adFio)) {
+            $errors += "$login (В AD не заполнено поле DisplayName)"
             continue
         }
 
-        # 2. Ищем пользователя в словаре, загруженном из SQL
-        $searchEmail = $email.Trim().ToLower()
+        # 2. Ищем ФИО в словаре из 1С
+        # Приводим к нижнему регистру и убираем лишние пробелы
+        $searchFio = $adFio.Trim().ToLower() -replace '\s+', ' '
         
-        if ($1cDict.ContainsKey($searchEmail)) {
-            $uvDate = $1cDict[$searchEmail]
+        if ($dbDict.ContainsKey($searchFio)) {
+            $uvDate = $dbDict[$searchFio]
             
             # 3. Проверяем наличие даты увольнения (UvDate)
             if (-not [string]::IsNullOrWhiteSpace($uvDate)) {
-                # UvDate заполнен -> уволен
-                $firedUsers += "$login — $fio (с $uvDate)"
+                $firedUsers += "$login — $adFio (с $uvDate)"
             } else {
-                # UvDate пустой -> работает (не уволен)
-                $activeUsers += "$login — $fio"
+                $activeUsers += "$login — $adFio"
             }
         } else {
-            $errors += "$login — $fio (Email '$email' не найден в представлении v_Empl_info)"
+            $errors += "$login — $adFio (ФИО не найдено в базе 1С)"
         }
 
     } catch {
-        $errors += "$login — $fio (Логин не найден в AD)"
+        $errors += "$login (Логин не найден в AD)"
     }
 }
 
@@ -101,7 +93,6 @@ $activeCount = $activeUsers.Count
 $firedListString = if ($firedCount -gt 0) { $firedUsers -join "`r`n" } else { "Нет уволенных" }
 $activeListString = if ($activeCount -gt 0) { $activeUsers -join "`r`n" } else { "Нет неуволенных" }
 
-# Формируем текст строго по вашему шаблону
 $reportMessage = @"
 Уволенные($firedCount):
 $firedListString
@@ -110,9 +101,9 @@ $firedListString
 $activeListString
 "@
 
-# Добавляем блок с ошибками в конец файла (если кто-то не найден в AD или БД)
+# Логируем тех, кого не удалось сопоставить
 if ($errors.Count -gt 0) {
-    $reportMessage += "`r`n`r`nОШИБКИ ПОИСКА:`r`n" + ($errors -join "`r`n")
+    $reportMessage += "`r`n`r`nОШИБКИ ПОИСКА (несовпадение ФИО или отсутствие в AD):`r`n" + ($errors -join "`r`n")
 }
 
 # Сохраняем в файл
