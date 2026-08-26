@@ -1,57 +1,82 @@
-# ==============================================================================
-# ОБНОВЛЕННАЯ ФУНКЦИЯ (С ЛИМИТАМИ И УСКОРЕНИЕМ .NET)
-# ==============================================================================
-function Get-FolderWithGroupBFS {
-    param (
-        [string]$BasePath,
-        [string]$GroupName,
-        [int]$MaxDepth = 3,           # Искать максимум на 3 уровня вглубь
-        [int]$TimeoutSeconds = 45     # Скипать, если ищет дольше 45 секунд
-    )
+cls
+Write-Host "=== ТЕСТ СБОРА КЭША ЧЕРЕЗ ROBOCOPY ===" -ForegroundColor Cyan
 
-    $startTime = Get-Date
+# Тот самый проблемный путь
+$BasePath = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS"
+$DepthLimit = 5
+
+Write-Host "1. Проверяем доступ к корню..."
+if (-not (Test-Path -LiteralPath $BasePath -PathType Container)) {
+    Write-Host "[ОШИБКА] Базовый путь недоступен. Дальше идти бессмысленно." -ForegroundColor Red
+    return
+}
+Write-Host "[ОК] Корень доступен." -ForegroundColor Green
+
+# Генерируем путь к временному логу на рабочем столе, чтобы ты мог его открыть и посмотреть глазками
+$desktopPath = [Environment]::GetFolderPath("Desktop")
+$tempLog = Join-Path $desktopPath "RoboTest_$(Get-Date -Format 'HH-mm-ss').log"
+
+Write-Host "2. Запускаем Robocopy (глубина $DepthLimit)..."
+Write-Host "   (Это может занять от пары секунд до минуты. Ждем...)" -ForegroundColor Yellow
+
+$startTime = Get-Date
+
+# Ключи:
+# /L - только листинг
+# /E - все папки, включая пустые
+# /LEV:5 - до 5 уровня
+# /XJ - без символических ссылок
+# /NFL, /NC, /NS, /NJH, /NJT - без лишнего мусора в логе
+# /R:0 /W:0 - не ждать при ошибках доступа
+# /UNILOG - лог в Unicode (чтобы русские буквы не сломались)
+$roboArgs = @(
+    $BasePath, "NULL", 
+    "/L", "/E", "/LEV:$DepthLimit", "/XJ", 
+    "/NFL", "/NC", "/NS", "/NJH", "/NJT", "/R:0", "/W:0",
+    "/UNILOG:$tempLog"
+)
+
+# Запускаем, глушим вывод в консоль (всё идет в файл)
+& robocopy $roboArgs | Out-Null
+
+$endTime = Get-Date
+Write-Host "   Robocopy отработал за: $(($endTime - $startTime).TotalSeconds) секунд" -ForegroundColor Green
+
+Write-Host "3. Читаем и парсим лог..."
+$Cache = [System.Collections.Generic.List[string]]::new()
+
+if (Test-Path -LiteralPath $tempLog) {
+    # Читаем файл
+    $lines = Get-Content -LiteralPath $tempLog
     
-    # Очередь теперь хранит объекты (Путь и его Глубина)
-    $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
-    $queue.Enqueue([PSCustomObject]@{ Path = $BasePath; Depth = 0 })
-
-    while ($queue.Count -gt 0) {
-        # 1. Проверка таймаута
-        if ((Get-Date) - $startTime -gt [timespan]::FromSeconds($TimeoutSeconds)) {
-            Write-Host "  -> Превышен лимит времени ($TimeoutSeconds сек). Пропускаем." -ForegroundColor Magenta
-            return "Превышено время поиска (>$TimeoutSeconds сек). Требуется ручной поиск."
-        }
-
-        $current = $queue.Dequeue()
-        $currentPath = $current.Path
-        $currentDepth = $current.Depth
-
-        try {
-            # 2. Быстрое чтение ACL (запрашиваем только Access, без Owner/Audit)
-            $acl = (Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop).GetAccessControl('Access')
+    foreach ($line in $lines) {
+        # Ищем строку, которая похожа на путь (начинается с \\ или буквы диска)
+        if ($line -match '([a-zA-Z]:\\.*|\\\\.*)') {
+            $folderPath = $matches[1].TrimEnd('\').Trim()
             
-            $hasGroup = $acl.Access | Where-Object { $_.IdentityReference.Value -match "\\$GroupName$" }
-
-            if ($hasGroup) {
-                return $currentPath # Нашли!
-            }
-
-            # 3. Проверка глубины. Если достигли дна - не сканируем подпапки
-            if ($currentDepth -ge $MaxDepth) {
-                continue 
-            }
-
-            # 4. Ускоренное получение списка папок через .NET
-            $subFolders = [System.IO.Directory]::EnumerateDirectories($currentPath)
-            foreach ($folder in $subFolders) {
-                $queue.Enqueue([PSCustomObject]@{ Path = $folder; Depth = $currentDepth + 1 })
-            }
-        }
-        catch {
-            # Глушим ошибки доступа (Access Denied / слишком длинный путь)
+            # Добавляем в кэш без лишних проверок Test-Path (чтобы было быстрее)
+            $Cache.Add($folderPath)
         }
     }
-
-    # Если обошли всё дерево до MaxDepth и ничего не нашли
-    return $null
+} else {
+    Write-Host "[ОШИБКА] Файл лога не создался!" -ForegroundColor Red
 }
+
+Write-Host "4. РЕЗУЛЬТАТЫ:" -ForegroundColor Cyan
+Write-Host "Всего путей собрано: $($Cache.Count)" -ForegroundColor Yellow
+
+if ($Cache.Count -gt 0) {
+    Write-Host "Показываю первые 10 папок из кэша:"
+    for ($i = 0; $i -lt [math]::Min(10, $Cache.Count); $i++) {
+        Write-Host "  [$i] $($Cache[$i])"
+    }
+    
+    Write-Host "Показываю последние 5 папок из кэша:"
+    for ($i = [math]::Max(0, $Cache.Count - 5); $i -lt $Cache.Count; $i++) {
+        Write-Host "  [$i] $($Cache[$i])"
+    }
+} else {
+    Write-Host "[ПУСТО] Регулярка ничего не нашла в логе. Открой файл $tempLog на рабочем столе и посмотри, что там внутри!" -ForegroundColor Red
+}
+
+Write-Host "`nФайл лога остался на рабочем столе: $tempLog"
