@@ -2,19 +2,15 @@ cls
 # ==============================================================================
 # НАСТРОЙКИ ПУТЕЙ
 # ==============================================================================
-$SourceExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups.xlsx" # Исходный файл
-$TargetExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS.xlsx" # Куда сохранить результат
+$SourceExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups.xlsx"
+$TargetExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS.xlsx"
 
-# Целевой путь для поиска (можно указать R:\AppDS, но UNC надежнее)
 $AppDS_SearchBase = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS" 
 $MaxDepth = 5
 
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА С КЭШИРОВАНИЕМ ЧЕРЕЗ ROBOCOPY
+# ФУНКЦИЯ ПОИСКА: ROBOCOPY + BFS-СОРТИРОВКА + ЖИВОЙ СЧЕТЧИК
 # ==============================================================================
-# Эта переменная будет хранить все папки в памяти, чтобы не дергать диск 100 раз
-$global:RoboFolderCache = $null
-
 function Search-GroupInAppDS {
     param (
         [string]$BasePath,
@@ -22,59 +18,74 @@ function Search-GroupInAppDS {
         [int]$DepthLimit = 5
     )
 
-    # 1. Если кэш пуст - запускаем Robocopy и собираем структуру ОДИН РАЗ
+    # 1. Собираем структуру через Robocopy (ОДИН РАЗ)
     if ($null -eq $global:RoboFolderCache) {
-        Write-Host "  -> [КЭШ ПУСТ] Запуск Robocopy для быстрого сканирования $BasePath (глубина $DepthLimit)..." -ForegroundColor Magenta
+        Write-Host "  -> [КЭШ ПУСТ] Запуск Robocopy (до $DepthLimit уровней) для базового пути..." -ForegroundColor Magenta
         
-        # /L - только листинг (не копировать)
-        # /E - все подпапки (включая пустые)
-        # /LEV - лимит вложенности
-        # /XJ - без junction points (симлинков)
-        # /NFL, /NC, /NS, /NJH, /NJT - отключение мусора в выводе лога
-        # /NDL НЕ ПИШЕМ - иначе он скроет названия папок!
+        $tempLog = Join-Path $env:TEMP "robo_cache_$([guid]::NewGuid().Guid).log"
         $roboArgs = @(
             $BasePath, "NULL", 
             "/L", "/E", "/LEV:$DepthLimit", "/XJ", 
-            "/NFL", "/NC", "/NS", "/NJH", "/NJT", "/R:0", "/W:0"
+            "/NFL", "/NC", "/NS", "/NJH", "/NJT", "/R:0", "/W:0",
+            "/UNILOG:$tempLog" # Решает проблему с русскими буквами
         )
         
-        $output = & robocopy $roboArgs
-        $global:RoboFolderCache = [System.Collections.Generic.List[string]]::new()
+        & robocopy $roboArgs | Out-Null
         
-        # Парсим вывод и сохраняем чистые пути в список
-        foreach ($line in $output) {
-            $folderPath = $line.Trim()
-            
-            # Проверяем, что строка не пустая и это реально папка
-            if ($folderPath -and (Test-Path -LiteralPath $folderPath -PathType Container -ErrorAction SilentlyContinue)) {
-                $global:RoboFolderCache.Add($folderPath)
+        $tempList = [System.Collections.Generic.List[string]]::new()
+        
+        if (Test-Path -LiteralPath $tempLog) {
+            foreach ($line in (Get-Content -LiteralPath $tempLog)) {
+                if ($line -match '([a-zA-Z]:\\.*|\\\\.*)') {
+                    $folderPath = $matches[1].TrimEnd('\').Trim()
+                    if (Test-Path -LiteralPath $folderPath -PathType Container -ErrorAction SilentlyContinue) {
+                        $tempList.Add($folderPath)
+                    }
+                }
             }
+            Remove-Item -LiteralPath $tempLog -Force
         }
-        Write-Host "  -> [КЭШ СОЗДАН] Найдено папок для перебора: $($global:RoboFolderCache.Count)" -ForegroundColor Green
+        
+        Write-Host "  -> [СОРТИРОВКА] Выстраиваем пути по уровням (эмуляция BFS)..." -ForegroundColor Yellow
+        
+        # СОРТИРОВКА ПО ГЛУБИНЕ (от корня вглубь)
+        # Считаем количество слешей в пути. Чем их меньше - тем выше папка.
+        $global:RoboFolderCache = $tempList | Sort-Object { ($_ -split '\\').Count }
+        
+        Write-Host "  -> [КЭШ ГОТОВ] Папок в памяти: $($global:RoboFolderCache.Count)" -ForegroundColor Green
     }
 
-    # 2. Ищем группу в закэшированном списке папок
-    $escapedGroup = [regex]::Escape($GroupName)
+    # 2. Ищем группу в отсортированном кэше
+    $cleanGroup = $GroupName.Trim()
+    $totalFolders = $global:RoboFolderCache.Count
+    $checkedCount = 0
 
     foreach ($folder in $global:RoboFolderCache) {
+        $checkedCount++
+        
+        # Индикатор жизни, чтобы не казалось, что скрипт завис (каждые 500 папок)
+        if ($checkedCount % 500 -eq 0) {
+            Write-Host "     ... Проверено прав (Get-Acl): $checkedCount из $totalFolders" -ForegroundColor DarkGray
+        }
+
         try {
-            # Читаем ACL
             $acl = (Get-Acl -LiteralPath $folder -ErrorAction Stop).Access
             
-            # Ищем совпадение по IdentityReference
-            $hasGroup = $acl | Where-Object { $_.IdentityReference.Value -match "\\$escapedGroup$" }
-
-            if ($hasGroup) {
-                # Нашли! Возвращаем путь без лишнего слеша на конце
-                return $folder.TrimEnd('\')
+            foreach ($rule in $acl) {
+                # Отрезаем домен ABB-WIN\ и сравниваем чистое имя
+                $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
+                
+                if ($aclCleanName -eq $cleanGroup) {
+                    Write-Host "     -> Найдено на шаге $checkedCount!" -ForegroundColor Green
+                    return $folder
+                }
             }
         }
         catch {
-            # Игнорируем папки, к которым у скрипта нет доступа
+            # Папку нельзя прочитать - идем дальше
         }
     }
     
-    # Если обошли весь кэш и не нашли
     return $null 
 }
 
@@ -98,13 +109,12 @@ try {
     for ($i = 2; $i -le $lastRow; $i++) {
         $groupName = $wsSource.Cells.Item($i, 1).Text
         $status    = $wsSource.Cells.Item($i, 2).Text
-        $details   = $wsSource.Cells.Item($i, 3).Text # Точное расположение / Описание
+        $details   = $wsSource.Cells.Item($i, 3).Text 
 
         if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
 
         Write-Host "Обработка [$i / $lastRow]: $groupName"
 
-        # Проверяем, содержит ли текущий путь триггер "Users-APPsFileExchange"
         if ($details -match "Users-APPsFileExchange") {
             Write-Host "  -> Триггер 'Users-APPsFileExchange' найден. Ищем группу в AppDS..." -ForegroundColor Yellow
             
@@ -117,15 +127,13 @@ try {
             } else {
                 $status  = "Группа не найдена (AppDS)"
                 $details = "Не найдено в пределах $MaxDepth уровней в $AppDS_SearchBase"
-                Write-Host "  -> Не найдено" -ForegroundColor DarkYellow
+                Write-Host "  -> Не найдено (обошли все доступные папки)" -ForegroundColor DarkYellow
             }
         }
         else {
-            # Если это обычная группа, ничего не меняем, просто пишем в лог, что пропускаем
             Write-Host "  -> Обычная группа, переносим без изменений." -ForegroundColor Gray
         }
 
-        # Собираем строку для нового файла
         $results += [PSCustomObject]@{
             GroupName = $groupName
             Status    = $status
