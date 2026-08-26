@@ -1,66 +1,30 @@
 cls
-Write-Host "=== ТЕСТ СБОРА КЭША ЧЕРЕЗ ROBOCOPY (СУЩЕСТВУЮЩИЙ ФАЙЛ) ===" -ForegroundColor Cyan
+Write-Host "=== ТЕСТ ROBOCOPY (ПЕРЕХВАТ ВЫВОДА ЧЕРЕЗ POWERSHELL) ===" -ForegroundColor Cyan
 
 $BasePath = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS"
-$DepthLimit = 5
-
-# Жестко заданный путь к логу на рабочем столе
-$LogFile = "C:\Users\z-BorodinES\Desktop\robolog.txt"
-# Используем рабочий стол как фиктивную папку назначения (вместо NULL), чтобы избежать ошибок доступа
 $FakeDest = "C:\Users\z-BorodinES\Desktop"
+$LogFile  = "C:\Users\z-BorodinES\Desktop\robolog_raw.txt"
 
-Write-Host "1. Подготовка файла лога..."
-# Принудительно создаем ПУСТОЙ файл перед запуском
-New-Item -Path $LogFile -ItemType File -Force | Out-Null
-Write-Host "[ОК] Файл $LogFile гарантированно создан." -ForegroundColor Green
+Write-Host "1. Запуск Robocopy (без глушителей) и перехват текста в память..." -ForegroundColor Yellow
 
-Write-Host "2. Запускаем Robocopy (глубина $DepthLimit)..."
-Write-Host "   (Ждем отработки...)" -ForegroundColor Yellow
-$startTime = Get-Date
-
-# Ключ /UNILOG+: (с плюсом) заставляет писать в СУЩЕСТВУЮЩИЙ файл
 $roboArgs = @(
     $BasePath, $FakeDest, 
-    "/L", "/E", "/LEV:$DepthLimit", "/XJ", 
-    "/NFL", "/NC", "/NS", "/NJH", "/NJT", "/R:0", "/W:0",
-    "/UNILOG+:$LogFile"
+    "/L", "/E", "/LEV:2", "/XJ"
 )
 
-& robocopy $roboArgs | Out-Null
+# Вызываем robocopy и ВЕСЬ его вывод забираем в переменную $rawOutput
+$rawOutput = & robocopy $roboArgs
 
-$endTime = Get-Date
-Write-Host "   Robocopy отработал за: $(($endTime - $startTime).TotalSeconds) секунд" -ForegroundColor Green
+Write-Host "2. Robocopy отработал. Сохраняю текст в файл..." -ForegroundColor Yellow
 
-Write-Host "3. Проверка лога..."
-$Cache = [System.Collections.Generic.List[string]]::new()
+# PowerShell сам пишет файл в нормальной кодировке
+$rawOutput | Out-File -FilePath $LogFile -Encoding UTF8 -Force
 
 if (Test-Path -LiteralPath $LogFile) {
     $fileSize = (Get-Item $LogFile).Length
-    Write-Host "   Размер файла лога: $fileSize байт"
-    
-    if ($fileSize -gt 0) {
-        $lines = Get-Content -LiteralPath $LogFile
-        foreach ($line in $lines) {
-            if ($line -match '([a-zA-Z]:\\.*|\\\\.*)') {
-                $folderPath = $matches[1].TrimEnd('\').Trim()
-                $Cache.Add($folderPath)
-            }
-        }
-    } else {
-        Write-Host "[ОШИБКА] Файл лога остался ПУСТЫМ! Robocopy не смог ничего прочитать." -ForegroundColor Red
-    }
+    Write-Host "[ОК] Файл сохранен! Размер: $fileSize байт." -ForegroundColor Green
+    Write-Host "`nОткрой файл $LogFile на рабочем столе." -ForegroundColor Cyan
+    Write-Host "Там обязательно должна быть 'шапка' (заголовок Robocopy). Напиши мне, какие ошибки он там выдал или что вообще написал."
 } else {
-    Write-Host "[ОШИБКА] Файл лога пропал!" -ForegroundColor Red
+    Write-Host "[ОШИБКА] Даже PowerShell не смог создать файл лога. Проверь права на рабочий стол." -ForegroundColor Red
 }
-
-Write-Host "4. РЕЗУЛЬТАТЫ:" -ForegroundColor Cyan
-Write-Host "Всего путей собрано: $($Cache.Count)" -ForegroundColor Yellow
-
-if ($Cache.Count -gt 0) {
-    Write-Host "Показываю первые 10 папок из кэша:"
-    for ($i = 0; $i -lt [math]::Min(10, $Cache.Count); $i++) {
-        Write-Host "  [$i] $($Cache[$i])"
-    }
-} 
-
-Write-Host "`nФайл лога находится здесь: $LogFile"
