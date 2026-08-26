@@ -1,147 +1,10 @@
 cls
-# ==============================================================================
-# НАСТРОЙКИ ПУТЕЙ И ПАРАМЕТРОВ
-# ==============================================================================
-$SourceExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups.xlsx"
-$TargetExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS.xlsx"
-
-$AppDS_SearchBase = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS" 
-$MaxDepth = 5
-$FakeDest = "C:\Users\z-BorodinES\Desktop" 
+Import-Module ActiveDirectory
 
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА: ROBOCOPY КЭШ + МНОГОПОТОЧНЫЙ ПОИСК + ЛОГИКА ВЛОЖЕННОСТИ
+# НАСТРОЙКИ
 # ==============================================================================
-function Search-GroupInAppDS_Parallel {
-    param (
-        [string]$BasePath,
-        [string]$GroupName,
-        [int]$DepthLimit = 5
-    )
-
-    # 1. Заполняем глобальный кэш папок (ОДИН РАЗ)
-    if ($null -eq $global:RoboFolderCache) {
-        Write-Host "  -> [КЭШ ПУСТ] Сканирование $BasePath через Robocopy..." -ForegroundColor Magenta
-        
-        $roboArgs = @(
-            $BasePath, $FakeDest, 
-            "/L", "/E", "/LEV:$DepthLimit", "/XJ",
-            "/R:0", "/W:0"
-        )
-        
-        $rawOutput = & robocopy $roboArgs
-        $tempList = [System.Collections.Generic.List[string]]::new()
-        
-        foreach ($line in $rawOutput) {
-            if ($line -notmatch "File" -and $line -match '([a-zA-Z]:\\.*|\\\\.*)') {
-                $folderPath = $matches[1].TrimEnd('\').Trim()
-                if (-not $tempList.Contains($folderPath)) {
-                    $tempList.Add($folderPath)
-                }
-            }
-        }
-        
-        $global:RoboFolderCache = $tempList | Sort-Object { ($_ -split '\\').Count }
-        Write-Host "  -> [КЭШ ГОТОВ] Папок в памяти: $($global:RoboFolderCache.Count)" -ForegroundColor Green
-    }
-
-    $cleanGroup = $GroupName.Trim()
-    
-    # 2. МНОГОПОТОЧНЫЙ ПОИСК
-    $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 20)
-    $RunspacePool.Open()
-    
-    $Jobs = @()
-    $FoundPath = $null
-
-    # Код, который выполняется внутри каждого потока
-    $ScriptBlock = {
-        param($folder, $groupToFind)
-        
-        # --- ЛОГИКА ВЛОЖЕННЫХ ГРУПП ---
-        # Если ищем русскую подгруппу, готовим имя её английского родителя
-        $altGroup = $null
-        if ($groupToFind -match "(?i) - изменение$") {
-            $altGroup = $groupToFind -ireplace "(?i) - изменение$", " - write"
-        } elseif ($groupToFind -match "(?i) - чтение$") {
-            $altGroup = $groupToFind -ireplace "(?i) - чтение$", " - read"
-        }
-
-        try {
-            $acl = (Get-Acl -LiteralPath $folder -ErrorAction Stop).Access
-            
-            foreach ($rule in $acl) {
-                $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
-                
-                # Проверяем совпадение либо с оригинальным именем, либо с родительским (если оно есть)
-                if ($aclCleanName -eq $groupToFind -or ($null -ne $altGroup -and $aclCleanName -eq $altGroup)) {
-                    return $folder
-                }
-            }
-        }
-        catch { }
-        return $null
-    }
-
-    Write-Host "  -> Запуск параллельного поиска (20 потоков)..." -ForegroundColor Yellow
-
-    # Запускаем задачи
-    foreach ($folder in $global:RoboFolderCache) {
-        $PowerShell = [powershell]::Create()
-        $PowerShell.RunspacePool = $RunspacePool
-        [void]$PowerShell.AddScript($ScriptBlock)
-        [void]$PowerShell.AddArgument($folder)
-        [void]$PowerShell.AddArgument($cleanGroup)
-        
-        $Jobs += [PSCustomObject]@{
-            Pipe = $PowerShell
-            Result = $PowerShell.BeginInvoke()
-        }
-    }
-
-    # Ждем результатов
-    $completedCount = 0
-    while ($Jobs.Result.IsCompleted -contains $false) {
-        foreach ($job in $Jobs) {
-            if ($job.Result.IsCompleted -and $null -eq $job.Checked) {
-                $job.Checked = $true
-                $completedCount++
-                
-                $result = $job.Pipe.EndInvoke($job.Result)
-                
-                if ($result) {
-                    $FoundPath = $result
-                    break # Как только один поток нашел, прерываем цикл проверки
-                }
-            }
-        }
-
-        if ($FoundPath) { break }
-        
-        if ($completedCount % 500 -eq 0 -and $completedCount -gt 0) {
-            Write-Host "     ... Проверено: $completedCount из $($global:RoboFolderCache.Count)" -ForegroundColor DarkGray
-        }
-        
-        Start-Sleep -Milliseconds 50 
-    }
-
-    # Очистка потоков
-    foreach ($job in $Jobs) {
-        $job.Pipe.Dispose()
-    }
-    $RunspacePool.Close()
-    $RunspacePool.Dispose()
-
-    if ($FoundPath) {
-        Write-Host "     -> НАЙДЕНО!" -ForegroundColor Green
-    }
-    
-    return $FoundPath 
-}
-
-# ==============================================================================
-# ОСНОВНАЯ ЛОГИКА
-# ==============================================================================
+$ExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS.xlsx"
 
 Write-Host "Запуск Excel..." -ForegroundColor Cyan
 $excel = New-Object -ComObject Excel.Application
@@ -149,83 +12,61 @@ $excel.Visible = $false
 $excel.DisplayAlerts = $false
 
 try {
-    Write-Host "Чтение исходного файла $SourceExcelPath..." -ForegroundColor Cyan
-    $wbSource = $excel.Workbooks.Open($SourceExcelPath)
-    $wsSource = $wbSource.Worksheets.Item(1)
-    $lastRow = $wsSource.Cells.SpecialCells(11).Row 
+    Write-Host "Чтение файла $ExcelPath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($ExcelPath)
+    $ws = $wb.Worksheets.Item(1)
+    $lastRow = $ws.Cells.SpecialCells(11).Row 
 
-    $results = @()
+    Write-Host "Начинаем запись путей в Active Directory..." -ForegroundColor Yellow
 
     for ($i = 2; $i -le $lastRow; $i++) {
-        $groupName = $wsSource.Cells.Item($i, 1).Text
-        $status    = $wsSource.Cells.Item($i, 2).Text
-        $details   = $wsSource.Cells.Item($i, 3).Text 
+        $groupName = $ws.Cells.Item($i, 1).Text
+        $status    = $ws.Cells.Item($i, 2).Text
+        $details   = $ws.Cells.Item($i, 3).Text 
 
+        # Пропускаем пустые строки
         if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
 
-        Write-Host "Обработка [$i / $lastRow]: $groupName"
-
-        if ($details -match "Users-APPsFileExchange") {
-            Write-Host "  -> Ищем группу в AppDS..." -ForegroundColor Yellow
+        # Ищем внутри текста 3-й колонки UNC-путь (начинается с \\)
+        if ($details -match '(\\\\.*)') {
+            $cleanPath = $matches[1].Trim()
             
-            $foundAppDS = Search-GroupInAppDS_Parallel -BasePath $AppDS_SearchBase -GroupName $groupName -DepthLimit $MaxDepth
+            try {
+                # 1. Проверяем, существует ли группа в AD (используем Filter, чтобы избежать ошибок со спецсимволами)
+                $adGroup = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
 
-            if ($foundAppDS) {
-                $status  = "Найдено (AppDS)"
-                $details = $foundAppDS
-            } else {
-                $status  = "Группа не найдена (AppDS)"
-                $details = "Не найдено в пределах $MaxDepth уровней в $AppDS_SearchBase"
-                Write-Host "  -> Не найдено" -ForegroundColor DarkYellow
+                if ($null -ne $adGroup) {
+                    # 2. Обновляем атрибут info (Notes)
+                    # Если хочешь сначала просто посмотреть, как отработает скрипт, не меняя AD,
+                    # добавь -WhatIf в конец следующей команды:
+                    Set-ADGroup -Identity $adGroup -Replace @{info=$cleanPath}
+                    
+                    Write-Host "[$i / $lastRow] УСПЕХ: Группе $groupName записан путь $cleanPath" -ForegroundColor Green
+                } else {
+                    Write-Host "[$i / $lastRow] ОШИБКА: Группа $groupName не найдена в AD" -ForegroundColor Red
+                }
+            }
+            catch {
+                Write-Host "[$i / $lastRow] ОШИБКА ЗАПИСИ: Не удалось обновить $groupName ($($_.Exception.Message))" -ForegroundColor Red
             }
         }
         else {
-            Write-Host "  -> Обычная группа, переносим без изменений." -ForegroundColor Gray
-        }
-
-        $results += [PSCustomObject]@{
-            GroupName = $groupName
-            Status    = $status
-            Details   = $details
+            # Если в колонке "Точное расположение" нет пути (например, написано "Группа не найдена")
+            Write-Host "[$i / $lastRow] ПРОПУСК: $groupName (Нет корректного пути)" -ForegroundColor DarkGray
         }
     }
-
-    $wbSource.Close($false)
-
-    Write-Host "Создание нового файла $TargetExcelPath..." -ForegroundColor Cyan
-    $wbTarget = $excel.Workbooks.Add()
-    $wsTarget = $wbTarget.Worksheets.Item(1)
-
-    $wsTarget.Cells.Item(1, 1).Value2 = "Имя группы"
-    $wsTarget.Cells.Item(1, 2).Value2 = "Статус"
-    $wsTarget.Cells.Item(1, 3).Value2 = "Точное расположение / Описание"
-    
-    $wsTarget.Range("A1:C1").Font.Bold = $true
-
-    $rowTarget = 2
-    foreach ($item in $results) {
-        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.GroupName
-        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.Status
-        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.Details
-        $rowTarget++
-    }
-
-    [void]$wsTarget.Columns.AutoFit()
-
-    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
-    $wbTarget.SaveAs($TargetExcelPath)
-    $wbTarget.Close($true)
-
-    Write-Host "Готово! Результат сохранен в: $TargetExcelPath" -ForegroundColor Green
 }
 catch {
-    Write-Error "Произошла ошибка: $_"
+    Write-Error "Произошла глобальная ошибка: $_"
 }
 finally {
+    # Корректно закрываем Excel, чтобы он не завис в диспетчере задач
+    if ($wb) { $wb.Close($false) }
     if ($excel) {
         $excel.Quit()
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     }
+    Write-Host "Работа скрипта завершена." -ForegroundColor Cyan
 }
