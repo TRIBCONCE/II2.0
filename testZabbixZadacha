@@ -1,5 +1,5 @@
 # ==============================================================================
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ ПОИСКА С КЭШИРОВАНИЕМ
+# ФУНКЦИЯ ПОИСКА С КЭШИРОВАНИЕМ (С ИСПРАВЛЕННОЙ КОДИРОВКОЙ)
 # ==============================================================================
 function Search-GroupInAppDS {
     param (
@@ -12,26 +12,43 @@ function Search-GroupInAppDS {
     if ($null -eq $global:RoboFolderCache) {
         Write-Host "  -> [КЭШ ПУСТ] Запуск Robocopy для быстрого сканирования $BasePath (глубина $DepthLimit)..." -ForegroundColor Magenta
         
+        # Генерируем путь к временному файлу лога
+        $tempLog = Join-Path $env:TEMP "robo_cache_$([guid]::NewGuid().Guid).log"
+        
         $roboArgs = @(
             $BasePath, "NULL", 
             "/L", "/E", "/LEV:$DepthLimit", "/XJ", 
-            "/NFL", "/NC", "/NS", "/NJH", "/NJT", "/R:0", "/W:0"
+            "/NFL", "/NC", "/NS", "/NJH", "/NJT", "/R:0", "/W:0",
+            "/UNILOG:$tempLog" # Вывод в лог в кодировке Unicode (решает проблему русских букв!)
         )
         
-        $output = & robocopy $roboArgs
+        # Запускаем robocopy. Вывода в консоль не будет, всё уйдет в файл
+        & robocopy $roboArgs | Out-Null
+        
         $global:RoboFolderCache = [System.Collections.Generic.List[string]]::new()
         
-        foreach ($line in $output) {
-            # ИЗМЕНЕНИЕ 1: Регулярка ищет начало пути (буква диска:\ или \\) и забирает только его, отбрасывая счетчики Robocopy
-            if ($line -match '([a-zA-Z]:\\.*|\\\\.*)') {
-                $folderPath = $matches[1].Trim()
-                
-                if (Test-Path -LiteralPath $folderPath -PathType Container -ErrorAction SilentlyContinue) {
-                    $global:RoboFolderCache.Add($folderPath)
+        # Если лог создался, читаем из него папки
+        if (Test-Path -LiteralPath $tempLog) {
+            $lines = Get-Content -LiteralPath $tempLog
+            foreach ($line in $lines) {
+                # Ищем UNC-путь или букву диска в строке лога
+                if ($line -match '([a-zA-Z]:\\.*|\\\\.*)') {
+                    $folderPath = $matches[1].Trim()
+                    
+                    if (Test-Path -LiteralPath $folderPath -PathType Container -ErrorAction SilentlyContinue) {
+                        $global:RoboFolderCache.Add($folderPath)
+                    }
                 }
             }
+            # Удаляем временный файл за собой
+            Remove-Item -LiteralPath $tempLog -Force
         }
+        
         Write-Host "  -> [КЭШ СОЗДАН] Успешно загружено папок в память: $($global:RoboFolderCache.Count)" -ForegroundColor Green
+        
+        if ($global:RoboFolderCache.Count -eq 0) {
+            Write-Host "  -> [ВНИМАНИЕ] Кэш пуст! Проверь, существует ли базовый путь и есть ли к нему доступ." -ForegroundColor Red
+        }
     }
 
     # 2. Ищем группу в закэшированном списке папок
@@ -42,20 +59,16 @@ function Search-GroupInAppDS {
             $acl = (Get-Acl -LiteralPath $folder -ErrorAction Stop).Access
             
             foreach ($rule in $acl) {
-                # Получаем полное имя (например, ABB-WIN\ОФ Внутренний учет - write)
-                $aclFullRef = $rule.IdentityReference.Value
+                # Получаем имя без домена
+                $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
                 
-                # ИЗМЕНЕНИЕ 2: Просто разбиваем строку по слешу и берем последний элемент
-                $aclCleanName = $aclFullRef.Split('\')[-1].Trim()
-                
-                # Оператор -eq в PowerShell работает без учета регистра (case-insensitive)
                 if ($aclCleanName -eq $cleanGroup) {
                     return $folder.TrimEnd('\')
                 }
             }
         }
         catch {
-            # Пропускаем папки, к которым у скрипта нет доступа
+            # Пропускаем закрытые папки
         }
     }
     
