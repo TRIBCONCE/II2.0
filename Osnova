@@ -2,9 +2,10 @@ cls
 Import-Module ActiveDirectory
 
 # ==============================================================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ ПУТЕЙ
 # ==============================================================================
-$ExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS.xlsx"
+$SourceExcelPath = "C:\Users\z-BorodinES\Desktop\SourceGroups.xlsx" # Твой исходный файл
+$TargetExcelPath = "C:\Users\z-BorodinES\Desktop\Groups_From_Parents.xlsx" # Новый файл с результатами
 
 Write-Host "Запуск Excel..." -ForegroundColor Cyan
 $excel = New-Object -ComObject Excel.Application
@@ -12,61 +13,114 @@ $excel.Visible = $false
 $excel.DisplayAlerts = $false
 
 try {
-    Write-Host "Чтение файла $ExcelPath..." -ForegroundColor Cyan
-    $wb = $excel.Workbooks.Open($ExcelPath)
-    $ws = $wb.Worksheets.Item(1)
-    $lastRow = $ws.Cells.SpecialCells(11).Row 
+    Write-Host "Чтение исходного файла $SourceExcelPath..." -ForegroundColor Cyan
+    $wbSource = $excel.Workbooks.Open($SourceExcelPath)
+    $wsSource = $wbSource.Worksheets.Item(1)
+    $lastRow = $wsSource.Cells.SpecialCells(11).Row 
 
-    Write-Host "Начинаем запись путей в Active Directory..." -ForegroundColor Yellow
+    $results = @()
+
+    Write-Host "Поиск родительских групп в Active Directory..." -ForegroundColor Yellow
 
     for ($i = 2; $i -le $lastRow; $i++) {
-        $groupName = $ws.Cells.Item($i, 1).Text
-        $status    = $ws.Cells.Item($i, 2).Text
-        $details   = $ws.Cells.Item($i, 3).Text 
-
-        # Пропускаем пустые строки
+        $groupName = $wsSource.Cells.Item($i, 1).Text
+        
         if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
 
-        # Ищем внутри текста 3-й колонки UNC-путь (начинается с \\)
-        if ($details -match '(\\\\.*)') {
-            $cleanPath = $matches[1].Trim()
-            
-            try {
-                # 1. Проверяем, существует ли группа в AD (используем Filter, чтобы избежать ошибок со спецсимволами)
-                $adGroup = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+        $cleanGroupName = $groupName.Trim()
+        $parentName = $null
+        $status = ""
+        $details = ""
 
-                if ($null -ne $adGroup) {
-                    # 2. Обновляем атрибут info (Notes)
-                    # Если хочешь сначала просто посмотреть, как отработает скрипт, не меняя AD,
-                    # добавь -WhatIf в конец следующей команды:
-                    Set-ADGroup -Identity $adGroup -Replace @{info=$cleanPath}
-                    
-                    Write-Host "[$i / $lastRow] УСПЕХ: Группе $groupName записан путь $cleanPath" -ForegroundColor Green
-                } else {
-                    Write-Host "[$i / $lastRow] ОШИБКА: Группа $groupName не найдена в AD" -ForegroundColor Red
-                }
-            }
-            catch {
-                Write-Host "[$i / $lastRow] ОШИБКА ЗАПИСИ: Не удалось обновить $groupName ($($_.Exception.Message))" -ForegroundColor Red
-            }
+        # --- ЛОГИКА ВЫЧИСЛЕНИЯ ИМЕНИ РОДИТЕЛЬСКОЙ ГРУППЫ ---
+        if ($cleanGroupName -match "(?i) - изменение$") {
+            $parentName = $cleanGroupName -ireplace "(?i) - изменение$", " - write"
+        } elseif ($cleanGroupName -match "(?i) - чтение$") {
+            $parentName = $cleanGroupName -ireplace "(?i) - чтение$", " - read"
         }
-        else {
-            # Если в колонке "Точное расположение" нет пути (например, написано "Группа не найдена")
-            Write-Host "[$i / $lastRow] ПРОПУСК: $groupName (Нет корректного пути)" -ForegroundColor DarkGray
+
+        if ($parentName) {
+            # Если суффикс найден, ищем родительскую группу в AD
+            try {
+                # Запрашиваем группу и её свойство info (Notes)
+                $parentGroup = Get-ADGroup -Filter "Name -eq '$parentName'" -Properties info -ErrorAction Stop
+
+                if ($null -ne $parentGroup) {
+                    if ($null -ne $parentGroup.info -and -not [string]::IsNullOrWhiteSpace($parentGroup.info)) {
+                        # Путь в Notes найден! Очищаем его от возможных переносов строк
+                        $status = "Найдено через родительскую группу"
+                        $details = ($parentGroup.info -replace "[\r\n]", " ").Trim()
+                        Write-Host "[$i / $lastRow] УСПЕХ: $cleanGroupName -> Взято из $parentName" -ForegroundColor Green
+                    } else {
+                        $status = "Родительская группа найдена, но путь пуст"
+                        $details = "У группы $parentName поле Notes пустое"
+                        Write-Host "[$i / $lastRow] ПУСТО: У родителя $parentName нет пути" -ForegroundColor DarkYellow
+                    }
+                } else {
+                    $status = "Родительская группа не найдена"
+                    $details = "Группа $parentName не существует в AD"
+                    Write-Host "[$i / $lastRow] ОШИБКА: Родитель $parentName не найден" -ForegroundColor Red
+                }
+            } catch {
+                $status = "Ошибка при поиске в AD"
+                $details = $_.Exception.Message
+                Write-Host "[$i / $lastRow] ОШИБКА AD: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        } else {
+            # Если у группы нет суффикса "изменение" или "чтение"
+            $status = "Нет суффикса вложенности"
+            $details = "Группу нужно искать другими методами"
+            Write-Host "[$i / $lastRow] ПРОПУСК: $cleanGroupName (нет суффикса)" -ForegroundColor Gray
+        }
+
+        # Собираем данные для нового файла
+        $results += [PSCustomObject]@{
+            GroupName = $cleanGroupName
+            Status    = $status
+            Details   = $details
         }
     }
+
+    $wbSource.Close($false)
+
+    # --- Создание нового Excel файла ---
+    Write-Host "Создание нового файла $TargetExcelPath..." -ForegroundColor Cyan
+    $wbTarget = $excel.Workbooks.Add()
+    $wsTarget = $wbTarget.Worksheets.Item(1)
+
+    # Заголовки
+    $wsTarget.Cells.Item(1, 1).Value2 = "Имя группы"
+    $wsTarget.Cells.Item(1, 2).Value2 = "Статус"
+    $wsTarget.Cells.Item(1, 3).Value2 = "Точное расположение / Описание"
+    
+    $wsTarget.Range("A1:C1").Font.Bold = $true
+
+    # Запись данных
+    $rowTarget = 2
+    foreach ($item in $results) {
+        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.GroupName
+        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.Status
+        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.Details
+        $rowTarget++
+    }
+
+    # Автоподбор ширины столбцов
+    [void]$wsTarget.Columns.AutoFit()
+
+    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
+    $wbTarget.SaveAs($TargetExcelPath)
+    $wbTarget.Close($true)
+
+    Write-Host "Готово! Результат сохранен в: $TargetExcelPath" -ForegroundColor Green
 }
 catch {
-    Write-Error "Произошла глобальная ошибка: $_"
+    Write-Error "Произошла ошибка: $_"
 }
 finally {
-    # Корректно закрываем Excel, чтобы он не завис в диспетчере задач
-    if ($wb) { $wb.Close($false) }
-    if ($excel) {
+    if ($null -ne $excel) {
         $excel.Quit()
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     }
-    Write-Host "Работа скрипта завершена." -ForegroundColor Cyan
 }
