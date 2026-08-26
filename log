@@ -1,16 +1,17 @@
-PS C:\Users\z-BorodinES> (Get-Acl -Path "R:\AppDS\577-П\Отчеты брокера\Исходящие").Access | Format-Table IdentityReference, FileSystemRights, AccessControlType -AutoSize
-
-IdentityReference                                                   FileSystemRights AccessControlType
------------------                                                   ---------------- -----------------
-BUILTIN\Administrators                                                   FullControl             Allow
-BUILTIN\Administrators                                                   FullControl             Allow
-CREATOR OWNER                                                            FullControl             Allow
-BUILTIN\Users                                            ReadAndExecute, Synchronize             Allow
-BUILTIN\Users                                   CreateFiles, AppendData, Synchronize             Allow
-NT AUTHORITY\SYSTEM                                                      FullControl             Allow
-ABB-WIN\s-abbreports               DeleteSubdirectoriesAndFiles, Modify, Synchronize             Allow
-ABB-WIN\MjakotaAA                  DeleteSubdirectoriesAndFiles, Modify, Synchronize             Allow
-ABB-WIN\ОФ Внутренний учет - write                                       FullControl             Allow
-ABB-WIN\ОФ Внутренний учет - read                        ReadAndExecute, Synchronize             Allow
-
-Вот такой вывод а вот из названия группы ОФ Внутренний учет - write но она почему то не нашлась как и все остальные двай подумай что не так
+Обработка [2 / 368]: CardPerso - изменение
+  -> Триггер 'Users-APPsFileExchange' найден. Ищем группу в AppDS...
+  -> [КЭШ ПУСТ] Запуск Robocopy для быстрого сканирования \\abb-win.akbars.ru\departments\AppDS (глубина 5)...
+  -> [КЭШ СОЗДАН] Успешно загружено папок в память: 0
+  -> Не найдено
+Обработка [3 / 368]: CardPerso - чтение
+  -> Триггер 'Users-APPsFileExchange' найден. Ищем группу в AppDS...
+  -> Не найдено
+Обработка [4 / 368]: FisShare - изменение
+  -> Триггер 'Users-APPsFileExchange' найден. Ищем группу в AppDS...
+  -> Не найдено
+Обработка [5 / 368]: FisShare - чтение
+  -> Триггер 'Users-APPsFileExchange' найден. Ищем группу в AppDS...
+  -> Не найдено
+Обработка [6 / 368]: FSDPT fssp
+  -> Триггер 'Users-APPsFileExchange' найден. Ищем группу в AppDS...
+  -> Не найдено
