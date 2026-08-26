@@ -10,7 +10,7 @@ $MaxDepth = 5
 $FakeDest = "C:\Users\z-BorodinES\Desktop" 
 
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА: ROBOCOPY КЭШ + МНОГОПОТОЧНЫЙ ПОИСК
+# ФУНКЦИЯ ПОИСКА: ROBOCOPY КЭШ + МНОГОПОТОЧНЫЙ ПОИСК + ЛОГИКА ВЛОЖЕННОСТИ
 # ==============================================================================
 function Search-GroupInAppDS_Parallel {
     param (
@@ -41,7 +41,6 @@ function Search-GroupInAppDS_Parallel {
             }
         }
         
-        # Оставляем сортировку, чтобы шансы найти группу быстрее (ближе к корню) были выше
         $global:RoboFolderCache = $tempList | Sort-Object { ($_ -split '\\').Count }
         Write-Host "  -> [КЭШ ГОТОВ] Папок в памяти: $($global:RoboFolderCache.Count)" -ForegroundColor Green
     }
@@ -49,21 +48,33 @@ function Search-GroupInAppDS_Parallel {
     $cleanGroup = $GroupName.Trim()
     
     # 2. МНОГОПОТОЧНЫЙ ПОИСК
-    # Используем RunspacePool (быстрые потоки .NET) для распараллеливания Get-Acl
-    $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 20) # 20 потоков одновременно
+    $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 20)
     $RunspacePool.Open()
     
     $Jobs = @()
     $FoundPath = $null
 
-    # Код, который будет выполняться внутри каждого потока
+    # Код, который выполняется внутри каждого потока
     $ScriptBlock = {
         param($folder, $groupToFind)
+        
+        # --- ЛОГИКА ВЛОЖЕННЫХ ГРУПП ---
+        # Если ищем русскую подгруппу, готовим имя её английского родителя
+        $altGroup = $null
+        if ($groupToFind -match "(?i) - изменение$") {
+            $altGroup = $groupToFind -ireplace "(?i) - изменение$", " - write"
+        } elseif ($groupToFind -match "(?i) - чтение$") {
+            $altGroup = $groupToFind -ireplace "(?i) - чтение$", " - read"
+        }
+
         try {
             $acl = (Get-Acl -LiteralPath $folder -ErrorAction Stop).Access
+            
             foreach ($rule in $acl) {
                 $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
-                if ($aclCleanName -eq $groupToFind) {
+                
+                # Проверяем совпадение либо с оригинальным именем, либо с родительским (если оно есть)
+                if ($aclCleanName -eq $groupToFind -or ($null -ne $altGroup -and $aclCleanName -eq $altGroup)) {
                     return $folder
                 }
             }
@@ -91,7 +102,6 @@ function Search-GroupInAppDS_Parallel {
     # Ждем результатов
     $completedCount = 0
     while ($Jobs.Result.IsCompleted -contains $false) {
-        # Ищем, не нашел ли кто-то из потоков группу
         foreach ($job in $Jobs) {
             if ($job.Result.IsCompleted -and $null -eq $job.Checked) {
                 $job.Checked = $true
@@ -101,15 +111,13 @@ function Search-GroupInAppDS_Parallel {
                 
                 if ($result) {
                     $FoundPath = $result
-                    break
+                    break # Как только один поток нашел, прерываем цикл проверки
                 }
             }
         }
 
-        # Если нашли - выходим из цикла ожидания
         if ($FoundPath) { break }
         
-        # Индикатор прогресса
         if ($completedCount % 500 -eq 0 -and $completedCount -gt 0) {
             Write-Host "     ... Проверено: $completedCount из $($global:RoboFolderCache.Count)" -ForegroundColor DarkGray
         }
@@ -117,7 +125,7 @@ function Search-GroupInAppDS_Parallel {
         Start-Sleep -Milliseconds 50 
     }
 
-    # Очистка потоков (убиваем те, что еще работают, т.к. мы уже нашли ответ)
+    # Очистка потоков
     foreach ($job in $Jobs) {
         $job.Pipe.Dispose()
     }
@@ -184,7 +192,6 @@ try {
 
     $wbSource.Close($false)
 
-    # --- Создание нового Excel файла ---
     Write-Host "Создание нового файла $TargetExcelPath..." -ForegroundColor Cyan
     $wbTarget = $excel.Workbooks.Add()
     $wsTarget = $wbTarget.Worksheets.Item(1)
