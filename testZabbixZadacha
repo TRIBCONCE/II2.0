@@ -1,5 +1,5 @@
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА С КЭШИРОВАНИЕМ (С ИСПРАВЛЕННОЙ КОДИРОВКОЙ)
+# ФУНКЦИЯ ПОИСКА С КЭШИРОВАНИЕМ (ЧЕРЕЗ НАДЕЖНЫЙ .NET)
 # ==============================================================================
 function Search-GroupInAppDS {
     param (
@@ -8,47 +8,43 @@ function Search-GroupInAppDS {
         [int]$DepthLimit = 5
     )
 
-    # 1. Заполняем кэш, если он пуст
+    # 1. Заполняем кэш через .NET, если он пуст
     if ($null -eq $global:RoboFolderCache) {
-        Write-Host "  -> [КЭШ ПУСТ] Запуск Robocopy для быстрого сканирования $BasePath (глубина $DepthLimit)..." -ForegroundColor Magenta
-        
-        # Генерируем путь к временному файлу лога
-        $tempLog = Join-Path $env:TEMP "robo_cache_$([guid]::NewGuid().Guid).log"
-        
-        $roboArgs = @(
-            $BasePath, "NULL", 
-            "/L", "/E", "/LEV:$DepthLimit", "/XJ", 
-            "/NFL", "/NC", "/NS", "/NJH", "/NJT", "/R:0", "/W:0",
-            "/UNILOG:$tempLog" # Вывод в лог в кодировке Unicode (решает проблему русских букв!)
-        )
-        
-        # Запускаем robocopy. Вывода в консоль не будет, всё уйдет в файл
-        & robocopy $roboArgs | Out-Null
+        Write-Host "  -> [КЭШ ПУСТ] Быстрое сканирование $BasePath через .NET (глубина $DepthLimit)..." -ForegroundColor Magenta
         
         $global:RoboFolderCache = [System.Collections.Generic.List[string]]::new()
+        $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
         
-        # Если лог создался, читаем из него папки
-        if (Test-Path -LiteralPath $tempLog) {
-            $lines = Get-Content -LiteralPath $tempLog
-            foreach ($line in $lines) {
-                # Ищем UNC-путь или букву диска в строке лога
-                if ($line -match '([a-zA-Z]:\\.*|\\\\.*)') {
-                    $folderPath = $matches[1].Trim()
-                    
-                    if (Test-Path -LiteralPath $folderPath -PathType Container -ErrorAction SilentlyContinue) {
-                        $global:RoboFolderCache.Add($folderPath)
-                    }
+        # Проверяем доступность самого базового пути
+        if (Test-Path -LiteralPath $BasePath -PathType Container) {
+            $cleanBasePath = $BasePath.TrimEnd('\')
+            $global:RoboFolderCache.Add($cleanBasePath)
+            $queue.Enqueue([PSCustomObject]@{ Path = $cleanBasePath; Depth = 0 })
+        } else {
+            Write-Host "  -> [ОШИБКА] Базовый путь $BasePath не доступен!" -ForegroundColor Red
+            return $null
+        }
+
+        # Собираем дерево папок в ширину (BFS)
+        while ($queue.Count -gt 0) {
+            $current = $queue.Dequeue()
+            
+            # Если достигли лимита глубины - не лезем глубже
+            if ($current.Depth -ge $DepthLimit) { continue }
+
+            try {
+                $subFolders = [System.IO.Directory]::EnumerateDirectories($current.Path)
+                foreach ($folder in $subFolders) {
+                    $global:RoboFolderCache.Add($folder)
+                    $queue.Enqueue([PSCustomObject]@{ Path = $folder; Depth = $current.Depth + 1 })
                 }
             }
-            # Удаляем временный файл за собой
-            Remove-Item -LiteralPath $tempLog -Force
+            catch {
+                # Молча пропускаем папки (Access Denied)
+            }
         }
-        
+
         Write-Host "  -> [КЭШ СОЗДАН] Успешно загружено папок в память: $($global:RoboFolderCache.Count)" -ForegroundColor Green
-        
-        if ($global:RoboFolderCache.Count -eq 0) {
-            Write-Host "  -> [ВНИМАНИЕ] Кэш пуст! Проверь, существует ли базовый путь и есть ли к нему доступ." -ForegroundColor Red
-        }
     }
 
     # 2. Ищем группу в закэшированном списке папок
@@ -59,16 +55,17 @@ function Search-GroupInAppDS {
             $acl = (Get-Acl -LiteralPath $folder -ErrorAction Stop).Access
             
             foreach ($rule in $acl) {
-                # Получаем имя без домена
+                # Разбиваем IdentityReference по слешу (ABB-WIN\Имя_Группы) и берем только имя
                 $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
                 
+                # Точное сравнение без учета регистра
                 if ($aclCleanName -eq $cleanGroup) {
-                    return $folder.TrimEnd('\')
+                    return $folder
                 }
             }
         }
         catch {
-            # Пропускаем закрытые папки
+            # Пропускаем папки, на которых нет прав на чтение ACL
         }
     }
     
