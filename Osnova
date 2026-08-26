@@ -7,98 +7,128 @@ $TargetExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS.xlsx"
 
 $AppDS_SearchBase = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS" 
 $MaxDepth = 5
-
-# Фиктивный путь назначения для robocopy (нужен любой реально существующий путь, 
-# чтобы обмануть DLP систему, которая блокирует NULL)
 $FakeDest = "C:\Users\z-BorodinES\Desktop" 
 
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА: ПЕРЕХВАТ ROBOCOPY В ПАМЯТЬ + BFS-СОРТИРОВКА
+# ФУНКЦИЯ ПОИСКА: ROBOCOPY КЭШ + МНОГОПОТОЧНЫЙ ПОИСК
 # ==============================================================================
-function Search-GroupInAppDS {
+function Search-GroupInAppDS_Parallel {
     param (
         [string]$BasePath,
         [string]$GroupName,
         [int]$DepthLimit = 5
     )
 
-    # 1. Заполняем глобальный кэш папок (ОДИН РАЗ ЗА ВЕСЬ СКРИПТ)
+    # 1. Заполняем глобальный кэш папок (ОДИН РАЗ)
     if ($null -eq $global:RoboFolderCache) {
-        Write-Host "  -> [КЭШ ПУСТ] Сканирование $BasePath (глубина $DepthLimit) через Robocopy..." -ForegroundColor Magenta
+        Write-Host "  -> [КЭШ ПУСТ] Сканирование $BasePath через Robocopy..." -ForegroundColor Magenta
         
-        # Ключи для robocopy: только чтение, все папки, без симлинков, 
-        # БЕЗ глушителей (чтобы вывод точно попал в память), без пауз на ошибках.
         $roboArgs = @(
             $BasePath, $FakeDest, 
             "/L", "/E", "/LEV:$DepthLimit", "/XJ",
             "/R:0", "/W:0"
         )
         
-        Write-Host "  -> Ждем отработки Robocopy (может занять время)..." -ForegroundColor Yellow
-        $startTime = Get-Date
-        
-        # МАГИЯ ПЕРЕХВАТА: Весь консольный вывод robocopy летит в массив строк
         $rawOutput = & robocopy $roboArgs
-        
-        $endTime = Get-Date
-        Write-Host "  -> Robocopy завершен за $(($endTime - $startTime).TotalSeconds) секунд." -ForegroundColor Green
-        
-        # Парсим вывод
         $tempList = [System.Collections.Generic.List[string]]::new()
         
-        Write-Host "  -> Парсинг и фильтрация путей из памяти..." -ForegroundColor Yellow
         foreach ($line in $rawOutput) {
-            # Ищем маркеры папок в выводе robocopy (отбрасываем файлы - у них маркер *EXTRA File или New File)
-            # В выводе robocopy перед папками обычно стоит пробел, затем New Dir, EXTRA Dir или просто путь
             if ($line -notmatch "File" -and $line -match '([a-zA-Z]:\\.*|\\\\.*)') {
-                # Вырезаем сам путь и убираем лишние слеши/пробелы
                 $folderPath = $matches[1].TrimEnd('\').Trim()
-                
-                # Добавляем в список без Test-Path (для максимальной скорости)
                 if (-not $tempList.Contains($folderPath)) {
                     $tempList.Add($folderPath)
                 }
             }
         }
         
-        # СОРТИРОВКА BFS (По ширине/глубине): Считаем слеши. Чем меньше слешей, тем ближе папка к корню.
+        # Оставляем сортировку, чтобы шансы найти группу быстрее (ближе к корню) были выше
         $global:RoboFolderCache = $tempList | Sort-Object { ($_ -split '\\').Count }
-        
-        Write-Host "  -> [КЭШ ГОТОВ] Папок в памяти для перебора: $($global:RoboFolderCache.Count)" -ForegroundColor Green
+        Write-Host "  -> [КЭШ ГОТОВ] Папок в памяти: $($global:RoboFolderCache.Count)" -ForegroundColor Green
     }
 
-    # 2. Ищем группу в готовом кэше
     $cleanGroup = $GroupName.Trim()
-    $totalFolders = $global:RoboFolderCache.Count
-    $checkedCount = 0
+    
+    # 2. МНОГОПОТОЧНЫЙ ПОИСК
+    # Используем RunspacePool (быстрые потоки .NET) для распараллеливания Get-Acl
+    $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 20) # 20 потоков одновременно
+    $RunspacePool.Open()
+    
+    $Jobs = @()
+    $FoundPath = $null
 
-    foreach ($folder in $global:RoboFolderCache) {
-        $checkedCount++
-        
-        # Живой пульс в консоль каждые 500 папок
-        if ($checkedCount % 500 -eq 0) {
-            Write-Host "     ... Проверено ACL: $checkedCount из $totalFolders" -ForegroundColor DarkGray
-        }
-
+    # Код, который будет выполняться внутри каждого потока
+    $ScriptBlock = {
+        param($folder, $groupToFind)
         try {
             $acl = (Get-Acl -LiteralPath $folder -ErrorAction Stop).Access
-            
             foreach ($rule in $acl) {
-                # Берем правую часть имени (без домена ABB-WIN\)
                 $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
-                
-                if ($aclCleanName -eq $cleanGroup) {
-                    Write-Host "     -> НАЙДЕНО на глубине (шаг $checkedCount)!" -ForegroundColor Green
+                if ($aclCleanName -eq $groupToFind) {
                     return $folder
                 }
             }
         }
-        catch {
-            # Пропускаем папки, к которым у тебя нет прав доступа
+        catch { }
+        return $null
+    }
+
+    Write-Host "  -> Запуск параллельного поиска (20 потоков)..." -ForegroundColor Yellow
+
+    # Запускаем задачи
+    foreach ($folder in $global:RoboFolderCache) {
+        $PowerShell = [powershell]::Create()
+        $PowerShell.RunspacePool = $RunspacePool
+        [void]$PowerShell.AddScript($ScriptBlock)
+        [void]$PowerShell.AddArgument($folder)
+        [void]$PowerShell.AddArgument($cleanGroup)
+        
+        $Jobs += [PSCustomObject]@{
+            Pipe = $PowerShell
+            Result = $PowerShell.BeginInvoke()
         }
     }
+
+    # Ждем результатов
+    $completedCount = 0
+    while ($Jobs.Result.IsCompleted -contains $false) {
+        # Ищем, не нашел ли кто-то из потоков группу
+        foreach ($job in $Jobs) {
+            if ($job.Result.IsCompleted -and $null -eq $job.Checked) {
+                $job.Checked = $true
+                $completedCount++
+                
+                $result = $job.Pipe.EndInvoke($job.Result)
+                
+                if ($result) {
+                    $FoundPath = $result
+                    break
+                }
+            }
+        }
+
+        # Если нашли - выходим из цикла ожидания
+        if ($FoundPath) { break }
+        
+        # Индикатор прогресса
+        if ($completedCount % 500 -eq 0 -and $completedCount -gt 0) {
+            Write-Host "     ... Проверено: $completedCount из $($global:RoboFolderCache.Count)" -ForegroundColor DarkGray
+        }
+        
+        Start-Sleep -Milliseconds 50 
+    }
+
+    # Очистка потоков (убиваем те, что еще работают, т.к. мы уже нашли ответ)
+    foreach ($job in $Jobs) {
+        $job.Pipe.Dispose()
+    }
+    $RunspacePool.Close()
+    $RunspacePool.Dispose()
+
+    if ($FoundPath) {
+        Write-Host "     -> НАЙДЕНО!" -ForegroundColor Green
+    }
     
-    return $null 
+    return $FoundPath 
 }
 
 # ==============================================================================
@@ -128,9 +158,9 @@ try {
         Write-Host "Обработка [$i / $lastRow]: $groupName"
 
         if ($details -match "Users-APPsFileExchange") {
-            Write-Host "  -> Триггер 'Users-APPsFileExchange' найден. Ищем группу в AppDS..." -ForegroundColor Yellow
+            Write-Host "  -> Ищем группу в AppDS..." -ForegroundColor Yellow
             
-            $foundAppDS = Search-GroupInAppDS -BasePath $AppDS_SearchBase -GroupName $groupName -DepthLimit $MaxDepth
+            $foundAppDS = Search-GroupInAppDS_Parallel -BasePath $AppDS_SearchBase -GroupName $groupName -DepthLimit $MaxDepth
 
             if ($foundAppDS) {
                 $status  = "Найдено (AppDS)"
@@ -138,7 +168,7 @@ try {
             } else {
                 $status  = "Группа не найдена (AppDS)"
                 $details = "Не найдено в пределах $MaxDepth уровней в $AppDS_SearchBase"
-                Write-Host "  -> Не найдено (перебраны все папки кэша)" -ForegroundColor DarkYellow
+                Write-Host "  -> Не найдено" -ForegroundColor DarkYellow
             }
         }
         else {
