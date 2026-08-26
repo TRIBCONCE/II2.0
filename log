@@ -1,13 +1,16 @@
-# Запрос только тех, кто в отпуске на текущий день
-$qF = @"
-SELECT e.LastName, e.FirstName, e.MiddleName, e.Tab_Numb, f.StartDate, f.EndDate
-FROM IC.Furlough_WT f
-JOIN IC.Empl_WT_USPS e ON e.EmplID=f.EmplID
-WHERE e.UvDate IS NULL
-  AND f.StartDate <= CAST(GETDATE() AS date)
-  AND f.EndDate >= CAST(GETDATE() AS date)
-ORDER BY e.LastName
-"@
-$F = Invoke-Sql $qF 
+PS C:\Users\z-BorodinES> (Get-Acl -Path "R:\AppDS\577-П\Отчеты брокера\Исходящие").Access | Format-Table IdentityReference, FileSystemRights, AccessControlType -AutoSize
 
-Смотри можешь пж в этот скрипт добавить вот проверку у тех пользователей кто не уволен ещё наличие отпуска
+IdentityReference                                                   FileSystemRights AccessControlType
+-----------------                                                   ---------------- -----------------
+BUILTIN\Administrators                                                   FullControl             Allow
+BUILTIN\Administrators                                                   FullControl             Allow
+CREATOR OWNER                                                            FullControl             Allow
+BUILTIN\Users                                            ReadAndExecute, Synchronize             Allow
+BUILTIN\Users                                   CreateFiles, AppendData, Synchronize             Allow
+NT AUTHORITY\SYSTEM                                                      FullControl             Allow
+ABB-WIN\s-abbreports               DeleteSubdirectoriesAndFiles, Modify, Synchronize             Allow
+ABB-WIN\MjakotaAA                  DeleteSubdirectoriesAndFiles, Modify, Synchronize             Allow
+ABB-WIN\ОФ Внутренний учет - write                                       FullControl             Allow
+ABB-WIN\ОФ Внутренний учет - read                        ReadAndExecute, Synchronize             Allow
+
+Вот такой вывод а вот из названия группы ОФ Внутренний учет - write но она почему то не нашлась как и все остальные двай подумай что не так
