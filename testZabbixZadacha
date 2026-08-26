@@ -1,5 +1,5 @@
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА С КЭШИРОВАНИЕМ (ЧЕРЕЗ НАДЕЖНЫЙ .NET)
+# ФУНКЦИЯ ПОИСКА С КЭШИРОВАНИЕМ И ПОДРОБНЫМ ЛОГИРОВАНИЕМ
 # ==============================================================================
 function Search-GroupInAppDS {
     param (
@@ -8,24 +8,34 @@ function Search-GroupInAppDS {
         [int]$DepthLimit = 5
     )
 
+    # Путь для лога (сохранится на рабочем столе)
+    $LogFile = "C:\Users\z-BorodinES\Desktop\AppDS_Cache_Debug.txt"
+
     # 1. Заполняем кэш через .NET, если он пуст
     if ($null -eq $global:RoboFolderCache) {
-        Write-Host "  -> [КЭШ ПУСТ] Быстрое сканирование $BasePath через .NET (глубина $DepthLimit)..." -ForegroundColor Magenta
+        Write-Host "  -> [КЭШ ПУСТ] Начинаю сканирование $BasePath (глубина $DepthLimit)..." -ForegroundColor Magenta
+        
+        # Начинаем лог
+        "=== ЛОГ СКАНИРОВАНИЯ $BasePath ===" | Out-File -FilePath $LogFile -Force
         
         $global:RoboFolderCache = [System.Collections.Generic.List[string]]::new()
         $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
         
-        # Проверяем доступность самого базового пути
+        # Проверяем доступ к корню
         if (Test-Path -LiteralPath $BasePath -PathType Container) {
             $cleanBasePath = $BasePath.TrimEnd('\')
             $global:RoboFolderCache.Add($cleanBasePath)
             $queue.Enqueue([PSCustomObject]@{ Path = $cleanBasePath; Depth = 0 })
+            Add-Content -Path $LogFile -Value "[INFO] Базовый путь доступен: $cleanBasePath"
         } else {
-            Write-Host "  -> [ОШИБКА] Базовый путь $BasePath не доступен!" -ForegroundColor Red
+            Add-Content -Path $LogFile -Value "[FATAL] Базовый путь не доступен или не существует: $BasePath"
+            Write-Host "  -> [ОШИБКА] Базовый путь $BasePath не доступен! Смотри лог: $LogFile" -ForegroundColor Red
             return $null
         }
 
-        # Собираем дерево папок в ширину (BFS)
+        Write-Host "  -> Собираем папки... Следи за счетчиком:" -ForegroundColor Yellow
+
+        $errorCount = 0
         while ($queue.Count -gt 0) {
             $current = $queue.Dequeue()
             
@@ -37,14 +47,23 @@ function Search-GroupInAppDS {
                 foreach ($folder in $subFolders) {
                     $global:RoboFolderCache.Add($folder)
                     $queue.Enqueue([PSCustomObject]@{ Path = $folder; Depth = $current.Depth + 1 })
+                    
+                    # Живой пульс: выводим сообщение каждую 1000 папок
+                    if ($global:RoboFolderCache.Count % 1000 -eq 0) {
+                        Write-Host "     ... В кэш добавлено папок: $($global:RoboFolderCache.Count)" -ForegroundColor Cyan
+                    }
                 }
             }
             catch {
-                # Молча пропускаем папки (Access Denied)
+                $errorCount++
+                $errMsg = $_.Exception.Message
+                # Пишем ошибку в лог, чтобы понять причину
+                Add-Content -Path $LogFile -Value "[ОШИБКА ДОСТУПА] Путь: $($current.Path) | Ошибка: $errMsg"
             }
         }
 
-        Write-Host "  -> [КЭШ СОЗДАН] Успешно загружено папок в память: $($global:RoboFolderCache.Count)" -ForegroundColor Green
+        Write-Host "  -> [КЭШ СОЗДАН] Загружено: $($global:RoboFolderCache.Count) папок. Ошибок доступа: $errorCount." -ForegroundColor Green
+        Write-Host "  -> Лог формирования кэша сохранен в: $LogFile" -ForegroundColor DarkGray
     }
 
     # 2. Ищем группу в закэшированном списке папок
@@ -55,18 +74,13 @@ function Search-GroupInAppDS {
             $acl = (Get-Acl -LiteralPath $folder -ErrorAction Stop).Access
             
             foreach ($rule in $acl) {
-                # Разбиваем IdentityReference по слешу (ABB-WIN\Имя_Группы) и берем только имя
                 $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
-                
-                # Точное сравнение без учета регистра
                 if ($aclCleanName -eq $cleanGroup) {
                     return $folder
                 }
             }
         }
-        catch {
-            # Пропускаем папки, на которых нет прав на чтение ACL
-        }
+        catch { }
     }
     
     return $null 
