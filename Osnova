@@ -5,23 +5,25 @@ cls
 $SourceExcelPath = "C:\Users\z-BorodinES\Desktop\SourceGroups.xlsx" 
 $TargetExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS_NewLogic.xlsx"
 
-# UNC-путь к AppDS (надежнее, чем сетевой диск R:)
-$AppDSRoot = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS"
-$MaxDepth = 5
+$AppDSRoot       = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS"
+$MaxDepth        = 5
+$TimeoutSeconds  = 30 # Лимит времени на одну группу (в секундах)
 
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА В ШИРИНУ (BFS) + ЛОГИКА ВЛОЖЕННЫХ ГРУПП
+# ФУНКЦИЯ ПОИСКА В ШИРИНУ (BFS) + ТАЙМАУТ 30 СЕК + ВЛОЖЕННЫЕ ГРУППЫ
 # ==============================================================================
 function Get-FolderWithGroupBFS {
     param (
         [string]$BasePath,
         [string]$GroupName,
         [string]$AltGroupName,
-        [int]$DepthLimit = 5
+        [int]$DepthLimit = 5,
+        [int]$TimeoutSec = 30
     )
 
     if (-not (Test-Path -LiteralPath $BasePath -PathType Container)) { return $null }
 
+    $startTime = Get-Date
     $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
     $queue.Enqueue([PSCustomObject]@{ Path = $BasePath.TrimEnd('\'); Depth = 0 })
 
@@ -29,14 +31,17 @@ function Get-FolderWithGroupBFS {
     $cleanAltGroup = if ($AltGroupName) { $AltGroupName.Trim() } else { $null }
 
     while ($queue.Count -gt 0) {
+        # ПРОВЕРКА ТАЙМАУТА
+        if ((Get-Date) - $startTime -gt [timespan]::FromSeconds($TimeoutSec)) {
+            return "TIMEOUT"
+        }
+
         $current = $queue.Dequeue()
         
         try {
-            # Читаем права
-            $acl = (Get-Acl -LiteralPath $current.Path -ErrorAction Stop).Access
+            $acl = (Get-Item -LiteralPath $current.Path -Force -ErrorAction Stop).GetAccessControl('Access')
             
-            # Проверяем наличие группы или её родителя (если это "изменение/чтение")
-            foreach ($rule in $acl) {
+            foreach ($rule in $acl.Access) {
                 $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
                 
                 if ($aclCleanName -eq $cleanGroup -or ($null -ne $cleanAltGroup -and $aclCleanName -eq $cleanAltGroup)) {
@@ -44,7 +49,6 @@ function Get-FolderWithGroupBFS {
                 }
             }
 
-            # Идем вглубь, если не достигли лимита
             if ($current.Depth -ge $DepthLimit) { continue }
 
             $subFolders = [System.IO.Directory]::EnumerateDirectories($current.Path)
@@ -75,7 +79,6 @@ function Find-FuzzyFolder {
         foreach ($folder in $subFolders) {
             $folderName = ($folder -split '\\')[-1]
             
-            # Если искомое слово есть в названии папки (или наоборот)
             if ($folderName -match [regex]::Escape($TargetFolderName) -or $TargetFolderName -match [regex]::Escape($folderName)) {
                 return $folder
             }
@@ -104,7 +107,7 @@ try {
 
     for ($i = 2; $i -le $lastRow; $i++) {
         $groupName = $wsSource.Cells.Item($i, 1).Text
-        $rawObjectPath = $wsSource.Cells.Item($i, 4).Text # Путь из Object
+        $rawObjectPath = $wsSource.Cells.Item($i, 4).Text 
 
         if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
 
@@ -121,35 +124,26 @@ try {
         # --- 2. ПАРСИНГ И ПОДГОТОВКА ПУТИ ---
         $cleanPath = $rawObjectPath.Replace("/", "\")
         $escapedGroup = [regex]::Escape($groupName)
-        
-        # Отбрасываем имя группы из пути
         $cleanPath = $cleanPath -replace "\\$escapedGroup\\?$", ""
 
         $status = ""
         $details = ""
 
-        # Проверяем, есть ли триггер Users-APPsFileExchange
         if ($cleanPath -match 'Users-APPsFileExchange\\?(.*)') {
-            $relativePath = $matches[1] # Всё, что идет ПОСЛЕ Users-APPsFileExchange
-            
-            # Строим предполагаемый прямой путь в AppDS
-            $primaryPath = Join-Path $AppDSRoot $relativePath
-            $primaryPath = $primaryPath.TrimEnd('\')
+            $relativePath = $matches[1]
+            $primaryPath = (Join-Path $AppDSRoot $relativePath).TrimEnd('\')
 
             $searchBasePath = $null
             $searchType = ""
 
             if (Test-Path -LiteralPath $primaryPath -PathType Container) {
-                # Путь существует точь-в-точь
                 $searchBasePath = $primaryPath
                 $searchType = "Прямой путь"
-                Write-Host "  -> Прямой путь существует: $primaryPath" -ForegroundColor Yellow
+                Write-Host "  -> Прямой путь: $primaryPath" -ForegroundColor Yellow
             } 
             else {
-                # Путь не существует, берем главную папку (например, SWIFT)
                 $firstFolder = ($relativePath -split '\\')[0]
-                
-                Write-Host "  -> Прямой путь не найден. Ищем приблизительно папку '$firstFolder'..." -ForegroundColor Magenta
+                Write-Host "  -> Прямой путь не найден. Ищем папку '$firstFolder'..." -ForegroundColor Magenta
                 $fuzzyPath = Find-FuzzyFolder -RootPath $AppDSRoot -TargetFolderName $firstFolder
                 
                 if ($fuzzyPath) {
@@ -163,28 +157,32 @@ try {
                 }
             }
 
-            # --- 3. ЗАПУСК ПОИСКА В ШИРИНУ ---
+            # --- 3. ЗАПУСК BFS ПОИСКА С ТАЙМАУТОМ ---
             if ($searchBasePath) {
-                $foundLocation = Get-FolderWithGroupBFS -BasePath $searchBasePath -GroupName $groupName -AltGroupName $altGroupName -DepthLimit $MaxDepth
+                $foundLocation = Get-FolderWithGroupBFS -BasePath $searchBasePath -GroupName $groupName -AltGroupName $altGroupName -DepthLimit $MaxDepth -TimeoutSec $TimeoutSeconds
                 
-                if ($foundLocation) {
+                if ($foundLocation -eq "TIMEOUT") {
+                    $status = "Группа не найдена"
+                    $details = "Превышено время поиска (>$TimeoutSeconds сек). Требуется ручной поиск."
+                    Write-Host "  -> Таймаут $TimeoutSeconds сек превышен! Пропускаем." -ForegroundColor Magenta
+                }
+                elseif ($foundLocation) {
                     $status = "Найдено ($searchType)"
                     $details = $foundLocation
                     Write-Host "  -> НАЙДЕНО: $details" -ForegroundColor Green
                 } else {
                     $status = "Группа не найдена"
                     $details = "Не найдено (до $MaxDepth уровней) в $searchBasePath"
-                    Write-Host "  -> Обошли 5 уровней, группа не найдена." -ForegroundColor DarkYellow
+                    Write-Host "  -> Обошли все уровни, группа не найдена." -ForegroundColor DarkYellow
                 }
             }
         }
         else {
             $status = "Пропущено"
             $details = "В пути Object нет 'Users-APPsFileExchange'"
-            Write-Host "  -> Нет триггера Users-APPsFileExchange, пропускаем." -ForegroundColor Gray
+            Write-Host "  -> Пропуск (нет триггера)." -ForegroundColor Gray
         }
 
-        # Собираем данные
         $results += [PSCustomObject]@{
             GroupName = $groupName
             Status    = $status
