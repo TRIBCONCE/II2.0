@@ -1,152 +1,234 @@
 cls
-Import-Module ActiveDirectory
+# ==============================================================================
+# НАСТРОЙКИ ПУТЕЙ И ПАРАМЕТРОВ
+# ==============================================================================
+$SourceExcelPath = "C:\Users\z-BorodinES\Desktop\SourceGroups.xlsx" 
+$TargetExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS_NewLogic.xlsx"
 
-$OutputFile = "C:\Users\z-BorodinES\Desktop\Отчёт_по_группам_AD3.xlsx"
+# UNC-путь к AppDS (надежнее, чем сетевой диск R:)
+$AppDSRoot = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS"
+$MaxDepth = 5
 
-# Точный путь, скопированный из атрибутов AD
-$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+# ==============================================================================
+# ФУНКЦИЯ ПОИСКА В ШИРИНУ (BFS) + ЛОГИКА ВЛОЖЕННЫХ ГРУПП
+# ==============================================================================
+function Get-FolderWithGroupBFS {
+    param (
+        [string]$BasePath,
+        [string]$GroupName,
+        [string]$AltGroupName,
+        [int]$DepthLimit = 5
+    )
 
-Write-Host "Получение списка групп из конкретной OU..." -ForegroundColor Cyan
+    if (-not (Test-Path -LiteralPath $BasePath -PathType Container)) { return $null }
 
-# Берем ВСЕ группы из указанной OU, запрашиваем info (Notes) и CanonicalName (Object)
-$groups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties info, CanonicalName
+    $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
+    $queue.Enqueue([PSCustomObject]@{ Path = $BasePath.TrimEnd('\'); Depth = 0 })
 
-Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей и прав доступа..." -ForegroundColor Cyan
+    $cleanGroup = $GroupName.Trim()
+    $cleanAltGroup = if ($AltGroupName) { $AltGroupName.Trim() } else { $null }
 
-$ResultData = @()
-
-foreach ($group in $groups) {
-    $groupName = $group.Name
-    $objectPath = $group.CanonicalName
-    
-    # Очищаем путь от переносов строк и обычных пробелов
-    if ($null -ne $group.info) {
-        $folderPath = $group.info -replace "[\r\n]", " "
-        $folderPath = $folderPath.Trim()
-    } else {
-        $folderPath = ""
-    }
-
-    if ([string]::IsNullOrWhiteSpace($folderPath)) {
-        $status = "Путь не указан"
-    } 
-    else {
-        $workingPath = ""
-        $hasHiddenChar = $false
-
-        # Ищем начало UNC-пути \\ и забираем всё до конца строки
-        if ($folderPath -match '(\\\\.*)') {
-            $cleanUNC = $matches[1]
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        
+        try {
+            # Читаем права
+            $acl = (Get-Acl -LiteralPath $current.Path -ErrorAction Stop).Access
             
-            # Если оригинальная строка отличается от чистого пути (есть скрытые спецсимволы в начале)
-            if ($folderPath -ne $cleanUNC) {
-                $hasHiddenChar = $true
+            # Проверяем наличие группы или её родителя (если это "изменение/чтение")
+            foreach ($rule in $acl) {
+                $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
+                
+                if ($aclCleanName -eq $cleanGroup -or ($null -ne $cleanAltGroup -and $aclCleanName -eq $cleanAltGroup)) {
+                    return $current.Path
+                }
             }
-            
-            # Проверяем доступность папки по чистому пути
-            if (Test-Path -LiteralPath $cleanUNC -ErrorAction SilentlyContinue) {
-                $workingPath = $cleanUNC
-            } else {
-                $status = "Не существует"
+
+            # Идем вглубь, если не достигли лимита
+            if ($current.Depth -ge $DepthLimit) { continue }
+
+            $subFolders = [System.IO.Directory]::EnumerateDirectories($current.Path)
+            foreach ($folder in $subFolders) {
+                $queue.Enqueue([PSCustomObject]@{ Path = $folder; Depth = $current.Depth + 1 })
             }
-        } 
-        else {
-            # Если в строке вообще нет \\
-            $status = "Некорректный формат пути"
         }
-
-        # Если путь существует, проверяем, назначена ли на него группа
-        if ($workingPath -ne "") {
-            try {
-                # Быстро читаем ACL папки
-                $acl = (Get-Item -LiteralPath $workingPath -Force -ErrorAction Stop).GetAccessControl('Access')
-                
-                # --- ЛОГИКА ДЛЯ ВЛОЖЕННЫХ ГРУПП ---
-                # Формируем имя родительской группы (если применимо)
-                $altGroupName = $null
-                if ($groupName -match "(?i) - изменение$") {
-                    $altGroupName = $groupName -ireplace "(?i) - изменение$", " - write"
-                } elseif ($groupName -match "(?i) - чтение$") {
-                    $altGroupName = $groupName -ireplace "(?i) - чтение$", " - read"
-                }
-
-                # Экранируем имена для регулярного выражения
-                $escapedGroup = [regex]::Escape($groupName)
-                
-                # Ищем в ACL либо саму группу, либо её английского родителя
-                $hasGroup = $acl.Access | Where-Object { 
-                    $ruleName = $_.IdentityReference.Value
-                    ($ruleName -match "\\$escapedGroup$") -or ($null -ne $altGroupName -and $ruleName -match "\\$([regex]::Escape($altGroupName))$")
-                }
-
-                if ($hasGroup) {
-                    $status = if ($hasHiddenChar) { "Путь существует необходимо убрать символ в начале" } else { "Существует" }
-                } else {
-                    $status = if ($hasHiddenChar) { "Путь существует (надо убрать символ), но группа не соответствует пути" } else { "Путь существует но группа не соответствует пути" }
-                }
-            } 
-            catch {
-                # Если у тебя (от чьего имени запущен скрипт) нет прав на чтение свойств безопасности этой папки
-                $status = if ($hasHiddenChar) { "Путь существует (надо убрать символ), но нет доступа для проверки прав" } else { "Путь существует, но нет доступа для проверки прав" }
-            }
-            
-            # Перезаписываем путь для Excel, чтобы туда попала чистая рабочая версия (без скрытых символов)
-            $folderPath = $workingPath
+        catch {
+            # Пропуск папок без доступа
         }
     }
-
-    $ResultData += [PSCustomObject]@{
-        GroupName  = $groupName
-        Path       = $folderPath
-        Status     = $status
-        ObjectPath = $objectPath
-    }
+    return $null
 }
 
-if ($groups.Count -gt 0) {
-    Write-Host "Запись данных в Excel..." -ForegroundColor Cyan
-
-    $excel = New-Object -ComObject Excel.Application
-    $excel.Visible = $false
-    $excel.DisplayAlerts = $false
-
+# ==============================================================================
+# ФУНКЦИЯ ПРИБЛИЗИТЕЛЬНОГО ПОИСКА ПАПКИ В КОРНЕ
+# ==============================================================================
+function Find-FuzzyFolder {
+    param (
+        [string]$RootPath,
+        [string]$TargetFolderName
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($TargetFolderName)) { return $null }
+    
     try {
-        $workbook = $excel.Workbooks.Add()
-        $worksheet = $workbook.Sheets.Item(1)
+        $subFolders = [System.IO.Directory]::EnumerateDirectories($RootPath)
+        foreach ($folder in $subFolders) {
+            $folderName = ($folder -split '\\')[-1]
+            
+            # Если искомое слово есть в названии папки (или наоборот)
+            if ($folderName -match [regex]::Escape($TargetFolderName) -or $TargetFolderName -match [regex]::Escape($folderName)) {
+                return $folder
+            }
+        }
+    } catch {}
+    
+    return $null
+}
 
-        $worksheet.Cells.Item(1, 1).Value2 = "Имя группы"
-        $worksheet.Cells.Item(1, 2).Value2 = "Путь (из Notes)"
-        $worksheet.Cells.Item(1, 3).Value2 = "Статус пути"
-        $worksheet.Cells.Item(1, 4).Value2 = "Путь из Object"
+# ==============================================================================
+# ОСНОВНАЯ ЛОГИКА
+# ==============================================================================
 
-        $worksheet.Rows.Item(1).Font.Bold = $true
+Write-Host "Запуск Excel..." -ForegroundColor Cyan
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
 
-        $row = 2
-        foreach ($item in $ResultData) {
-            $worksheet.Cells.Item($row, 1).Value2 = $item.GroupName
-            $worksheet.Cells.Item($row, 2).Value2 = $item.Path
-            $worksheet.Cells.Item($row, 3).Value2 = $item.Status
-            $worksheet.Cells.Item($row, 4).Value2 = $item.ObjectPath
-            $row++
+try {
+    Write-Host "Чтение исходного файла $SourceExcelPath..." -ForegroundColor Cyan
+    $wbSource = $excel.Workbooks.Open($SourceExcelPath)
+    $wsSource = $wbSource.Worksheets.Item(1)
+    $lastRow = $wsSource.Cells.SpecialCells(11).Row 
+
+    $results = @()
+
+    for ($i = 2; $i -le $lastRow; $i++) {
+        $groupName = $wsSource.Cells.Item($i, 1).Text
+        $rawObjectPath = $wsSource.Cells.Item($i, 4).Text # Путь из Object
+
+        if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
+
+        Write-Host "Обработка [$i / $lastRow]: $groupName"
+
+        # --- 1. ВЫЧИСЛЕНИЕ АНГЛИЙСКОЙ ГРУППЫ-РОДИТЕЛЯ ---
+        $altGroupName = $null
+        if ($groupName -match "(?i) - изменение$") {
+            $altGroupName = $groupName -ireplace "(?i) - изменение$", " - write"
+        } elseif ($groupName -match "(?i) - чтение$") {
+            $altGroupName = $groupName -ireplace "(?i) - чтение$", " - read"
         }
 
-        [void]$worksheet.Columns.AutoFit()
+        # --- 2. ПАРСИНГ И ПОДГОТОВКА ПУТИ ---
+        $cleanPath = $rawObjectPath.Replace("/", "\")
+        $escapedGroup = [regex]::Escape($groupName)
+        
+        # Отбрасываем имя группы из пути
+        $cleanPath = $cleanPath -replace "\\$escapedGroup\\?$", ""
 
-        $workbook.SaveAs($OutputFile)
-        Write-Host "Файл успешно сохранен: $OutputFile" -ForegroundColor Green
+        $status = ""
+        $details = ""
+
+        # Проверяем, есть ли триггер Users-APPsFileExchange
+        if ($cleanPath -match 'Users-APPsFileExchange\\?(.*)') {
+            $relativePath = $matches[1] # Всё, что идет ПОСЛЕ Users-APPsFileExchange
+            
+            # Строим предполагаемый прямой путь в AppDS
+            $primaryPath = Join-Path $AppDSRoot $relativePath
+            $primaryPath = $primaryPath.TrimEnd('\')
+
+            $searchBasePath = $null
+            $searchType = ""
+
+            if (Test-Path -LiteralPath $primaryPath -PathType Container) {
+                # Путь существует точь-в-точь
+                $searchBasePath = $primaryPath
+                $searchType = "Прямой путь"
+                Write-Host "  -> Прямой путь существует: $primaryPath" -ForegroundColor Yellow
+            } 
+            else {
+                # Путь не существует, берем главную папку (например, SWIFT)
+                $firstFolder = ($relativePath -split '\\')[0]
+                
+                Write-Host "  -> Прямой путь не найден. Ищем приблизительно папку '$firstFolder'..." -ForegroundColor Magenta
+                $fuzzyPath = Find-FuzzyFolder -RootPath $AppDSRoot -TargetFolderName $firstFolder
+                
+                if ($fuzzyPath) {
+                    $searchBasePath = $fuzzyPath
+                    $searchType = "Приблизительный путь ($firstFolder)"
+                    Write-Host "  -> Найдена похожая папка: $fuzzyPath" -ForegroundColor Yellow
+                } else {
+                    $status = "Группа не найдена"
+                    $details = "Базовый и приблизительный пути не найдены в AppDS"
+                    Write-Host "  -> Не удалось найти даже похожую папку." -ForegroundColor Red
+                }
+            }
+
+            # --- 3. ЗАПУСК ПОИСКА В ШИРИНУ ---
+            if ($searchBasePath) {
+                $foundLocation = Get-FolderWithGroupBFS -BasePath $searchBasePath -GroupName $groupName -AltGroupName $altGroupName -DepthLimit $MaxDepth
+                
+                if ($foundLocation) {
+                    $status = "Найдено ($searchType)"
+                    $details = $foundLocation
+                    Write-Host "  -> НАЙДЕНО: $details" -ForegroundColor Green
+                } else {
+                    $status = "Группа не найдена"
+                    $details = "Не найдено (до $MaxDepth уровней) в $searchBasePath"
+                    Write-Host "  -> Обошли 5 уровней, группа не найдена." -ForegroundColor DarkYellow
+                }
+            }
+        }
+        else {
+            $status = "Пропущено"
+            $details = "В пути Object нет 'Users-APPsFileExchange'"
+            Write-Host "  -> Нет триггера Users-APPsFileExchange, пропускаем." -ForegroundColor Gray
+        }
+
+        # Собираем данные
+        $results += [PSCustomObject]@{
+            GroupName = $groupName
+            Status    = $status
+            Details   = $details
+        }
     }
-    catch {
-        Write-Host "[!] Произошла ошибка при работе с Excel: $_" -ForegroundColor Red
+
+    $wbSource.Close($false)
+
+    # --- Создание нового Excel файла ---
+    Write-Host "Создание нового файла $TargetExcelPath..." -ForegroundColor Cyan
+    $wbTarget = $excel.Workbooks.Add()
+    $wsTarget = $wbTarget.Worksheets.Item(1)
+
+    $wsTarget.Cells.Item(1, 1).Value2 = "Имя группы"
+    $wsTarget.Cells.Item(1, 2).Value2 = "Статус"
+    $wsTarget.Cells.Item(1, 3).Value2 = "Точное расположение / Описание"
+    
+    $wsTarget.Range("A1:C1").Font.Bold = $true
+
+    $rowTarget = 2
+    foreach ($item in $results) {
+        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.GroupName
+        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.Status
+        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.Details
+        $rowTarget++
     }
-    finally {
-        if ($null -ne $workbook) { $workbook.Close($false) }
+
+    [void]$wsTarget.Columns.AutoFit()
+
+    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
+    $wbTarget.SaveAs($TargetExcelPath)
+    $wbTarget.Close($true)
+
+    Write-Host "Готово! Результат сохранен в: $TargetExcelPath" -ForegroundColor Green
+}
+catch {
+    Write-Error "Произошла ошибка: $_"
+}
+finally {
+    if ($excel) {
         $excel.Quit()
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     }
-
-    Invoke-Item $OutputFile
-} else {
-    Write-Host "Не найдено ни одной группы в указанной OU. Проверь путь SearchBase." -ForegroundColor Yellow
 }
