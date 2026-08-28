@@ -54,7 +54,6 @@ try {
                     Write-Host "  -> Участников: 0. (В Notes успешно записано: группа без пользователей)" -ForegroundColor Green
                 }
                 catch {
-                    # Если прав на запись нет, количество мы всё равно посчитали
                     Write-Host "  -> Участников: 0. (ОШИБКА записи в Notes: $($_.Exception.Message))" -ForegroundColor Yellow
                 }
             } else {
@@ -66,10 +65,10 @@ try {
             Write-Host "  -> Ошибка: $($_.Exception.Message)" -ForegroundColor Red
         }
 
-        # Собираем данные для нового файла
+        # ИСПРАВЛЕНИЕ ЗДЕСЬ: Принудительно конвертируем число в строку, чтобы Excel не падал
         $results += [PSCustomObject]@{
             GroupName   = $cleanGroup
-            MemberCount = $memberCount
+            MemberCount = "$memberCount" 
             ObjectPath  = $objectPath
         }
     }
