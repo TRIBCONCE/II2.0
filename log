@@ -1,131 +1,97 @@
-------------------------------------------------------------------------------
-   ROBOCOPY     ::     Robust File Copy for Windows                              
--------------------------------------------------------------------------------
+# ==============================================================================
+# ОСНОВНАЯ ЛОГИКА
+# ==============================================================================
+Write-Host "Запуск Excel..." -ForegroundColor Cyan
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+try {
+    Write-Host "Чтение исходного файла $SourceExcelPath..." -ForegroundColor Cyan
+    $wbSource = $excel.Workbooks.Open($SourceExcelPath)
+    $wsSource = $wbSource.Worksheets.Item(1)
+    $lastRow = $wsSource.Cells.SpecialCells(11).Row 
+    $results = @()
+    Write-Host "Подсчет участников групп и обновление Notes в Active Directory..." -ForegroundColor Yellow
+    for ($i = 2; $i -le $lastRow; $i++) {
+        $groupName  = $wsSource.Cells.Item($i, 1).Text
+        $objectPath = $wsSource.Cells.Item($i, 4).Text 
+        if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
+        
+        $cleanGroup = $groupName.Trim()
+        Write-Host "Обработка [$i / $lastRow]: $cleanGroup"
+        
+        $memberCount = 0
+        try {
+            # Быстрый запрос: берем только массив ссылок на участников
+            $adGroup = Get-ADGroup -Identity $cleanGroup -Properties Member -ErrorAction Stop
+            
+            if ($null -eq $adGroup.Member) {
+                $memberCount = 0
+            } else {
+                $memberCount = @($adGroup.Member).Count
+            }
+            
+            # --- ЛОГИКА ЗАПИСИ В NOTES ДЛЯ ПУСТЫХ ГРУПП ---
+            if ($memberCount -eq 0) {
+                try {
+                    Set-ADGroup -Identity $adGroup -Replace @{info="группа без пользователей"} -ErrorAction Stop
+                    Write-Host "  -> Участников: 0. (В Notes успешно записано: группа без пользователей)" -ForegroundColor Green
+                }
+                catch {
+                    # Если прав на запись нет, количество мы всё равно посчитали
+                    Write-Host "  -> Участников: 0. (ОШИБКА записи в Notes: $($_.Exception.Message))" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "  -> Участников: $memberCount" -ForegroundColor Green
+            }
+        }
+        catch {
+            $memberCount = "Ошибка AD: Группа не найдена"
+            Write-Host "  -> Ошибка: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        # Собираем данные для нового файла
+        $results += [PSCustomObject]@{
+            GroupName   = $cleanGroup
+            MemberCount = $memberCount
+            ObjectPath  = $objectPath
+        }
+    }
+    $wbSource.Close($false)
+    # --- Создание нового Excel файла ---
+    Write-Host "Создание нового файла $TargetExcelPath..." -ForegroundColor Cyan
+    $wbTarget = $excel.Workbooks.Add()
+    $wsTarget = $wbTarget.Worksheets.Item(1)
+    $wsTarget.Cells.Item(1, 1).Value2 = "Имя группы"
+    $wsTarget.Cells.Item(1, 2).Value2 = "Количество человек"
+    $wsTarget.Cells.Item(1, 3).Value2 = "Путь из Object"
+    
+    $wsTarget.Range("A1:C1").Font.Bold = $true
+    $rowTarget = 2
+    foreach ($item in $results) {
+        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.GroupName
+        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.MemberCount
+        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.ObjectPath
+        $rowTarget++
+    }
+    [void]$wsTarget.Columns.AutoFit()
+    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
+    $wbTarget.SaveAs($TargetExcelPath)
+    $wbTarget.Close($true)
+    Write-Host "Готово! Результат сохранен в: $TargetExcelPath" -ForegroundColor Green
+}
+catch {
+    Write-Error "Произошла глобальная ошибка: $_"
+}
+finally {
+    if ($null -ne $excel) {
+        $excel.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
+} : Произошла глобальная ошибка: Unable to cast object of type 'System.Int32' to type 'System.String'.
+    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
+    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException
+ 
 
-  Started : 26  ўЈгбв  2026 Ј. 15:57:27
-   Source : \\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\
-     Dest : C:\Users\z-BorodinES\Desktop\
-
-    Files : *.*
-	    
-  Options : *.* /L /S /E /DCOPY:DA /COPY:DAT /XJ /LEV:2 /R:1000000 /W:30 
-
-------------------------------------------------------------------------------
-
-	                   2	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\Bot invite v2\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\excel csv д ©«л\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\PyCharm Community Edition\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\Quiz-bot\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\txt д ©«л\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\TXT” ©«л\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\ZabbixZadacha\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\Ђўв®¬ вЁ§ жЁЁ\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\‚лЈаг§Є  2.0\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\‚лЈаг§ЄЁ\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\…йс ®¤­Ё ўлЈаг§ЄЁ\
-	*EXTRA Dir        -1	C:\Users\z-BorodinES\Desktop\ђ®Ў®в Ї® б®§¤ ­Ёо “‡\
-	  *EXTRA File 		   13761	AI Bars.xlsx
-	  *EXTRA File 		       0	AppDS_Cache_Debug.txt
-	  *EXTRA File 		    8939	cpub-mstsc-CARD_Access-CmsRdsh.rdp
-	  *EXTRA File 		     514	desktop.ini
-	  *EXTRA File 		   53270	express.quizbot.7z
-	  *EXTRA File 		   11269	GLAVNTest.ps1
-	  *EXTRA File 		    5001	Log.txt
-	  *EXTRA File 		    4999	Log2.txt
-	  *EXTRA File 		    1741	Log3.txt
-	  *EXTRA File 		       0	Log4.txt
-	  *EXTRA File 		    8524	New Microsoft Excel Worksheet (10).csv
-	  *EXTRA File 		       3	New Microsoft Excel Worksheet (2).csv
-	  *EXTRA File 		    6624	New Microsoft Excel Worksheet.xlsx
-	  *EXTRA File 		       0	New Text Document.txt
-	  *EXTRA File 		   10528	Otchet.txt
-	  *EXTRA File 		   10168	Otchet2.txt
-	  *EXTRA File 		       0	Otchet3.txt
-	  *EXTRA File 		   24935	Otchet4.txt
-	  *EXTRA File 		   43035	Otchet5.txt
-	  *EXTRA File 		    5416	Pass_Spisok.txt
-	  *EXTRA File 		    4700	Polz.txt
-	  *EXTRA File 		    4698	Polz2.txt
-	  *EXTRA File 		       0	Polz3.txt
-	  *EXTRA File 		   10844	Polz4.txt
-	  *EXTRA File 		  120312	Qlik_ЋвзҐвл б ђ ббл«Є ¬Ё_14.08.26..xlsx
-	  *EXTRA File 		  109934	Reports_ЋвзҐвл б Ї®¤ЇЁбЄ ¬Ё_Ї®бва®з­®.xlsx
-	  *EXTRA File 		    4988	testLog.txt
-	  *EXTRA File 		    5041	testLog2.txt
-	  *EXTRA File 		    1783	testLog3.txt
-	  *EXTRA File 		       0	testLog4.txt
-	  *EXTRA File 		    4594	Untitled3.ps1
-	  *EXTRA File 		    1274	Windows PowerShell ISE.lnk
-	  *EXTRA File 		     165	~$ѓагЇЇл ¤«п AppDS.xlsx
-	  *EXTRA File 		     165	~$ѓагЇЇл б Їгбвл¬Ё Їгвп¬Ё.xlsx
-	  *EXTRA File 		     165	~$’ҐЇҐам Їгвм бгй.xlsx
-	  *EXTRA File 		     165	~$’ҐЇҐам нвЁ ЈагЇЇл ­Ґ б Їгбвл¬Ё Їгвп¬Ё.xlsx
-	  *EXTRA File 		   22002	ѓагЇЇл ¤«п AppDS.xlsx
-	  *EXTRA File 		   34689	ѓагЇЇл Їгвм ­Ґ бгй.xlsx
-	  *EXTRA File 		   26751	ѓагЇЇл б Їгбвл¬Ё Їгвп¬Ё.xlsx
-	  *EXTRA File 		    9046	Ќ ©¤Ґ­­лҐ ЈагЇЇл ¤«п AppDS.xlsx
-	  *EXTRA File 		    3894	ЌҐ Ї®¬Ґ­п«Ё Ї а®«м.txt
-	  *EXTRA File 		    4456	ЋвЇгбЄ .txt
-	  *EXTRA File 		   56413	ЋвЇгбЄ­ЁЄЁ.xlsx
-	  *EXTRA File 		   47125	Ћвзсв Ї® ЈагЇЇ ¬ б ­Ґбгй. Їгвп¬Ё.xlsx
-	  *EXTRA File 		  141672	Ћвзсв_Ї®_ЈагЇЇ ¬_AD.xlsx
-	  *EXTRA File 		  137850	Ћвзсв_Ї®_ЈагЇЇ ¬_AD2.xlsx
-	  *EXTRA File 		   91908	ЋвзҐв_Ї®_ЈагЇЇ ¬_FS.xlsx
-	  *EXTRA File 		   13887	‘ЇЁб®Є Ї® ЈагЇЇ ¬ AI Bars.xlsx
-	  *EXTRA File 		    1157	‘а ў­Ґ­ЁҐ.txt
-	  *EXTRA File 		   25136	’ҐЇҐам Їгвм бгй.xlsx
-	  *EXTRA File 		   27672	’ҐЇҐам нвЁ ЈагЇЇл ­Ґ б Їгбвл¬Ё Їгвп¬Ё.xlsx
-	  *EXTRA File 		    8301	“ў®«Ґ­­лҐ Ё ­Ґ гў®«Ґ­­лҐ Ї®«м§®ў вҐ«Ё.txt
-	    New File  		   2.6 m	GEstDepo_564_72.zip
-	    New File  		   6.3 m	RMK_2126_94.zip
-	  New Dir          2	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\1CKadryIntegration\
-	    New File  		   8.9 m	‘ЇЁб®Є б®ваг¤­ЁЄ®ў.txt
-
- New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\2gisintegration\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\577-Џ\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\764\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\Abdt.ClientsDebt.Autocalling.Web\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\Base24 Bankomats\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\BSS IBank-Retail\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\BSS Integration\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\BTS 2013 Current Logs\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\CardPerso\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\CDI\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\CFT-test\
-	  New Dir          8	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\ClientDoc\
-	    New File  		   1.0 g	filescomp.zip
-	    New File  		   1.7 g	Files_old.zip
-	    New File  		   7.2 g	lr (10.04.2028 ¬®¦­® г¤ «Ёвм).7z
-	    New File  		  38.5 g	np.7z
-	    New File  		  39.9 g	server.log.1
-	    New File  		  10.6 g	ЂаеЁў ¤®бмҐ.7z
-	    New File  		   1.9 g	„®Єг¬Ґ­вл Ї® ЄаҐ¤Ёв­л¬ ¤®Ј®ў®а ¬ (10.04.2028 ¬®¦­® г¤ «Ёвм).7z
-	    New File  		   1.0 g	Ќ®ў п Ї ЇЄ  (3).zip
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\ClientDocsImportprep\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\ClientDocsImportprod\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\Conscience\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\consumerloan_test\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\corpcard\
-	  New Dir          1	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\corporateportal-prod-lucene\
-	    New File  		     295	tenants.json
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\Correqts\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\correqts_stage_mt103\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\CRMEA\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\crmsiebel\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\Current Logs\
-	  New Dir          4	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\DBF_info\
-	    New File  		      62	dates.json
-	    New File  		  293888	Sprav.xls
-	    New File  		      90	ЇаЁ¬Ґа § Ї®«Ґ­­®Ј® д ©«  dates.json
-	    New File  		      60	ЇаЁ¬Ґа Їгбв®Ј® д ©«  dates.json
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\DB_Logs\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\Derzhava\
-	  New Dir          0	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\Derzhava-dev\
-	  New Dir         21	\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS\Diasoft\
-	    New File  		   10004	03112023.htm
-	    New File  		  205932	1.pdf
-	    New File  		    1087	Arapovaia - па«лЄ (2).lnk
-	    New File  		     968	Arapovaia - па«лЄ.lnk
-	    New File  		    1087	Barievmi2 - па«лЄ (2).lnk
-	    New File  		    1087	Barievmi2 - па«лЄ.lnk
+PS C:\Users\z-BorodinES> 
