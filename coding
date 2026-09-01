@@ -1,30 +1,136 @@
 cls
-Write-Host "=== ТЕСТ ROBOCOPY (ПЕРЕХВАТ ВЫВОДА ЧЕРЕЗ POWERSHELL) ===" -ForegroundColor Cyan
+# ==============================================================================
+# НАСТРОЙКИ ПУТЕЙ
+# ==============================================================================
+$FoldersExcelPath = "C:\Users\z-BorodinES\Desktop\File1_Folders.xlsx" # Файл с Блоками бизнеса и DFSPath
+$GroupsExcelPath  = "C:\Users\z-BorodinES\Desktop\File2_Groups.xlsx"  # Файл с группами и путями в Notes
+$TargetExcelPath  = "C:\Users\z-BorodinES\Desktop\Result_Match.xlsx"  # Итоговый файл
 
-$BasePath = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS"
-$FakeDest = "C:\Users\z-BorodinES\Desktop"
-$LogFile  = "C:\Users\z-BorodinES\Desktop\robolog_raw.txt"
+Write-Host "Запуск Excel..." -ForegroundColor Cyan
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
 
-Write-Host "1. Запуск Robocopy (без глушителей) и перехват текста в память..." -ForegroundColor Yellow
+try {
+    # ==============================================================================
+    # ШАГ 1: ЧТЕНИЕ ФАЙЛА С ГРУППАМИ (КЭШИРОВАНИЕ)
+    # ==============================================================================
+    Write-Host "Чтение файла с группами ($GroupsExcelPath)..." -ForegroundColor Cyan
+    $wbGroups = $excel.Workbooks.Open($GroupsExcelPath)
+    $wsGroups = $wbGroups.Worksheets.Item(1)
+    $lastRowGroups = $wsGroups.Cells.SpecialCells(11).Row 
 
-$roboArgs = @(
-    $BasePath, $FakeDest, 
-    "/L", "/E", "/LEV:2", "/XJ"
-)
+    $GroupsCache = @()
 
-# Вызываем robocopy и ВЕСЬ его вывод забираем в переменную $rawOutput
-$rawOutput = & robocopy $roboArgs
+    for ($i = 2; $i -le $lastRowGroups; $i++) {
+        $groupName  = $wsGroups.Cells.Item($i, 1).Text
+        $notesPath  = $wsGroups.Cells.Item($i, 2).Text
+        $pathStatus = $wsGroups.Cells.Item($i, 3).Text
 
-Write-Host "2. Robocopy отработал. Сохраняю текст в файл..." -ForegroundColor Yellow
+        if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
 
-# PowerShell сам пишет файл в нормальной кодировке
-$rawOutput | Out-File -FilePath $LogFile -Encoding UTF8 -Force
+        # Очищаем путь для точного сравнения (убираем пробелы и слеш на конце)
+        $cleanNotesPath = $notesPath.Trim().TrimEnd('\')
 
-if (Test-Path -LiteralPath $LogFile) {
-    $fileSize = (Get-Item $LogFile).Length
-    Write-Host "[ОК] Файл сохранен! Размер: $fileSize байт." -ForegroundColor Green
-    Write-Host "`nОткрой файл $LogFile на рабочем столе." -ForegroundColor Cyan
-    Write-Host "Там обязательно должна быть 'шапка' (заголовок Robocopy). Напиши мне, какие ошибки он там выдал или что вообще написал."
-} else {
-    Write-Host "[ОШИБКА] Даже PowerShell не смог создать файл лога. Проверь права на рабочий стол." -ForegroundColor Red
+        $GroupsCache += [PSCustomObject]@{
+            GroupName  = $groupName.Trim()
+            NotesPath  = $cleanNotesPath
+            PathStatus = $pathStatus.Trim()
+        }
+    }
+    $wbGroups.Close($false)
+    Write-Host "  -> Загружено групп в память: $($GroupsCache.Count)" -ForegroundColor Green
+
+
+    # ==============================================================================
+    # ШАГ 2: ЧТЕНИЕ ФАЙЛА С ПАПКАМИ И ПОИСК СОВПАДЕНИЙ
+    # ==============================================================================
+    Write-Host "`nЧтение файла с папками ($FoldersExcelPath)..." -ForegroundColor Cyan
+    $wbFolders = $excel.Workbooks.Open($FoldersExcelPath)
+    $wsFolders = $wbFolders.Worksheets.Item(1)
+    $lastRowFolders = $wsFolders.Cells.SpecialCells(11).Row 
+
+    $Results = @()
+
+    for ($i = 2; $i -le $lastRowFolders; $i++) {
+        $businessBlock = $wsFolders.Cells.Item($i, 1).Text
+        $folderName    = $wsFolders.Cells.Item($i, 2).Text
+        $dfsPath       = $wsFolders.Cells.Item($i, 3).Text
+
+        if ([string]::IsNullOrWhiteSpace($dfsPath)) { continue }
+
+        # Трансформация пути: меняем R:\ (независимо от регистра) на сетевой путь
+        # и убираем слеш на конце для идеального совпадения
+        $transformedPath = $dfsPath -ireplace "^R:\\", "\\abb-win.akbars.ru\departments\"
+        $transformedPath = $transformedPath.Trim().TrimEnd('\')
+
+        # Ищем все группы, у которых путь в Notes совпадает с трансформированным DFSPath
+        $matchedGroups = $GroupsCache | Where-Object { $_.NotesPath -eq $transformedPath }
+
+        if ($matchedGroups) {
+            Write-Host "[$i / $lastRowFolders] Найдено групп ($($matchedGroups.Count)) для пути: $transformedPath" -ForegroundColor Green
+            
+            foreach ($mg in $matchedGroups) {
+                $Results += [PSCustomObject]@{
+                    GroupName     = $mg.GroupName
+                    BusinessBlock = $businessBlock.Trim()
+                    PathStatus    = $mg.PathStatus
+                    NotesPath     = $mg.NotesPath
+                    DFSPath       = $dfsPath.Trim()
+                    FolderName    = $folderName.Trim()
+                }
+            }
+        } else {
+            Write-Host "[$i / $lastRowFolders] Нет совпадений для пути: $transformedPath" -ForegroundColor DarkGray
+        }
+    }
+    $wbFolders.Close($false)
+
+
+    # ==============================================================================
+    # ШАГ 3: ЗАПИСЬ РЕЗУЛЬТАТОВ В НОВЫЙ ФАЙЛ
+    # ==============================================================================
+    Write-Host "`nСоздание итогового файла $TargetExcelPath..." -ForegroundColor Cyan
+    $wbTarget = $excel.Workbooks.Add()
+    $wsTarget = $wbTarget.Worksheets.Item(1)
+
+    # Заголовки (строго по ТЗ)
+    $wsTarget.Cells.Item(1, 1).Value2 = "Имя группы"
+    $wsTarget.Cells.Item(1, 2).Value2 = "Блок Бизнеса"
+    $wsTarget.Cells.Item(1, 3).Value2 = "Статус пути"
+    $wsTarget.Cells.Item(1, 4).Value2 = "Путь (из Notes)"
+    $wsTarget.Cells.Item(1, 5).Value2 = "DFSPath"
+    $wsTarget.Cells.Item(1, 6).Value2 = "FolderName"
+    
+    $wsTarget.Range("A1:F1").Font.Bold = $true
+
+    $rowTarget = 2
+    foreach ($item in $Results) {
+        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.GroupName
+        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.BusinessBlock
+        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.PathStatus
+        $wsTarget.Cells.Item($rowTarget, 4).Value2 = $item.NotesPath
+        $wsTarget.Cells.Item($rowTarget, 5).Value2 = $item.DFSPath
+        $wsTarget.Cells.Item($rowTarget, 6).Value2 = $item.FolderName
+        $rowTarget++
+    }
+
+    [void]$wsTarget.Columns.AutoFit()
+
+    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
+    $wbTarget.SaveAs($TargetExcelPath)
+    $wbTarget.Close($true)
+
+    Write-Host "Готово! Сопоставлено записей: $($Results.Count). Файл сохранен." -ForegroundColor Green
+}
+catch {
+    Write-Error "Произошла глобальная ошибка: $_"
+}
+finally {
+    if ($null -ne $excel) {
+        $excel.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
 }
