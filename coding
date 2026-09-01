@@ -1,10 +1,12 @@
 cls
+Import-Module ActiveDirectory
+
 # ==============================================================================
 # НАСТРОЙКИ ПУТЕЙ
 # ==============================================================================
-$FoldersExcelPath = "C:\Users\z-BorodinES\Desktop\File1_Folders.xlsx" # Файл с Блоками бизнеса и DFSPath
-$GroupsExcelPath  = "C:\Users\z-BorodinES\Desktop\File2_Groups.xlsx"  # Файл с группами и путями в Notes
-$TargetExcelPath  = "C:\Users\z-BorodinES\Desktop\Result_Match.xlsx"  # Итоговый файл
+$FoldersExcelPath = "C:\Users\z-BorodinES\Desktop\File1_Folders.xlsx" 
+$GroupsExcelPath  = "C:\Users\z-BorodinES\Desktop\File2_Groups.xlsx"  
+$TargetExcelPath  = "C:\Users\z-BorodinES\Desktop\Result_Match_Final.xlsx"  
 
 Write-Host "Запуск Excel..." -ForegroundColor Cyan
 $excel = New-Object -ComObject Excel.Application
@@ -29,7 +31,6 @@ try {
 
         if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
 
-        # Очищаем путь для точного сравнения (убираем пробелы и слеш на конце)
         $cleanNotesPath = $notesPath.Trim().TrimEnd('\')
 
         $GroupsCache += [PSCustomObject]@{
@@ -40,7 +41,6 @@ try {
     }
     $wbGroups.Close($false)
     Write-Host "  -> Загружено групп в память: $($GroupsCache.Count)" -ForegroundColor Green
-
 
     # ==============================================================================
     # ШАГ 2: ЧТЕНИЕ ФАЙЛА С ПАПКАМИ И ПОИСК СОВПАДЕНИЙ
@@ -59,33 +59,67 @@ try {
 
         if ([string]::IsNullOrWhiteSpace($dfsPath)) { continue }
 
-        # Трансформация пути: меняем R:\ (независимо от регистра) на сетевой путь
-        # и убираем слеш на конце для идеального совпадения
         $transformedPath = $dfsPath -ireplace "^R:\\", "\\abb-win.akbars.ru\departments\"
         $transformedPath = $transformedPath.Trim().TrimEnd('\')
 
-        # Ищем все группы, у которых путь в Notes совпадает с трансформированным DFSPath
-        $matchedGroups = $GroupsCache | Where-Object { $_.NotesPath -eq $transformedPath }
+        $matchedGroups = @($GroupsCache | Where-Object { $_.NotesPath -eq $transformedPath })
 
-        if ($matchedGroups) {
-            Write-Host "[$i / $lastRowFolders] Найдено групп ($($matchedGroups.Count)) для пути: $transformedPath" -ForegroundColor Green
+        if ($matchedGroups.Count -eq 0) {
+            # НИЧЕГО НЕ НАЙДЕНО
+            Write-Host "[$i / $lastRowFolders] НЕ НАЙДЕНО: $transformedPath" -ForegroundColor DarkGray
             
-            foreach ($mg in $matchedGroups) {
-                $Results += [PSCustomObject]@{
-                    GroupName     = $mg.GroupName
-                    BusinessBlock = $businessBlock.Trim()
-                    PathStatus    = $mg.PathStatus
-                    NotesPath     = $mg.NotesPath
-                    DFSPath       = $dfsPath.Trim()
-                    FolderName    = $folderName.Trim()
-                }
+            $Results += [PSCustomObject]@{
+                SearchStatus  = "не найдена"
+                GroupName     = ""
+                BusinessBlock = $businessBlock.Trim()
+                PathStatus    = ""
+                NotesPath     = ""
+                DFSPath       = $dfsPath.Trim()
+                FolderName    = $folderName.Trim()
             }
-        } else {
-            Write-Host "[$i / $lastRowFolders] Нет совпадений для пути: $transformedPath" -ForegroundColor DarkGray
+        } 
+        else {
+            # НАЙДЕНА ОДНА ИЛИ НЕСКОЛЬКО ГРУПП
+            $selectedGroup = $null
+
+            if ($matchedGroups.Count -gt 1) {
+                Write-Host "[$i / $lastRowFolders] Найдено несколько групп ($($matchedGroups.Count)). Поиск главенствующей..." -ForegroundColor Yellow
+                
+                # Ищем группу, которая не вложена в другие (MemberOf пустое)
+                foreach ($mg in $matchedGroups) {
+                    try {
+                        $adGroup = Get-ADGroup -Identity $mg.GroupName -Properties MemberOf -ErrorAction Stop
+                        if ($null -eq $adGroup.MemberOf -or $adGroup.MemberOf.Count -eq 0) {
+                            $selectedGroup = $mg
+                            break # Нашли невложенную - берем её и прекращаем перебор
+                        }
+                    } catch { }
+                }
+
+                # Если не удалось найти невложенную (или AD недоступен), берем первую попавшуюся
+                if ($null -eq $selectedGroup) {
+                    $selectedGroup = $matchedGroups[0]
+                }
+            } 
+            else {
+                # Найдена ровно одна группа
+                Write-Host "[$i / $lastRowFolders] НАЙДЕНО (1): $transformedPath" -ForegroundColor Green
+                $selectedGroup = $matchedGroups[0]
+            }
+
+            # Добавляем в результаты
+            $Results += [PSCustomObject]@{
+                SearchStatus  = "найдена"
+                GroupName     = $selectedGroup.GroupName
+                BusinessBlock = $businessBlock.Trim()
+                PathStatus    = $selectedGroup.PathStatus
+                NotesPath     = $selectedGroup.NotesPath
+                DFSPath       = $dfsPath.Trim()
+                FolderName    = $folderName.Trim()
+            }
         }
     }
     $wbFolders.Close($false)
-
 
     # ==============================================================================
     # ШАГ 3: ЗАПИСЬ РЕЗУЛЬТАТОВ В НОВЫЙ ФАЙЛ
@@ -94,24 +128,26 @@ try {
     $wbTarget = $excel.Workbooks.Add()
     $wsTarget = $wbTarget.Worksheets.Item(1)
 
-    # Заголовки (строго по ТЗ)
-    $wsTarget.Cells.Item(1, 1).Value2 = "Имя группы"
-    $wsTarget.Cells.Item(1, 2).Value2 = "Блок Бизнеса"
-    $wsTarget.Cells.Item(1, 3).Value2 = "Статус пути"
-    $wsTarget.Cells.Item(1, 4).Value2 = "Путь (из Notes)"
-    $wsTarget.Cells.Item(1, 5).Value2 = "DFSPath"
-    $wsTarget.Cells.Item(1, 6).Value2 = "FolderName"
+    # Новые заголовки
+    $wsTarget.Cells.Item(1, 1).Value2 = "Статус поиска"
+    $wsTarget.Cells.Item(1, 2).Value2 = "Имя группы"
+    $wsTarget.Cells.Item(1, 3).Value2 = "Блок Бизнеса"
+    $wsTarget.Cells.Item(1, 4).Value2 = "Статус пути"
+    $wsTarget.Cells.Item(1, 5).Value2 = "Путь (из Notes)"
+    $wsTarget.Cells.Item(1, 6).Value2 = "DFSPath"
+    $wsTarget.Cells.Item(1, 7).Value2 = "FolderName"
     
-    $wsTarget.Range("A1:F1").Font.Bold = $true
+    $wsTarget.Range("A1:G1").Font.Bold = $true
 
     $rowTarget = 2
     foreach ($item in $Results) {
-        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.GroupName
-        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.BusinessBlock
-        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.PathStatus
-        $wsTarget.Cells.Item($rowTarget, 4).Value2 = $item.NotesPath
-        $wsTarget.Cells.Item($rowTarget, 5).Value2 = $item.DFSPath
-        $wsTarget.Cells.Item($rowTarget, 6).Value2 = $item.FolderName
+        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.SearchStatus
+        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.GroupName
+        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.BusinessBlock
+        $wsTarget.Cells.Item($rowTarget, 4).Value2 = $item.PathStatus
+        $wsTarget.Cells.Item($rowTarget, 5).Value2 = $item.NotesPath
+        $wsTarget.Cells.Item($rowTarget, 6).Value2 = $item.DFSPath
+        $wsTarget.Cells.Item($rowTarget, 7).Value2 = $item.FolderName
         $rowTarget++
     }
 
