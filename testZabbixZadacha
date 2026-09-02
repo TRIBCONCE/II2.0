@@ -1,87 +1,215 @@
+cls
+Import-Module ActiveDirectory
+
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА С КЭШИРОВАНИЕМ И ПОДРОБНЫМ ЛОГИРОВАНИЕМ
+# НАСТРОЙКИ
 # ==============================================================================
-function Search-GroupInAppDS {
-    param (
-        [string]$BasePath,
-        [string]$GroupName,
-        [int]$DepthLimit = 5
-    )
+$TargetExcelPath = "C:\Users\z-BorodinES\Desktop\Sizing_Report_AD.xlsx"
+$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+$MaxThreads = 8  # Увеличиваем до 8 параллельных папок
 
-    # Путь для лога (сохранится на рабочем столе)
-    $LogFile = "C:\Users\z-BorodinES\Desktop\AppDS_Cache_Debug.txt"
+# ==============================================================================
+# ШАГ 1: СБОР ГРУПП
+# ==============================================================================
+Write-Host "1. Получение групп из OU..." -ForegroundColor Cyan
+$allGroups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties department, info
 
-    # 1. Заполняем кэш через .NET, если он пуст
-    if ($null -eq $global:RoboFolderCache) {
-        Write-Host "  -> [КЭШ ПУСТ] Начинаю сканирование $BasePath (глубина $DepthLimit)..." -ForegroundColor Magenta
-        
-        # Начинаем лог
-        "=== ЛОГ СКАНИРОВАНИЯ $BasePath ===" | Out-File -FilePath $LogFile -Force
-        
-        $global:RoboFolderCache = [System.Collections.Generic.List[string]]::new()
-        $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
-        
-        # Проверяем доступ к корню
-        if (Test-Path -LiteralPath $BasePath -PathType Container) {
-            $cleanBasePath = $BasePath.TrimEnd('\')
-            $global:RoboFolderCache.Add($cleanBasePath)
-            $queue.Enqueue([PSCustomObject]@{ Path = $cleanBasePath; Depth = 0 })
-            Add-Content -Path $LogFile -Value "[INFO] Базовый путь доступен: $cleanBasePath"
-        } else {
-            Add-Content -Path $LogFile -Value "[FATAL] Базовый путь не доступен или не существует: $BasePath"
-            Write-Host "  -> [ОШИБКА] Базовый путь $BasePath не доступен! Смотри лог: $LogFile" -ForegroundColor Red
-            return $null
-        }
-
-        Write-Host "  -> Собираем папки... Следи за счетчиком:" -ForegroundColor Yellow
-
-        $errorCount = 0
-        while ($queue.Count -gt 0) {
-            $current = $queue.Dequeue()
-            
-            # Если достигли лимита глубины - не лезем глубже
-            if ($current.Depth -ge $DepthLimit) { continue }
-
-            try {
-                $subFolders = [System.IO.Directory]::EnumerateDirectories($current.Path)
-                foreach ($folder in $subFolders) {
-                    $global:RoboFolderCache.Add($folder)
-                    $queue.Enqueue([PSCustomObject]@{ Path = $folder; Depth = $current.Depth + 1 })
-                    
-                    # Живой пульс: выводим сообщение каждую 1000 папок
-                    if ($global:RoboFolderCache.Count % 1000 -eq 0) {
-                        Write-Host "     ... В кэш добавлено папок: $($global:RoboFolderCache.Count)" -ForegroundColor Cyan
-                    }
-                }
-            }
-            catch {
-                $errorCount++
-                $errMsg = $_.Exception.Message
-                # Пишем ошибку в лог, чтобы понять причину
-                Add-Content -Path $LogFile -Value "[ОШИБКА ДОСТУПА] Путь: $($current.Path) | Ошибка: $errMsg"
+$groupList = @()
+foreach ($g in $allGroups) {
+    if (-not [string]::IsNullOrWhiteSpace($g.department) -and -not [string]::IsNullOrWhiteSpace($g.info)) {
+        $cleanPath = ($g.info -replace "[\r\n]", " ").Trim()
+        if ($cleanPath -match '(\\\\.*)') {
+            $groupList += [PSCustomObject]@{
+                GroupName  = $g.Name
+                Department = $g.department
+                Path       = $matches[1].TrimEnd('\')
             }
         }
+    }
+}
 
-        Write-Host "  -> [КЭШ СОЗДАН] Загружено: $($global:RoboFolderCache.Count) папок. Ошибок доступа: $errorCount." -ForegroundColor Green
-        Write-Host "  -> Лог формирования кэша сохранен в: $LogFile" -ForegroundColor DarkGray
+Write-Host "Валидных групп для обработки: $($groupList.Count)" -ForegroundColor Green
+if ($groupList.Count -eq 0) { return }
+
+# ==============================================================================
+# ШАГ 2: БЫСТРЫЙ МНОГОПОТОЧНЫЙ ПОДСЧЕТ ЧЕРЕЗ ИТОГИ ROBOCOPY
+# ==============================================================================
+Write-Host "`n2. Запуск турбо-сканирования ($MaxThreads потоков)..." -ForegroundColor Yellow
+
+$RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
+$RunspacePool.Open()
+$Jobs = @()
+
+$ScriptBlock = {
+    param($Path, $GroupName, $Department)
+
+    # Резолв DFS
+    $targetPath = $Path
+    try {
+        $dfsResult = & dfsutil link $Path 2>$null
+        if ($dfsResult -match 'Target:\s+(\\\\.*)') {
+            $targetPath = $matches[1].Trim()
+        }
+    } catch { }
+
+    if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+        return [PSCustomObject]@{
+            BusinessBlock = "$Department"
+            GroupName     = "$GroupName"
+            NotesPath     = "$Path"
+            TargetPath    = "НЕДОСТУПЕН"
+            TotalGB       = "0"
+            Old3YearsGB   = "0"
+            Old5YearsGB   = "0"
+        }
     }
 
-    # 2. Ищем группу в закэшированном списке папок
-    $cleanGroup = $GroupName.Trim()
-
-    foreach ($folder in $global:RoboFolderCache) {
-        try {
-            $acl = (Get-Acl -LiteralPath $folder -ErrorAction Stop).Access
-            
-            foreach ($rule in $acl) {
-                $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
-                if ($aclCleanName -eq $cleanGroup) {
-                    return $folder
-                }
+    # Функция быстрого замера байт из Summary-таблицы Robocopy
+    function Get-RoboBytes {
+        param([string]$ExtraArgs = "")
+        $cmd = "robocopy `"$Path`" NULL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP $ExtraArgs"
+        $output = cmd /c $cmd
+        # Ищем строку с итогами: "   Bytes :    12345678"
+        foreach ($line in $output) {
+            if ($line -match '^\s*Bytes\s*:\s*(\d+)') {
+                return [long]$matches[1]
             }
         }
-        catch { }
+        return 0L
     }
+
+    # Дни для фильтров /MINAGE
+    $Days3Y = 3 * 365
+    $Days5Y = 5 * 365
+
+    # 1. Общий размер (без вывода файлов в консоль, только заголовок итогов)
+    [long]$TotalBytes = Get-RoboBytes
     
-    return $null 
+    # 2. Файлы старше 3 лет
+    [long]$Old3Bytes = 0L
+    if ($TotalBytes -gt 0) {
+        $Old3Bytes = Get-RoboBytes "/MINAGE:$Days3Y"
+    }
+
+    # 3. Файлы старше 5 лет
+    [long]$Old5Bytes = 0L
+    if ($Old3Bytes -gt 0) {
+        $Old5Bytes = Get-RoboBytes "/MINAGE:$Days5Y"
+    }
+
+    return [PSCustomObject]@{
+        BusinessBlock = "$Department"
+        GroupName     = "$GroupName"
+        NotesPath     = "$Path"
+        TargetPath    = "$targetPath"
+        TotalGB       = "$([math]::Round($TotalBytes / 1GB, 2))"
+        Old3YearsGB   = "$([math]::Round($Old3Bytes  / 1GB, 2))"
+        Old5YearsGB   = "$([math]::Round($Old5Bytes  / 1GB, 2))"
+    }
+}
+
+foreach ($g in $groupList) {
+    $PowerShell = [powershell]::Create()
+    $PowerShell.RunspacePool = $RunspacePool
+    [void]$PowerShell.AddScript($ScriptBlock)
+    [void]$PowerShell.AddArgument($g.Path)
+    [void]$PowerShell.AddArgument($g.GroupName)
+    [void]$PowerShell.AddArgument($g.Department)
+    
+    $Jobs += [PSCustomObject]@{
+        Pipe    = $PowerShell
+        Result  = $PowerShell.BeginInvoke()
+        Checked = $false
+    }
+}
+
+$completedCount = 0
+$totalJobs = $Jobs.Count
+$Results = @()
+
+while ($Jobs.Result.IsCompleted -contains $false) {
+    foreach ($job in $Jobs) {
+        if ($job.Result.IsCompleted -and -not $job.Checked) {
+            $job.Checked = $true
+            $completedCount++
+            
+            try {
+                $res = $job.Pipe.EndInvoke($job.Result)
+                if ($res) { $Results += $res }
+            } catch { }
+            
+            Write-Host "Обработано путей: $completedCount из $totalJobs" -ForegroundColor DarkGray
+        }
+    }
+    Start-Sleep -Milliseconds 200
+}
+
+# Добираем задачи
+foreach ($job in $Jobs) {
+    if (-not $job.Checked) {
+        $job.Checked = $true
+        try {
+            $res = $job.Pipe.EndInvoke($job.Result)
+            if ($res) { $Results += $res }
+        } catch { }
+    }
+    $job.Pipe.Dispose()
+}
+
+$RunspacePool.Close()
+$RunspacePool.Dispose()
+
+# ==============================================================================
+# ШАГ 3: ВЫГРУЗКА В EXCEL
+# ==============================================================================
+Write-Host "`n3. Сохранение в Excel..." -ForegroundColor Cyan
+
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+
+try {
+    $wb = $excel.Workbooks.Add()
+    $ws = $wb.Worksheets.Item(1)
+    $ws.Name = "Диск R"
+
+    $ws.Cells.Item(1, 1).Value2 = "Блок бизнеса"
+    $ws.Cells.Item(1, 2).Value2 = "Имя группы"
+    $ws.Cells.Item(1, 3).Value2 = "Путь(Notes)"
+    $ws.Cells.Item(1, 4).Value2 = "TargetPath"
+    $ws.Cells.Item(1, 5).Value2 = "Общий размер папки, в Gb"
+    $ws.Cells.Item(1, 6).Value2 = "Файлы старше 3х лет, в Gb"
+    $ws.Cells.Item(1, 7).Value2 = "Файлы старше 5 лет, в Gb"
+    $ws.Range("A1:G1").Font.Bold = $true
+
+    $row = 2
+    foreach ($res in $Results) {
+        $ws.Cells.Item($row, 1).Value2 = $res.BusinessBlock
+        $ws.Cells.Item($row, 2).Value2 = $res.GroupName
+        $ws.Cells.Item($row, 3).Value2 = $res.NotesPath
+        $ws.Cells.Item($row, 4).Value2 = $res.TargetPath
+        $ws.Cells.Item($row, 5).Value2 = $res.TotalGB
+        $ws.Cells.Item($row, 6).Value2 = $res.Old3YearsGB
+        $ws.Cells.Item($row, 7).Value2 = $res.Old5YearsGB
+        $row++
+    }
+
+    [void]$ws.Columns.AutoFit()
+
+    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
+    $wb.SaveAs($TargetExcelPath)
+    $wb.Close($true)
+
+    Write-Host "ГОТОВО! Результаты сохранены в $TargetExcelPath" -ForegroundColor Green
+}
+catch {
+    Write-Error "Ошибка Excel: $_"
+}
+finally {
+    if ($null -ne $excel) {
+        $excel.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
 }
