@@ -1,229 +1,217 @@
 cls
-# ==============================================================================
-# НАСТРОЙКИ ПУТЕЙ И ПАРАМЕТРОВ
-# ==============================================================================
-$SourceExcelPath = "C:\Users\z-BorodinES\Desktop\SourceGroups.xlsx" 
-$TargetExcelPath = "C:\Users\z-BorodinES\Desktop\FoundGroups_AppDS_NewLogic.xlsx"
-
-$AppDSRoot       = "\\p-fsglo-gl02f.abb-win.akbars.ru\AppDS"
-$MaxDepth        = 5
-$TimeoutSeconds  = 30 # Лимит времени на одну группу (в секундах)
+Import-Module ActiveDirectory
 
 # ==============================================================================
-# ФУНКЦИЯ ПОИСКА В ШИРИНУ (BFS) + ТАЙМАУТ 30 СЕК + ВЛОЖЕННЫЕ ГРУППЫ
+# НАСТРОЙКИ
 # ==============================================================================
-function Get-FolderWithGroupBFS {
-    param (
-        [string]$BasePath,
-        [string]$GroupName,
-        [string]$AltGroupName,
-        [int]$DepthLimit = 5,
-        [int]$TimeoutSec = 30
-    )
+$TargetExcelPath = "C:\Users\z-BorodinES\Desktop\Sizing_Report_AD.xlsx"
+$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+$MaxThreads = 4
 
-    if (-not (Test-Path -LiteralPath $BasePath -PathType Container)) { return $null }
+# ==============================================================================
+# ШАГ 1: ПОЛУЧЕНИЕ ГРУПП ИЗ AD
+# ==============================================================================
+Write-Host "Получение групп из OU..." -ForegroundColor Cyan
+$allGroups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties department, info
 
-    $startTime = Get-Date
-    $queue = [System.Collections.Generic.Queue[PSCustomObject]]::new()
-    $queue.Enqueue([PSCustomObject]@{ Path = $BasePath.TrimEnd('\'); Depth = 0 })
+# Фильтруем: оставляем только те группы, где есть department И есть путь в info (Notes)
+$validGroups = $allGroups | Where-Object { 
+    (-not [string]::IsNullOrWhiteSpace($_.department)) -and 
+    (-not [string]::IsNullOrWhiteSpace($_.info)) 
+}
 
-    $cleanGroup = $GroupName.Trim()
-    $cleanAltGroup = if ($AltGroupName) { $AltGroupName.Trim() } else { $null }
+Write-Host "Найдено групп с заполненным Департаментом и Notes: $($validGroups.Count)" -ForegroundColor Green
 
-    while ($queue.Count -gt 0) {
-        # ПРОВЕРКА ТАЙМАУТА
-        if ((Get-Date) - $startTime -gt [timespan]::FromSeconds($TimeoutSec)) {
-            return "TIMEOUT"
+if ($validGroups.Count -eq 0) {
+    Write-Host "Нет данных для обработки. Выход." -ForegroundColor Yellow
+    return
+}
+
+# ==============================================================================
+# ШАГ 2: НАСТРОЙКА МНОГОПОТОЧНОСТИ
+# ==============================================================================
+Write-Host "`nЗапуск многопоточного сканирования Robocopy ($MaxThreads потока)..." -ForegroundColor Yellow
+
+$RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
+$RunspacePool.Open()
+$Jobs = @()
+
+# Блок кода, который будет выполняться внутри каждого потока
+$ScriptBlock = {
+    param($GroupName, $Department, $RawNotesPath)
+
+    # 1. Очистка пути
+    $cleanPath = $RawNotesPath -replace "[\r\n]", " "
+    $cleanPath = $cleanPath.Trim()
+    
+    if ($cleanPath -match '(\\\\.*)') {
+        $cleanPath = $matches[1].TrimEnd('\')
+    } else {
+        return $null # Некорректный путь
+    }
+
+    # 2. Определение TargetPath (резолв DFS, если это DFS)
+    $targetPath = $cleanPath
+    try {
+        # Пытаемся получить реальный путь через системную утилиту (без вывода ошибок)
+        $dfsResult = & dfsutil link $cleanPath 2>$null
+        if ($dfsResult -match 'Target:\s+(\\\\.*)') {
+            $targetPath = $matches[1].Trim()
         }
+    } catch { }
 
-        $current = $queue.Dequeue()
-        
-        try {
-            $acl = (Get-Item -LiteralPath $current.Path -Force -ErrorAction Stop).GetAccessControl('Access')
-            
-            foreach ($rule in $acl.Access) {
-                $aclCleanName = $rule.IdentityReference.Value.Split('\')[-1].Trim()
-                
-                if ($aclCleanName -eq $cleanGroup -or ($null -ne $cleanAltGroup -and $aclCleanName -eq $cleanAltGroup)) {
-                    return $current.Path
-                }
-            }
+    # 3. Настройка Robocopy
+    $Date3Years = (Get-Date).AddYears(-3)
+    $Date5Years = (Get-Date).AddYears(-5)
 
-            if ($current.Depth -ge $DepthLimit) { continue }
-
-            $subFolders = [System.IO.Directory]::EnumerateDirectories($current.Path)
-            foreach ($folder in $subFolders) {
-                $queue.Enqueue([PSCustomObject]@{ Path = $folder; Depth = $current.Depth + 1 })
-            }
-        }
-        catch {
-            # Пропуск папок без доступа
+    if (-not (Test-Path -LiteralPath $cleanPath -ErrorAction SilentlyContinue)) {
+        return [PSCustomObject]@{
+            BusinessBlock = $Department
+            GroupName     = $GroupName
+            NotesPath     = $cleanPath
+            TargetPath    = "НЕДОСТУПЕН"
+            TotalGB       = 0
+            Old3YearsGB   = 0
+            Old5YearsGB   = 0
         }
     }
-    return $null
-}
 
-# ==============================================================================
-# ФУНКЦИЯ ПРИБЛИЗИТЕЛЬНОГО ПОИСКА ПАПКИ В КОРНЕ
-# ==============================================================================
-function Find-FuzzyFolder {
-    param (
-        [string]$RootPath,
-        [string]$TargetFolderName
-    )
-    
-    if ([string]::IsNullOrWhiteSpace($TargetFolderName)) { return $null }
-    
-    try {
-        $subFolders = [System.IO.Directory]::EnumerateDirectories($RootPath)
-        foreach ($folder in $subFolders) {
-            $folderName = ($folder -split '\\')[-1]
-            
-            if ($folderName -match [regex]::Escape($TargetFolderName) -or $TargetFolderName -match [regex]::Escape($folderName)) {
-                return $folder
-            }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "robocopy.exe"
+    $psi.Arguments = "`"$cleanPath`" NUL /L /E /XJ /BYTES /FP /TS /NC /NJH /NJS /NDL /R:0 /W:0 /NP"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+
+    [long]$TotalBytes = 0
+    [long]$Old3Bytes  = 0
+    [long]$Old5Bytes  = 0
+
+    $regex = [regex]'^\s*(\d+)\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s'
+
+    # 4. Чтение потока Robocopy "на лету"
+    while (($line = $process.StandardOutput.ReadLine()) -ne $null) {
+        $match = $regex.Match($line)
+        if ($match.Success) {
+            $Bytes = [long]$match.Groups[1].Value
+            $FileDate = [datetime]::ParseExact($match.Groups[2].Value, "yyyy/MM/dd HH:mm:ss", $null)
+
+            $TotalBytes += $Bytes
+
+            if ($FileDate -lt $Date3Years) { $Old3Bytes += $Bytes }
+            if ($FileDate -lt $Date5Years) { $Old5Bytes += $Bytes }
         }
-    } catch {}
-    
-    return $null
+    }
+
+    $process.WaitForExit()
+    $process.Dispose()
+
+    # Формируем итоговый объект
+    return [PSCustomObject]@{
+        BusinessBlock = $Department
+        GroupName     = $GroupName
+        NotesPath     = $cleanPath
+        TargetPath    = $targetPath
+        TotalGB       = [math]::Round($TotalBytes / 1GB, 2)
+        Old3YearsGB   = [math]::Round($Old3Bytes  / 1GB, 2)
+        Old5YearsGB   = [math]::Round($Old5Bytes  / 1GB, 2)
+    }
 }
 
 # ==============================================================================
-# ОСНОВНАЯ ЛОГИКА
+# ШАГ 3: РАЗДАЧА ЗАДАЧ ПОТОКАМ
 # ==============================================================================
+foreach ($group in $validGroups) {
+    $PowerShell = [powershell]::Create()
+    $PowerShell.RunspacePool = $RunspacePool
+    [void]$PowerShell.AddScript($ScriptBlock)
+    [void]$PowerShell.AddArgument($group.Name)
+    [void]$PowerShell.AddArgument($group.department)
+    [void]$PowerShell.AddArgument($group.info)
+    
+    $Jobs += [PSCustomObject]@{
+        Pipe = $PowerShell
+        Result = $PowerShell.BeginInvoke()
+    }
+}
 
-Write-Host "Запуск Excel..." -ForegroundColor Cyan
+# Ожидание результатов с прогресс-баром
+$completedCount = 0
+$totalJobs = $Jobs.Count
+$Results = @()
+
+while ($Jobs.Result.IsCompleted -contains $false) {
+    foreach ($job in $Jobs) {
+        if ($job.Result.IsCompleted -and $null -eq $job.Checked) {
+            $job.Checked = $true
+            $completedCount++
+            
+            $jobResult = $job.Pipe.EndInvoke($job.Result)
+            if ($jobResult) { $Results += $jobResult }
+            
+            Write-Host "Обработано путей: $completedCount из $totalJobs" -ForegroundColor DarkGray
+        }
+    }
+    Start-Sleep -Milliseconds 200
+}
+
+# Очистка потоков
+foreach ($job in $Jobs) { $job.Pipe.Dispose() }
+$RunspacePool.Close()
+$RunspacePool.Dispose()
+
+# ==============================================================================
+# ШАГ 4: ЗАПИСЬ РЕЗУЛЬТАТОВ В EXCEL
+# ==============================================================================
+Write-Host "`nСохранение отчета в Excel..." -ForegroundColor Cyan
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
 
 try {
-    Write-Host "Чтение исходного файла $SourceExcelPath..." -ForegroundColor Cyan
-    $wbSource = $excel.Workbooks.Open($SourceExcelPath)
-    $wsSource = $wbSource.Worksheets.Item(1)
-    $lastRow = $wsSource.Cells.SpecialCells(11).Row 
+    $wb = $excel.Workbooks.Add()
+    $ws = $wb.Worksheets.Item(1)
+    $ws.Name = "Диск R"
 
-    $results = @()
+    # Заголовки
+    $ws.Cells.Item(1, 1).Value2 = "Блок бизнеса"
+    $ws.Cells.Item(1, 2).Value2 = "Имя группы"
+    $ws.Cells.Item(1, 3).Value2 = "Путь(Notes)"
+    $ws.Cells.Item(1, 4).Value2 = "TargetPath"
+    $ws.Cells.Item(1, 5).Value2 = "Общий размер папки, в Gb"
+    $ws.Cells.Item(1, 6).Value2 = "Файлы старше 3х лет, в Gb"
+    $ws.Cells.Item(1, 7).Value2 = "Файлы старше 5 лет, в Gb"
 
-    for ($i = 2; $i -le $lastRow; $i++) {
-        $groupName = $wsSource.Cells.Item($i, 1).Text
-        $rawObjectPath = $wsSource.Cells.Item($i, 4).Text 
+    $ws.Range("A1:G1").Font.Bold = $true
 
-        if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
-
-        Write-Host "Обработка [$i / $lastRow]: $groupName"
-
-        # --- 1. ВЫЧИСЛЕНИЕ АНГЛИЙСКОЙ ГРУППЫ-РОДИТЕЛЯ ---
-        $altGroupName = $null
-        if ($groupName -match "(?i) - изменение$") {
-            $altGroupName = $groupName -ireplace "(?i) - изменение$", " - write"
-        } elseif ($groupName -match "(?i) - чтение$") {
-            $altGroupName = $groupName -ireplace "(?i) - чтение$", " - read"
-        }
-
-        # --- 2. ПАРСИНГ И ПОДГОТОВКА ПУТИ ---
-        $cleanPath = $rawObjectPath.Replace("/", "\")
-        $escapedGroup = [regex]::Escape($groupName)
-        $cleanPath = $cleanPath -replace "\\$escapedGroup\\?$", ""
-
-        $status = ""
-        $details = ""
-
-        if ($cleanPath -match 'Users-APPsFileExchange\\?(.*)') {
-            $relativePath = $matches[1]
-            $primaryPath = (Join-Path $AppDSRoot $relativePath).TrimEnd('\')
-
-            $searchBasePath = $null
-            $searchType = ""
-
-            if (Test-Path -LiteralPath $primaryPath -PathType Container) {
-                $searchBasePath = $primaryPath
-                $searchType = "Прямой путь"
-                Write-Host "  -> Прямой путь: $primaryPath" -ForegroundColor Yellow
-            } 
-            else {
-                $firstFolder = ($relativePath -split '\\')[0]
-                Write-Host "  -> Прямой путь не найден. Ищем папку '$firstFolder'..." -ForegroundColor Magenta
-                $fuzzyPath = Find-FuzzyFolder -RootPath $AppDSRoot -TargetFolderName $firstFolder
-                
-                if ($fuzzyPath) {
-                    $searchBasePath = $fuzzyPath
-                    $searchType = "Приблизительный путь ($firstFolder)"
-                    Write-Host "  -> Найдена похожая папка: $fuzzyPath" -ForegroundColor Yellow
-                } else {
-                    $status = "Группа не найдена"
-                    $details = "Базовый и приблизительный пути не найдены в AppDS"
-                    Write-Host "  -> Не удалось найти даже похожую папку." -ForegroundColor Red
-                }
-            }
-
-            # --- 3. ЗАПУСК BFS ПОИСКА С ТАЙМАУТОМ ---
-            if ($searchBasePath) {
-                $foundLocation = Get-FolderWithGroupBFS -BasePath $searchBasePath -GroupName $groupName -AltGroupName $altGroupName -DepthLimit $MaxDepth -TimeoutSec $TimeoutSeconds
-                
-                if ($foundLocation -eq "TIMEOUT") {
-                    $status = "Группа не найдена"
-                    $details = "Превышено время поиска (>$TimeoutSeconds сек). Требуется ручной поиск."
-                    Write-Host "  -> Таймаут $TimeoutSeconds сек превышен! Пропускаем." -ForegroundColor Magenta
-                }
-                elseif ($foundLocation) {
-                    $status = "Найдено ($searchType)"
-                    $details = $foundLocation
-                    Write-Host "  -> НАЙДЕНО: $details" -ForegroundColor Green
-                } else {
-                    $status = "Группа не найдена"
-                    $details = "Не найдено (до $MaxDepth уровней) в $searchBasePath"
-                    Write-Host "  -> Обошли все уровни, группа не найдена." -ForegroundColor DarkYellow
-                }
-            }
-        }
-        else {
-            $status = "Пропущено"
-            $details = "В пути Object нет 'Users-APPsFileExchange'"
-            Write-Host "  -> Пропуск (нет триггера)." -ForegroundColor Gray
-        }
-
-        $results += [PSCustomObject]@{
-            GroupName = $groupName
-            Status    = $status
-            Details   = $details
-        }
+    $row = 2
+    foreach ($res in $Results) {
+        $ws.Cells.Item($row, 1).Value2 = $res.BusinessBlock
+        $ws.Cells.Item($row, 2).Value2 = $res.GroupName
+        $ws.Cells.Item($row, 3).Value2 = $res.NotesPath
+        $ws.Cells.Item($row, 4).Value2 = $res.TargetPath
+        $ws.Cells.Item($row, 5).Value2 = $res.TotalGB
+        $ws.Cells.Item($row, 6).Value2 = $res.Old3YearsGB
+        $ws.Cells.Item($row, 7).Value2 = $res.Old5YearsGB
+        $row++
     }
 
-    $wbSource.Close($false)
-
-    # --- Создание нового Excel файла ---
-    Write-Host "Создание нового файла $TargetExcelPath..." -ForegroundColor Cyan
-    $wbTarget = $excel.Workbooks.Add()
-    $wsTarget = $wbTarget.Worksheets.Item(1)
-
-    $wsTarget.Cells.Item(1, 1).Value2 = "Имя группы"
-    $wsTarget.Cells.Item(1, 2).Value2 = "Статус"
-    $wsTarget.Cells.Item(1, 3).Value2 = "Точное расположение / Описание"
-    
-    $wsTarget.Range("A1:C1").Font.Bold = $true
-
-    $rowTarget = 2
-    foreach ($item in $results) {
-        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.GroupName
-        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.Status
-        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.Details
-        $rowTarget++
-    }
-
-    [void]$wsTarget.Columns.AutoFit()
+    [void]$ws.Columns.AutoFit()
 
     if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
-    $wbTarget.SaveAs($TargetExcelPath)
-    $wbTarget.Close($true)
+    $wb.SaveAs($TargetExcelPath)
+    $wb.Close($true)
 
-    Write-Host "Готово! Результат сохранен в: $TargetExcelPath" -ForegroundColor Green
+    Write-Host "УСПЕХ! Файл сохранен: $TargetExcelPath" -ForegroundColor Green
 }
 catch {
-    Write-Error "Произошла ошибка: $_"
+    Write-Error "Ошибка при работе с Excel: $_"
 }
 finally {
-    if ($excel) {
+    if ($null -ne $excel) {
         $excel.Quit()
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
         [System.GC]::Collect()
