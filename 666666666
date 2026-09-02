@@ -1,154 +1,171 @@
-Сейчас очень ответсвенная и важная работа 
-Помнищь мы получали группы безопасности из определённой оушки 
+Теперь на базе этой же задачи создаём сбор информации для забикса смотри как это сделано уже у меня но скрипт считает количество людей по подразделениям у каждого блока главное что ты должен от туда понять как именно формируется txt файл его формат 
+очень критично ибо мотом в заббиксе буду создавать дискавери свойство а оно очень прихотливо к формату
+Наша задача создать подобный сбор информации по подразделениям которые указаны в department у групп безопасностей но подсчитывать будет именно размеры папок тоесть СТРОГО на сегоднешний момент, то есть все разберы папок относящиеся относящиеся к определённому подразделению сумируем надеюсь понял ключевую идею 
 
-# Точный путь, скопированный из атрибутов AD
-$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+Вот код пример:
+cls
 
-Write-Host "Получение списка групп из конкретной OU..." -ForegroundColor Cyan
+$timestart = Get-Date
+$today = Get-Date -Format dd.MM.yyyy
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
-Так вот теперь мы из этой оушки берём все группы и оставляем только те группы у которых прописан атрибут department 
-Теперь очень важная часть мы же прописывали группам атрибут Notes это пути до папок так вот 
-с помощью робокопи считаем размер этой папки текущий, отдельно всех файлов старше 3х лет и отдельно всех файлов старше 5 лет
+$LogPath = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\AllUsersBlocksDiscoveryLOG.log"
 
-Вот код который делает что то то похожее 
+$ScriptStatus = "SUCCESS"
 
-# ============================================================
-# Network_Sizing.ps1
-# Windows PowerShell 5.1
-# ============================================================
-
-$scriptPath = $PSScriptRoot
-if (-not $scriptPath) { $scriptPath = (Get-Location).Path }
-
-$Report = Join-Path $scriptPath "Sizing_Report.csv"
-
-# Что сканируем
-$Paths = @(
-    "\\server01\share\Folder1",
-    "\\server01\share\Folder2",
-    "\\server02\share\Folder3"
-)
-
-# Даты для определения старых файлов
-$Date3Years = (Get-Date).AddYears(-3)
-$Date5Years = (Get-Date).AddYears(-5)
-
-
-function Get-FolderSizing {
+function Write-Log {
     param(
-        [string]$Path
+        [string]$Message
+    )
+    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
+}
+
+try {
+    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+
+    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+
+    $AllUsersOn = Get-ADUser `
+        -Filter { enabled -eq $true } `
+        -Credential $ab_creds `
+        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType
+
+    $LimitDate = (Get-Date).AddDays(-3)
+
+    $DivisionCount = @{}
+
+    # Счётчик исключённых
+    $ExcludedCount = 0
+
+    foreach ($User in $AllUsersOn) {
+
+        $sam = $User.samaccountname
+        $name = $User.name
+        $dn = $User.DistinguishedName
+
+        if (
+            $User.whenCreated -gt $LimitDate -or
+            $User.employeeType -eq "service" -or
+
+            $sam -like "Health*" -or
+            $sam -like "audit*" -or
+            $sam -like "esas*" -or
+            $sam -like "a-*" -or
+            $sam -like "z-*" -or
+            $name -like "*`$*" -or
+            $name -like "*Администратор*" -or
+            $name -like "*Тестовая*" -or
+            $dn -like "*Отключенные пользователи*" -or
+            $dn -like "*сторон*"
+        ) {
+            $ExcludedCount++
+            continue
+        }
+
+        $div = $User.division
+
+        if ($div) {
+            if ($DivisionCount.ContainsKey($div)) {
+                $DivisionCount[$div]++
+            }
+            else {
+                $DivisionCount[$div] = 1
+            }
+        }
+        else {
+            $emptyKey = "(не указано)"
+
+            if ($DivisionCount.ContainsKey($emptyKey)) {
+                $DivisionCount[$emptyKey]++
+            }
+            else {
+                $DivisionCount[$emptyKey] = 1
+            }
+        }
+    }
+    $DivisionCount["Все_пользователи"] = $AllUsers.Count
+    $discovery = foreach ($k in $DivisionCount.Keys) {
+        @{ '{#DIVISION}' = $k }
+    }
+
+    $payload = [ordered]@{
+        discovery = @($discovery)
+        counts = $DivisionCount
+        metadata = @{
+            TotalActiveUsers  = $AllUsersOn.Count
+            ExcludedUsers     = $ExcludedCount
+            RealUsers         = ($DivisionCount.Values | Measure-Object -Sum).Sum
+            UniqueDivisions   = $DivisionCount.Count
+            GeneratedAt       = $time
+            ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+        }
+    }
+
+    $json = $payload | ConvertTo-Json -Depth 4
+
+    $outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
+
+    [System.IO.File]::WriteAllText(
+        $outputPath,
+        $json,
+        [System.Text.UTF8Encoding]::new($false)
     )
 
-    Write-Host "`nСканирование: $Path" -ForegroundColor Cyan
+    $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
 
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    # Логирование
+    Write-Log ""
+    Write-Log "СТАТУС: $ScriptStatus"
+    Write-Log "Подсчёт по блокам"
+    Write-Log "Всего уникальных подразделений: $($DivisionCount.Count)"
 
-    if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
-        Write-Warning "Нет доступа или путь недоступен: $Path"
+    Write-Host "`nПодсчёт по блокам" -ForegroundColor Green
+    Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
 
-        return [PSCustomObject]@{
-            Path        = $Path
-            TotalGB     = 0
-            Old3YearsGB = 0
-            Old5YearsGB = 0
-            FileCount   = 0
-            ElapsedSec  = 0
-            Status      = "ERROR"
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        ForEach-Object {
+            $percent = "{0:P2}" -f ($_.Value / $RealUsersCount)
+            Write-Log ("{0,-60} {1,6} {2,8}" -f $_.Key, $_.Value, $percent)
         }
-    }
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "robocopy.exe"
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
+                     @{Label="Кол-во"; Expression={$_.Value}; Width=10},
+                     @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
 
-    # /L     - ничего не копировать, только показать
-    # /E     - пройти все подпапки
-    # /XJ    - не заходить в junction points
-    # /BYTES - размер файлов в байтах
-    # /TS    - дата/время файла
-    $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /FP /TS /NC /NJH /NJS /NDL /R:0 /W:0 /NP"
+    Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
+    Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
+    Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
 
-    $psi.UseShellExecute        = $false
-    $psi.CreateNoWindow         = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
+    Write-Log "Всего активных пользователей в AD: $($AllUsersOn.Count)"
+    Write-Log "Исключено (служебные/админские/вендоры): $ExcludedCount"
+    Write-Log "Реальных пользователей для анализа: $RealUsersCount"
 
-    $process = [System.Diagnostics.Process]::Start($psi)
+    $timestop = Get-Date
+    $TimeSum = $timestop - $timestart
 
-    [long]$TotalBytes = 0
-    [long]$Old3Bytes  = 0
-    [long]$Old5Bytes  = 0
-    [long]$FileCount  = 0
+    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+    Write-Host "Файл сохранён." -ForegroundColor Green
 
-    # Пример строки robocopy:
-    # 123456  2022/05/20 12:30:00  \\server\share\file.txt
-    $regex = [regex]'^\s*(\d+)\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s'
-
-    while (($line = $process.StandardOutput.ReadLine()) -ne $null) {
-
-        $match = $regex.Match($line)
-
-        if ($match.Success) {
-
-            $Bytes = [long]$match.Groups[1].Value
-
-            $FileDate = [datetime]::ParseExact(
-                $match.Groups[2].Value,
-                "yyyy/MM/dd HH:mm:ss",
-                $null
-            )
-
-            $TotalBytes += $Bytes
-            $FileCount++
-
-            if ($FileDate -lt $Date3Years) {
-                $Old3Bytes += $Bytes
-            }
-
-            if ($FileDate -lt $Date5Years) {
-                $Old5Bytes += $Bytes
-            }
-        }
-    }
-
-    $process.WaitForExit()
-    $ExitCode = $process.ExitCode
-    $process.Dispose()
-
-    $sw.Stop()
-
-    $Result = [PSCustomObject]@{
-        Path        = $Path
-        TotalGB     = [math]::Round($TotalBytes / 1GB, 2)
-        Old3YearsGB = [math]::Round($Old3Bytes  / 1GB, 2)
-        Old5YearsGB = [math]::Round($Old5Bytes  / 1GB, 2)
-        FileCount   = $FileCount
-        ElapsedSec  = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-        Status      = if ($ExitCode -lt 8) { "OK" } else { "ERROR ($ExitCode)" }
-    }
-
-    Write-Host ("Всего: {0} GB | файлов: {1} | старше 3 лет: {2} GB | старше 5 лет: {3} GB" -f `
-        $Result.TotalGB,
-        $Result.FileCount,
-        $Result.Old3YearsGB,
-        $Result.Old5YearsGB
-    ) -ForegroundColor Green
-
-    return $Result
+    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
 }
+catch {
+    $ScriptStatus = "ERROR"
+    Write-Log ""
+    Write-Log "СТАТУС: ERROR"
+    Write-Log "Ошибка:"
+    Write-Log $_.Exception.Message
+    Write-Log "Полная информация:"
+    Write-Log $_
+    
+    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+    
+    throw
+} 
 
-
-# Запуск
-$Results = foreach ($Path in $Paths) {
-    Get-FolderSizing -Path $Path
-}
-
-# Отчёт рядом со скриптом
-$Results | Export-Csv $Report -Delimiter ";" -NoTypeInformation -Encoding UTF8
-
-Write-Host "`nГотово." -ForegroundColor Green
-Write-Host "Отчёт: $Report" -ForegroundColor Cyan
-
-Только чтобы наш новый скрипт работал куда быстрее давай сделаем его многопоточным 4 потока
-
-теперь вот что делаем когда всю вводную я дал Теперь формируем новый xlsx файл в листе под названием Диск R Первый столбец: Блок бизнеса берём из department, второй столбец Имя группы, третий столбец Путь(Notes), четвертый столбец TargetPath - берём из папки скорее всего этот путь указан в dfs, Следующие столбцы -"Общий размер папки, в Gb", "Файлы старше 3х лет, в Gb", "Файлы старше 5 лет, в Gb"
-  
+ЛОГИРОВАНИЕ ТОЖЕ НЕ ЗАБУДЬ
