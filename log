@@ -1,4 +1,10 @@
-DFS путь записывает не правильно он выглядит к примеру у папки ДИТ вот так \\p-fsdpt-dit01f.abb-win.akbars.ru\ДИТ
-я вот открыл папку свойства DFS и нашел этот путь подумай как это можно сделать скриптом это тот самый TargetPath
 
-Так же я подумал давай считать файлы старше 3 и 5 лет перед уходом домой запущу скрипт и завтра посмотрим на результаты 
+ОШИБКА: Exception setting "Checked": "The property 'Checked' cannot be found on this object. Verify that the property exists and can be set."
+Exception setting "Checked": "The property 'Checked' cannot be found on this object. Verify that the property exists and can be set."
+At line:121 char:17
++                 $job.Checked = $true
++                 ~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : ExceptionWhenSetting
+
+Опять ты допустил эту ошибку, так же выводи информацию в консоль по каждой подсчитанной папки что бы я понимал что скрипт выполняется 
