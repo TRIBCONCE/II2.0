@@ -1,2 +1,154 @@
-Смотри у меня вот новая задача есть файл xlsx Два поля Имя группы,	Блок Бизнеса
-Надо всем группам безопасности в эктив директори в атрибуте department мы прописываем значение из столбца Блок Бизнеса
+Сейчас очень ответсвенная и важная работа 
+Помнищь мы получали группы безопасности из определённой оушки 
+
+# Точный путь, скопированный из атрибутов AD
+$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+
+Write-Host "Получение списка групп из конкретной OU..." -ForegroundColor Cyan
+
+Так вот теперь мы из этой оушки берём все группы и оставляем только те группы у которых прописан атрибут department 
+Теперь очень важная часть мы же прописывали группам атрибут Notes это пути до папок так вот 
+с помощью робокопи считаем размер этой папки текущий, отдельно всех файлов старше 3х лет и отдельно всех файлов старше 5 лет
+
+Вот код который делает что то то похожее 
+
+# ============================================================
+# Network_Sizing.ps1
+# Windows PowerShell 5.1
+# ============================================================
+
+$scriptPath = $PSScriptRoot
+if (-not $scriptPath) { $scriptPath = (Get-Location).Path }
+
+$Report = Join-Path $scriptPath "Sizing_Report.csv"
+
+# Что сканируем
+$Paths = @(
+    "\\server01\share\Folder1",
+    "\\server01\share\Folder2",
+    "\\server02\share\Folder3"
+)
+
+# Даты для определения старых файлов
+$Date3Years = (Get-Date).AddYears(-3)
+$Date5Years = (Get-Date).AddYears(-5)
+
+
+function Get-FolderSizing {
+    param(
+        [string]$Path
+    )
+
+    Write-Host "`nСканирование: $Path" -ForegroundColor Cyan
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+        Write-Warning "Нет доступа или путь недоступен: $Path"
+
+        return [PSCustomObject]@{
+            Path        = $Path
+            TotalGB     = 0
+            Old3YearsGB = 0
+            Old5YearsGB = 0
+            FileCount   = 0
+            ElapsedSec  = 0
+            Status      = "ERROR"
+        }
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "robocopy.exe"
+
+    # /L     - ничего не копировать, только показать
+    # /E     - пройти все подпапки
+    # /XJ    - не заходить в junction points
+    # /BYTES - размер файлов в байтах
+    # /TS    - дата/время файла
+    $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /FP /TS /NC /NJH /NJS /NDL /R:0 /W:0 /NP"
+
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+
+    [long]$TotalBytes = 0
+    [long]$Old3Bytes  = 0
+    [long]$Old5Bytes  = 0
+    [long]$FileCount  = 0
+
+    # Пример строки robocopy:
+    # 123456  2022/05/20 12:30:00  \\server\share\file.txt
+    $regex = [regex]'^\s*(\d+)\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s'
+
+    while (($line = $process.StandardOutput.ReadLine()) -ne $null) {
+
+        $match = $regex.Match($line)
+
+        if ($match.Success) {
+
+            $Bytes = [long]$match.Groups[1].Value
+
+            $FileDate = [datetime]::ParseExact(
+                $match.Groups[2].Value,
+                "yyyy/MM/dd HH:mm:ss",
+                $null
+            )
+
+            $TotalBytes += $Bytes
+            $FileCount++
+
+            if ($FileDate -lt $Date3Years) {
+                $Old3Bytes += $Bytes
+            }
+
+            if ($FileDate -lt $Date5Years) {
+                $Old5Bytes += $Bytes
+            }
+        }
+    }
+
+    $process.WaitForExit()
+    $ExitCode = $process.ExitCode
+    $process.Dispose()
+
+    $sw.Stop()
+
+    $Result = [PSCustomObject]@{
+        Path        = $Path
+        TotalGB     = [math]::Round($TotalBytes / 1GB, 2)
+        Old3YearsGB = [math]::Round($Old3Bytes  / 1GB, 2)
+        Old5YearsGB = [math]::Round($Old5Bytes  / 1GB, 2)
+        FileCount   = $FileCount
+        ElapsedSec  = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        Status      = if ($ExitCode -lt 8) { "OK" } else { "ERROR ($ExitCode)" }
+    }
+
+    Write-Host ("Всего: {0} GB | файлов: {1} | старше 3 лет: {2} GB | старше 5 лет: {3} GB" -f `
+        $Result.TotalGB,
+        $Result.FileCount,
+        $Result.Old3YearsGB,
+        $Result.Old5YearsGB
+    ) -ForegroundColor Green
+
+    return $Result
+}
+
+
+# Запуск
+$Results = foreach ($Path in $Paths) {
+    Get-FolderSizing -Path $Path
+}
+
+# Отчёт рядом со скриптом
+$Results | Export-Csv $Report -Delimiter ";" -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nГотово." -ForegroundColor Green
+Write-Host "Отчёт: $Report" -ForegroundColor Cyan
+
+Только чтобы наш новый скрипт работал куда быстрее давай сделаем его многопоточным 4 потока
+
+теперь вот что делаем когда всю вводную я дал Теперь формируем новый xlsx файл Первый столбец: Блок бизнеса берём из department, второй столбец Имя группы, третий столбец Путь(Notes), четвертый столбец TargetPath - берём из папки скорее всего этот путь указан в dfs, Следующие столбцы -"Общий размер папки, в Gb", "Файлы старше 3х лет, в Gb", "Файлы старше 5 лет, в Gb"
+  
