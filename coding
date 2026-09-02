@@ -2,11 +2,9 @@ cls
 Import-Module ActiveDirectory
 
 # ==============================================================================
-# НАСТРОЙКИ ПУТЕЙ
+# НАСТРОЙКИ
 # ==============================================================================
-$FoldersExcelPath = "C:\Users\z-BorodinES\Desktop\File1_Folders.xlsx" 
-$GroupsExcelPath  = "C:\Users\z-BorodinES\Desktop\File2_Groups.xlsx"  
-$TargetExcelPath  = "C:\Users\z-BorodinES\Desktop\Result_Match_Final.xlsx"  
+$ExcelPath = "C:\Users\z-BorodinES\Desktop\File_BusinessBlock.xlsx" # Укажи свой путь к файлу
 
 Write-Host "Запуск Excel..." -ForegroundColor Cyan
 $excel = New-Object -ComObject Excel.Application
@@ -14,159 +12,57 @@ $excel.Visible = $false
 $excel.DisplayAlerts = $false
 
 try {
-    # ==============================================================================
-    # ШАГ 1: ЧТЕНИЕ ФАЙЛА С ГРУППАМИ (КЭШИРОВАНИЕ)
-    # ==============================================================================
-    Write-Host "Чтение файла с группами ($GroupsExcelPath)..." -ForegroundColor Cyan
-    $wbGroups = $excel.Workbooks.Open($GroupsExcelPath)
-    $wsGroups = $wbGroups.Worksheets.Item(1)
-    $lastRowGroups = $wsGroups.Cells.SpecialCells(11).Row 
+    Write-Host "Чтение файла $ExcelPath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($ExcelPath)
+    $ws = $wb.Worksheets.Item(1)
+    $lastRow = $ws.Cells.SpecialCells(11).Row 
 
-    $GroupsCache = @()
+    Write-Host "Начинаем обновление атрибута Department в Active Directory..." -ForegroundColor Yellow
 
-    for ($i = 2; $i -le $lastRowGroups; $i++) {
-        $groupName  = $wsGroups.Cells.Item($i, 1).Text
-        $notesPath  = $wsGroups.Cells.Item($i, 2).Text
-        $pathStatus = $wsGroups.Cells.Item($i, 3).Text
+    for ($i = 2; $i -le $lastRow; $i++) {
+        $groupName     = $ws.Cells.Item($i, 1).Text
+        $businessBlock = $ws.Cells.Item($i, 2).Text
 
         if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
 
-        $cleanNotesPath = $notesPath.Trim().TrimEnd('\')
+        $cleanGroup = $groupName.Trim()
+        $cleanBlock = $businessBlock.Trim()
 
-        $GroupsCache += [PSCustomObject]@{
-            GroupName  = $groupName.Trim()
-            NotesPath  = $cleanNotesPath
-            PathStatus = $pathStatus.Trim()
-        }
-    }
-    $wbGroups.Close($false)
-    Write-Host "  -> Загружено групп в память: $($GroupsCache.Count)" -ForegroundColor Green
+        try {
+            # Ищем группу в AD (Filter {...} безопаснее обрабатывает спецсимволы в именах)
+            $adGroup = Get-ADGroup -Filter {Name -eq $cleanGroup} -ErrorAction Stop
 
-    # ==============================================================================
-    # ШАГ 2: ЧТЕНИЕ ФАЙЛА С ПАПКАМИ И ПОИСК СОВПАДЕНИЙ
-    # ==============================================================================
-    Write-Host "`nЧтение файла с папками ($FoldersExcelPath)..." -ForegroundColor Cyan
-    $wbFolders = $excel.Workbooks.Open($FoldersExcelPath)
-    $wsFolders = $wbFolders.Worksheets.Item(1)
-    $lastRowFolders = $wsFolders.Cells.SpecialCells(11).Row 
-
-    $Results = @()
-
-    for ($i = 2; $i -le $lastRowFolders; $i++) {
-        $businessBlock = $wsFolders.Cells.Item($i, 1).Text
-        $folderName    = $wsFolders.Cells.Item($i, 2).Text
-        $dfsPath       = $wsFolders.Cells.Item($i, 3).Text
-
-        if ([string]::IsNullOrWhiteSpace($dfsPath)) { continue }
-
-        $transformedPath = $dfsPath -ireplace "^R:\\", "\\abb-win.akbars.ru\departments\"
-        $transformedPath = $transformedPath.Trim().TrimEnd('\')
-
-        $matchedGroups = @($GroupsCache | Where-Object { $_.NotesPath -eq $transformedPath })
-
-        if ($matchedGroups.Count -eq 0) {
-            # НИЧЕГО НЕ НАЙДЕНО
-            Write-Host "[$i / $lastRowFolders] НЕ НАЙДЕНО: $transformedPath" -ForegroundColor DarkGray
-            
-            $Results += [PSCustomObject]@{
-                SearchStatus  = "не найдена"
-                GroupName     = ""
-                BusinessBlock = $businessBlock.Trim()
-                PathStatus    = ""
-                NotesPath     = ""
-                DFSPath       = $dfsPath.Trim()
-                FolderName    = $folderName.Trim()
-            }
-        } 
-        else {
-            # НАЙДЕНА ОДНА ИЛИ НЕСКОЛЬКО ГРУПП
-            $selectedGroup = $null
-
-            if ($matchedGroups.Count -gt 1) {
-                Write-Host "[$i / $lastRowFolders] Найдено несколько групп ($($matchedGroups.Count)). Поиск главенствующей..." -ForegroundColor Yellow
-                
-                # Ищем группу, которая не вложена в другие (MemberOf пустое)
-                foreach ($mg in $matchedGroups) {
-                    try {
-                        $adGroup = Get-ADGroup -Identity $mg.GroupName -Properties MemberOf -ErrorAction Stop
-                        if ($null -eq $adGroup.MemberOf -or $adGroup.MemberOf.Count -eq 0) {
-                            $selectedGroup = $mg
-                            break # Нашли невложенную - берем её и прекращаем перебор
-                        }
-                    } catch { }
-                }
-
-                # Если не удалось найти невложенную (или AD недоступен), берем первую попавшуюся
-                if ($null -eq $selectedGroup) {
-                    $selectedGroup = $matchedGroups[0]
+            if ($null -ne $adGroup) {
+                if (-not [string]::IsNullOrWhiteSpace($cleanBlock)) {
+                    # Записываем значение в атрибут department
+                    Set-ADGroup -Identity $adGroup -Replace @{department=$cleanBlock} -ErrorAction Stop
+                    Write-Host "[$i / $lastRow] УСПЕХ: Группе '$cleanGroup' записан департамент '$cleanBlock'" -ForegroundColor Green
+                } 
+                else {
+                    # Если ячейка пустая, очищаем атрибут
+                    Set-ADGroup -Identity $adGroup -Clear department -ErrorAction Stop
+                    Write-Host "[$i / $lastRow] ОЧИЩЕНО: У группы '$cleanGroup' удален атрибут department (пустая ячейка)" -ForegroundColor DarkYellow
                 }
             } 
             else {
-                # Найдена ровно одна группа
-                Write-Host "[$i / $lastRowFolders] НАЙДЕНО (1): $transformedPath" -ForegroundColor Green
-                $selectedGroup = $matchedGroups[0]
-            }
-
-            # Добавляем в результаты
-            $Results += [PSCustomObject]@{
-                SearchStatus  = "найдена"
-                GroupName     = $selectedGroup.GroupName
-                BusinessBlock = $businessBlock.Trim()
-                PathStatus    = $selectedGroup.PathStatus
-                NotesPath     = $selectedGroup.NotesPath
-                DFSPath       = $dfsPath.Trim()
-                FolderName    = $folderName.Trim()
+                Write-Host "[$i / $lastRow] НЕ НАЙДЕНО: Группа '$cleanGroup' не существует в AD" -ForegroundColor Red
             }
         }
+        catch {
+            Write-Host "[$i / $lastRow] ОШИБКА AD: Не удалось обработать '$cleanGroup' ($($_.Exception.Message))" -ForegroundColor Red
+        }
     }
-    $wbFolders.Close($false)
-
-    # ==============================================================================
-    # ШАГ 3: ЗАПИСЬ РЕЗУЛЬТАТОВ В НОВЫЙ ФАЙЛ
-    # ==============================================================================
-    Write-Host "`nСоздание итогового файла $TargetExcelPath..." -ForegroundColor Cyan
-    $wbTarget = $excel.Workbooks.Add()
-    $wsTarget = $wbTarget.Worksheets.Item(1)
-
-    # Новые заголовки
-    $wsTarget.Cells.Item(1, 1).Value2 = "Статус поиска"
-    $wsTarget.Cells.Item(1, 2).Value2 = "Имя группы"
-    $wsTarget.Cells.Item(1, 3).Value2 = "Блок Бизнеса"
-    $wsTarget.Cells.Item(1, 4).Value2 = "Статус пути"
-    $wsTarget.Cells.Item(1, 5).Value2 = "Путь (из Notes)"
-    $wsTarget.Cells.Item(1, 6).Value2 = "DFSPath"
-    $wsTarget.Cells.Item(1, 7).Value2 = "FolderName"
-    
-    $wsTarget.Range("A1:G1").Font.Bold = $true
-
-    $rowTarget = 2
-    foreach ($item in $Results) {
-        $wsTarget.Cells.Item($rowTarget, 1).Value2 = $item.SearchStatus
-        $wsTarget.Cells.Item($rowTarget, 2).Value2 = $item.GroupName
-        $wsTarget.Cells.Item($rowTarget, 3).Value2 = $item.BusinessBlock
-        $wsTarget.Cells.Item($rowTarget, 4).Value2 = $item.PathStatus
-        $wsTarget.Cells.Item($rowTarget, 5).Value2 = $item.NotesPath
-        $wsTarget.Cells.Item($rowTarget, 6).Value2 = $item.DFSPath
-        $wsTarget.Cells.Item($rowTarget, 7).Value2 = $item.FolderName
-        $rowTarget++
-    }
-
-    [void]$wsTarget.Columns.AutoFit()
-
-    if (Test-Path $TargetExcelPath) { Remove-Item $TargetExcelPath -Force }
-    $wbTarget.SaveAs($TargetExcelPath)
-    $wbTarget.Close($true)
-
-    Write-Host "Готово! Сопоставлено записей: $($Results.Count). Файл сохранен." -ForegroundColor Green
 }
 catch {
     Write-Error "Произошла глобальная ошибка: $_"
 }
 finally {
+    if ($null -ne $wb) { $wb.Close($false) }
     if ($null -ne $excel) {
         $excel.Quit()
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     }
+    Write-Host "Работа скрипта завершена." -ForegroundColor Cyan
 }
