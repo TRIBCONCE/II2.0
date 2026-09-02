@@ -24,11 +24,8 @@ try {
     Write-Log "--- ЗАПУСК СКРИПТА СБОРА РАЗМЕРОВ ПАПОК ДЛЯ ZABBIX ---"
     Write-Host "Получение групп из Active Directory..." -ForegroundColor Cyan
 
-    # Получаем группы
     $allGroups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties department, info
     
-    # Хэш-таблица для хранения уникальных путей с привязкой к Департаменту
-    # Ключ: Путь к папке, Значение: Название департамента
     $UniquePaths = @{}
 
     foreach ($g in $allGroups) {
@@ -38,7 +35,6 @@ try {
                 $normPath = $matches[1].TrimEnd('\')
                 $dept = $g.department.Trim()
                 
-                # Добавляем путь в словарь (избегаем дублей, чтобы не считать одну папку дважды для одного блока)
                 if (-not $UniquePaths.ContainsKey($normPath)) {
                     $UniquePaths[$normPath] = $dept
                 }
@@ -52,7 +48,7 @@ try {
     # ==============================================================================
     # МНОГОПОТОЧНЫЙ ПОДСЧЕТ
     # ==============================================================================
-    Write-Host "Запуск многопоточного сканирования Robocopy ($MaxThreads потоков)..." -ForegroundColor Yellow
+    Write-Host "`nЗапуск многопоточного сканирования Robocopy ($MaxThreads потоков)..." -ForegroundColor Yellow
     
     $RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
     $RunspacePool.Open()
@@ -62,7 +58,7 @@ try {
         param($Path, $Department)
 
         if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
-            return [PSCustomObject]@{ Department = $Department; TotalGB = 0 }
+            return [PSCustomObject]@{ Department = $Department; Path = $Path; TotalGB = 0 }
         }
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -75,7 +71,6 @@ try {
 
         $process = [System.Diagnostics.Process]::Start($psi)
 
-        # Читаем вывод, ищем только строку с байтами
         $stdout = $process.StandardOutput.ReadToEnd()
         $process.WaitForExit(180000) | Out-Null
         if (-not $process.HasExited) { $process.Kill() }
@@ -91,11 +86,12 @@ try {
 
         return [PSCustomObject]@{
             Department = $Department
+            Path       = $Path
             TotalGB    = [math]::Round($TotalBytes / 1GB, 2)
         }
     }
 
-    # Раздаем задачи потокам
+    # Раздаем задачи (ИСПРАВЛЕНА ОШИБКА С CHECKED)
     foreach ($entry in $UniquePaths.GetEnumerator()) {
         $PowerShell = [powershell]::Create()
         $PowerShell.RunspacePool = $RunspacePool
@@ -104,16 +100,18 @@ try {
         [void]$PowerShell.AddArgument($entry.Value)
         
         $Jobs += [PSCustomObject]@{
-            Pipe   = $PowerShell
-            Result = $PowerShell.BeginInvoke()
+            Pipe    = $PowerShell
+            Result  = $PowerShell.BeginInvoke()
+            Checked = $false
         }
     }
 
     # ==============================================================================
-    # АГРЕГАЦИЯ РЕЗУЛЬТАТОВ ПО ПОДРАЗДЕЛЕНИЯМ
+    # АГРЕГАЦИЯ И ВЫВОД В РЕАЛЬНОМ ВРЕМЕНИ
     # ==============================================================================
     $DivisionCount = @{}
     $completed = 0
+    $totalJobs = $Jobs.Count
 
     while ($Jobs.Result.IsCompleted -contains $false) {
         foreach ($job in $Jobs) {
@@ -128,18 +126,38 @@ try {
                         if (-not $DivisionCount.ContainsKey($div)) {
                             $DivisionCount[$div] = 0
                         }
-                        # Суммируем гигабайты по департаменту
+                        
                         $DivisionCount[$div] += $res.TotalGB
+                        
+                        # ВЫВОД КАЖДОЙ ПАПКИ В КОНСОЛЬ
+                        Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
                     }
-                } catch { }
-                
-                Write-Host "Обработано папок: $completed из $($Jobs.Count)" -ForegroundColor DarkGray
+                } catch {
+                    Write-Host "[$completed / $totalJobs] Ошибка потока: $($_.Exception.Message)" -ForegroundColor Red
+                }
             }
         }
         Start-Sleep -Milliseconds 200
     }
 
-    foreach ($job in $Jobs) { $job.Pipe.Dispose() }
+    # Добираем то, что могло успеть выполниться в последнюю секунду
+    foreach ($job in $Jobs) {
+        if (-not $job.Checked) {
+            $job.Checked = $true
+            try {
+                $res = $job.Pipe.EndInvoke($job.Result)
+                if ($res) {
+                    $div = $res.Department
+                    if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
+                    $DivisionCount[$div] += $res.TotalGB
+                    $completed++
+                    Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
+                }
+            } catch { }
+        }
+        $job.Pipe.Dispose()
+    }
+    
     $RunspacePool.Close()
     $RunspacePool.Dispose()
 
@@ -149,6 +167,8 @@ try {
     # ==============================================================================
     # ФОРМИРОВАНИЕ JSON ДЛЯ ZABBIX
     # ==============================================================================
+    Write-Host "`nГенерация JSON-файла для Zabbix..." -ForegroundColor Cyan
+
     $discovery = foreach ($k in $DivisionCount.Keys) {
         @{ '{#DIVISION}' = $k }
     }
@@ -170,18 +190,18 @@ try {
     [System.IO.File]::WriteAllText(
         $OutputPath,
         $json,
-        [System.Text.UTF8Encoding]::new($false) # UTF8 без BOM (критично для Zabbix)
+        [System.Text.UTF8Encoding]::new($false) 
     )
 
     # ==============================================================================
-    # ВЫВОД И ЛОГИРОВАНИЕ
+    # ФИНАЛЬНЫЙ ВЫВОД И ЛОГИРОВАНИЕ
     # ==============================================================================
     Write-Log ""
     Write-Log "СТАТУС: $ScriptStatus"
     Write-Log "Подсчёт объемов по блокам бизнеса завершен."
     Write-Log "Всего уникальных подразделений: $($DivisionCount.Count)"
 
-    Write-Host "`nПодсчёт по блокам (GB)" -ForegroundColor Green
+    Write-Host "`n=== ИТОГОВЫЙ ПОДСЧЕТ ПО БЛОКАМ (GB) ===" -ForegroundColor Green
     Write-Host "Всего подразделений: $($DivisionCount.Count)`n"
 
     $DivisionCount.GetEnumerator() |
