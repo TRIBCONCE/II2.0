@@ -1,158 +1,237 @@
-Теперь на базе этой же задачи создаём сбор информации для забикса смотри как это сделано уже у меня но скрипт считает количество людей по подразделениям у каждого блока главное что ты должен от туда понять как именно формируется txt файл его формат 
-очень критично ибо мотом в заббиксе буду создавать дискавери свойство а оно очень прихотливо к формату
-Наша задача создать подобный сбор информации по подразделениям которые указаны в department у групп безопасностей но подсчитывать будет именно размеры папок тоесть СТРОГО на сегоднешний момент, то есть все разберы папок относящиеся относящиеся к определённому подразделению сумируем надеюсь понял ключевую идею 
-
-Вот код пример:
 cls
 
 $timestart = Get-Date
 $today = Get-Date -Format dd.MM.yyyy
 $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
-$LogPath = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\AllUsersBlocksDiscoveryLOG.log"
+# ==============================================================================
+# НАСТРОЙКИ
+# ==============================================================================
+$LogPath     = "C:\Users\z-BorodinES\Desktop\LOGZabbixRN.txt"
+$OutputPath  = "C:\Users\z-BorodinES\Desktop\ZabbixRN.txt"
+$SearchBase  = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+$MaxThreads  = 6
 
 $ScriptStatus = "SUCCESS"
 
 function Write-Log {
-    param(
-        [string]$Message
-    )
+    param([string]$Message)
     $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
     Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
 }
 
 try {
-    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
-    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+    Write-Log "--- ЗАПУСК СКРИПТА СБОРА РАЗМЕРОВ ПАПОК ДЛЯ ZABBIX ---"
+    Write-Host "Получение групп из Active Directory..." -ForegroundColor Cyan
 
-    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
-    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+    $allGroups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties department, info
+    
+    $UniquePaths = @{}
 
-    $AllUsersOn = Get-ADUser `
-        -Filter { enabled -eq $true } `
-        -Credential $ab_creds `
-        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType
-
-    $LimitDate = (Get-Date).AddDays(-3)
-
-    $DivisionCount = @{}
-
-    # Счётчик исключённых
-    $ExcludedCount = 0
-
-    foreach ($User in $AllUsersOn) {
-
-        $sam = $User.samaccountname
-        $name = $User.name
-        $dn = $User.DistinguishedName
-
-        if (
-            $User.whenCreated -gt $LimitDate -or
-            $User.employeeType -eq "service" -or
-
-            $sam -like "Health*" -or
-            $sam -like "audit*" -or
-            $sam -like "esas*" -or
-            $sam -like "a-*" -or
-            $sam -like "z-*" -or
-            $name -like "*`$*" -or
-            $name -like "*Администратор*" -or
-            $name -like "*Тестовая*" -or
-            $dn -like "*Отключенные пользователи*" -or
-            $dn -like "*сторон*"
-        ) {
-            $ExcludedCount++
-            continue
-        }
-
-        $div = $User.division
-
-        if ($div) {
-            if ($DivisionCount.ContainsKey($div)) {
-                $DivisionCount[$div]++
-            }
-            else {
-                $DivisionCount[$div] = 1
-            }
-        }
-        else {
-            $emptyKey = "(не указано)"
-
-            if ($DivisionCount.ContainsKey($emptyKey)) {
-                $DivisionCount[$emptyKey]++
-            }
-            else {
-                $DivisionCount[$emptyKey] = 1
+    foreach ($g in $allGroups) {
+        if (-not [string]::IsNullOrWhiteSpace($g.department) -and -not [string]::IsNullOrWhiteSpace($g.info)) {
+            $cleanPath = ($g.info -replace "[\r\n]", " ").Trim()
+            if ($cleanPath -match '(\\\\.*)') {
+                $normPath = $matches[1].TrimEnd('\')
+                $dept = $g.department.Trim()
+                
+                if (-not $UniquePaths.ContainsKey($normPath)) {
+                    $UniquePaths[$normPath] = $dept
+                }
             }
         }
     }
-    $DivisionCount["Все_пользователи"] = $AllUsers.Count
+
+    Write-Host "Уникальных папок для сканирования: $($UniquePaths.Count)" -ForegroundColor Green
+    Write-Log "Собрано уникальных путей: $($UniquePaths.Count)"
+
+    # ==============================================================================
+    # МНОГОПОТОЧНЫЙ ПОДСЧЕТ
+    # ==============================================================================
+    Write-Host "`nЗапуск многопоточного сканирования Robocopy ($MaxThreads потоков)..." -ForegroundColor Yellow
+    
+    $RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
+    $RunspacePool.Open()
+    $Jobs = @()
+
+    $ScriptBlock = {
+        param($Path, $Department)
+
+        if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+            return [PSCustomObject]@{ Department = $Department; Path = $Path; TotalGB = 0 }
+        }
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "robocopy.exe"
+        $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP"
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
+
+        $process = [System.Diagnostics.Process]::Start($psi)
+
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $process.WaitForExit(180000) | Out-Null
+        if (-not $process.HasExited) { $process.Kill() }
+        $process.Dispose()
+
+        [long]$TotalBytes = 0
+        foreach ($line in ($stdout -split "`r?`n")) {
+            if ($line -match '^\s*Bytes\s*:\s*(\d+)') {
+                $TotalBytes = [long]$matches[1]
+                break
+            }
+        }
+
+        return [PSCustomObject]@{
+            Department = $Department
+            Path       = $Path
+            TotalGB    = [math]::Round($TotalBytes / 1GB, 2)
+        }
+    }
+
+    # Раздаем задачи (ИСПРАВЛЕНА ОШИБКА С CHECKED)
+    foreach ($entry in $UniquePaths.GetEnumerator()) {
+        $PowerShell = [powershell]::Create()
+        $PowerShell.RunspacePool = $RunspacePool
+        [void]$PowerShell.AddScript($ScriptBlock)
+        [void]$PowerShell.AddArgument($entry.Key)
+        [void]$PowerShell.AddArgument($entry.Value)
+        
+        $Jobs += [PSCustomObject]@{
+            Pipe    = $PowerShell
+            Result  = $PowerShell.BeginInvoke()
+            Checked = $false
+        }
+    }
+
+    # ==============================================================================
+    # АГРЕГАЦИЯ И ВЫВОД В РЕАЛЬНОМ ВРЕМЕНИ
+    # ==============================================================================
+    $DivisionCount = @{}
+    $completed = 0
+    $totalJobs = $Jobs.Count
+
+    while ($Jobs.Result.IsCompleted -contains $false) {
+        foreach ($job in $Jobs) {
+            if ($job.Result.IsCompleted -and -not $job.Checked) {
+                $job.Checked = $true
+                $completed++
+                
+                try {
+                    $res = $job.Pipe.EndInvoke($job.Result)
+                    if ($res) {
+                        $div = $res.Department
+                        if (-not $DivisionCount.ContainsKey($div)) {
+                            $DivisionCount[$div] = 0
+                        }
+                        
+                        $DivisionCount[$div] += $res.TotalGB
+                        
+                        # ВЫВОД КАЖДОЙ ПАПКИ В КОНСОЛЬ
+                        Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
+                    }
+                } catch {
+                    Write-Host "[$completed / $totalJobs] Ошибка потока: $($_.Exception.Message)" -ForegroundColor Red
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+
+    # Добираем то, что могло успеть выполниться в последнюю секунду
+    foreach ($job in $Jobs) {
+        if (-not $job.Checked) {
+            $job.Checked = $true
+            try {
+                $res = $job.Pipe.EndInvoke($job.Result)
+                if ($res) {
+                    $div = $res.Department
+                    if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
+                    $DivisionCount[$div] += $res.TotalGB
+                    $completed++
+                    Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
+                }
+            } catch { }
+        }
+        $job.Pipe.Dispose()
+    }
+    
+    $RunspacePool.Close()
+    $RunspacePool.Dispose()
+
+    # Считаем общий размер по всем блокам
+    $TotalEnterpriseGB = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+    # ==============================================================================
+    # ФОРМИРОВАНИЕ JSON ДЛЯ ZABBIX
+    # ==============================================================================
+    Write-Host "`nГенерация JSON-файла для Zabbix..." -ForegroundColor Cyan
+
     $discovery = foreach ($k in $DivisionCount.Keys) {
         @{ '{#DIVISION}' = $k }
     }
 
     $payload = [ordered]@{
         discovery = @($discovery)
-        counts = $DivisionCount
-        metadata = @{
-            TotalActiveUsers  = $AllUsersOn.Count
-            ExcludedUsers     = $ExcludedCount
-            RealUsers         = ($DivisionCount.Values | Measure-Object -Sum).Sum
-            UniqueDivisions   = $DivisionCount.Count
-            GeneratedAt       = $time
-            ScriptDurationSec = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+        counts    = $DivisionCount
+        metadata  = @{
+            TotalFoldersScanned = $UniquePaths.Count
+            UniqueDivisions     = $DivisionCount.Count
+            TotalEnterpriseGB   = $TotalEnterpriseGB
+            GeneratedAt         = $time
+            ScriptDurationSec   = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
         }
     }
 
     $json = $payload | ConvertTo-Json -Depth 4
 
-    $outputPath = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_UsersBlocks_Discovery.txt"
-
     [System.IO.File]::WriteAllText(
-        $outputPath,
+        $OutputPath,
         $json,
-        [System.Text.UTF8Encoding]::new($false)
+        [System.Text.UTF8Encoding]::new($false) 
     )
 
-    $RealUsersCount = ($DivisionCount.Values | Measure-Object -Sum).Sum
-
-    # Логирование
+    # ==============================================================================
+    # ФИНАЛЬНЫЙ ВЫВОД И ЛОГИРОВАНИЕ
+    # ==============================================================================
     Write-Log ""
     Write-Log "СТАТУС: $ScriptStatus"
-    Write-Log "Подсчёт по блокам"
+    Write-Log "Подсчёт объемов по блокам бизнеса завершен."
     Write-Log "Всего уникальных подразделений: $($DivisionCount.Count)"
 
-    Write-Host "`nПодсчёт по блокам" -ForegroundColor Green
-    Write-Host "Всего уникальных значений: $($DivisionCount.Count)`n"
+    Write-Host "`n=== ИТОГОВЫЙ ПОДСЧЕТ ПО БЛОКАМ (GB) ===" -ForegroundColor Green
+    Write-Host "Всего подразделений: $($DivisionCount.Count)`n"
 
     $DivisionCount.GetEnumerator() |
         Sort-Object Value -Descending |
         ForEach-Object {
-            $percent = "{0:P2}" -f ($_.Value / $RealUsersCount)
-            Write-Log ("{0,-60} {1,6} {2,8}" -f $_.Key, $_.Value, $percent)
+            $percent = 0
+            if ($TotalEnterpriseGB -gt 0) { $percent = $_.Value / $TotalEnterpriseGB }
+            $percentStr = "{0:P2}" -f $percent
+            Write-Log ("{0,-60} {1,10} GB {2,8}" -f $_.Key, $_.Value, $percentStr)
         }
 
     $DivisionCount.GetEnumerator() |
         Sort-Object Value -Descending |
         Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
-                     @{Label="Кол-во"; Expression={$_.Value}; Width=10},
-                     @{Label="%"; Expression={"{0:P2}" -f ($_.Value / $RealUsersCount)}; Width=10} -AutoSize
+                     @{Label="Размер (GB)"; Expression={$_.Value}; Width=15},
+                     @{Label="% от общего"; Expression={
+                        if ($TotalEnterpriseGB -gt 0) { "{0:P2}" -f ($_.Value / $TotalEnterpriseGB) } else { "0.00 %" }
+                     }; Width=15} -AutoSize
 
-    Write-Host "Всего активных пользователей в AD: $($AllUsersOn.Count)" -ForegroundColor Yellow
-    Write-Host "Исключено (служебные/админские/вендоры): $ExcludedCount" -ForegroundColor Magenta
-    Write-Host "Реальных пользователей для анализа: $RealUsersCount" -ForegroundColor Green
-
-    Write-Log "Всего активных пользователей в AD: $($AllUsersOn.Count)"
-    Write-Log "Исключено (служебные/админские/вендоры): $ExcludedCount"
-    Write-Log "Реальных пользователей для анализа: $RealUsersCount"
+    Write-Host "Общий объем данных: $($TotalEnterpriseGB) GB" -ForegroundColor Yellow
+    Write-Log "Общий объем данных: $($TotalEnterpriseGB) GB"
 
     $timestop = Get-Date
     $TimeSum = $timestop - $timestart
 
     Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
-    Write-Host "Файл сохранён." -ForegroundColor Green
+    Write-Host "JSON для Zabbix сохранён в: $OutputPath" -ForegroundColor Green
 
     Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
+    Write-Log "--- ЗАВЕРШЕНИЕ ---"
 }
 catch {
     $ScriptStatus = "ERROR"
@@ -166,6 +245,6 @@ catch {
     Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
     
     throw
-} 
+}
 
-ЛОГИРОВАНИЕ ТОЖЕ НЕ ЗАБУДЬ
+Такой вопрос мы можешь как нибудь в этот код вставить сохранения в реальном времене как в предыдущем которы xlsx файл формировал? если там сеть обрубится ли придётся остановить подсчёт он же долгий чтобы прога видела что уже подсчитанно и шла по группам дальше.
