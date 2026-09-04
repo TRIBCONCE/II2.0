@@ -1,9 +1,2 @@
-PS C:\Users\z-BorodinES> Get-CimInstance Win32_Process -Filter "Name = 'robocopy.exe'" | Select-Object CommandLine
-
-CommandLine
------------
-"robocopy.exe" "\\abb-win.akbars.ru\departments\ЕСЦ" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP
-"robocopy.exe" "\\abb-win.akbars.ru\departments\ЕСЦ" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP
-"robocopy.exe" "\\abb-win.akbars.ru\departments\ЕСЦ" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP
-"robocopy.exe" "\\abb-win.akbars.ru\departments\ЕСЦ" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP
-"robocopy.exe" "\\abb-win.akbars.ru\departments\ЕСЦ" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP
+Смотри Демартамент это атрибут department в эктив директори, так же давай убёрём столбец  Отдел (Street) а реальный путь давай писть не так - \\P-fsglo-gl08.abb-win.akbars.ru\PersonalDisks$\ABB-WIN\NagimovaEA а вот такого формата N:\NagimovaEA
+и ещё давай записывать файл xlsx в котором лист назвается Дисл N
