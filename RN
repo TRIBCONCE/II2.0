@@ -7,8 +7,11 @@ $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 # ==============================================================================
 # НАСТРОЙКИ
 # ==============================================================================
-$FinalExcelPath = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\PersonalDisks_Report.xlsx"
-$TempCsvPath    = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\PersonalDisks_Progress.csv"
+# УКАЖИ ЗДЕСЬ ПУТЬ К ТВОЕМУ ФАЙЛУ С "ДИСКОМ R"
+$FinalExcelPath = "C:\Users\z-BorodinES\Desktop\Sizing_Report_AD.xlsx" 
+
+# Изменил имя CSV на v2, чтобы не подхватило старые кривые колонки
+$TempCsvPath    = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\PersonalDisks_Progress_v2.csv"
 $LogPath        = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\PersonalDisks_LOG.log"
 $MaxThreads     = 6
 
@@ -30,7 +33,6 @@ try {
     $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
     $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
 
-    # Убрали streetAddress, оставили department и остальные
     $AllUsersOn = Get-ADUser `
         -Filter { enabled -eq $true } `
         -Credential $ab_creds `
@@ -83,8 +85,7 @@ try {
     Write-Host "Найдено целевых пользователей с диском N: $($ValidUsers.Count)" -ForegroundColor Yellow
     
     # --------------------------------------------------------------------------
-    # ТЕСТОВЫЙ РЕЖИМ: ОГРАНИЧЕНИЕ В 10 ЧЕЛОВЕК (Удали эту строку для полного обхода)
-    $ValidUsers = $ValidUsers | Select-Object -First 10
+    $ValidUsers = $ValidUsers | Select-Object -First 10 # ТЕСТОВЫЙ ЛИМИТ НА 10
     # --------------------------------------------------------------------------
 
     Write-Host "В работу взято: $($ValidUsers.Count) пользователей (ТЕСТОВЫЙ ЛИМИТ)" -ForegroundColor Magenta
@@ -96,11 +97,9 @@ try {
 
     if (Test-Path $TempCsvPath) {
         $existing = Import-Csv -Path $TempCsvPath -Delimiter ";" -Encoding UTF8
-        # Сверяем по скрытому реальному пути, чтобы кэш работал стабильно
         foreach ($row in $existing) { [void]$processedPaths.Add($row.UNCPath) }
         Write-Host "Найдено в кэше: $($processedPaths.Count) путей." -ForegroundColor Green
     } else {
-        # Заголовок CSV (в конце добавлено скрытое поле UNCPath для кэша)
         "Division;Name;Title;Department;DisplayPath;TotalGB;UNCPath" | Out-File -FilePath $TempCsvPath -Encoding UTF8
     }
 
@@ -119,7 +118,7 @@ try {
         $ScriptBlock = {
             param($Path, $Name, $Division, $Title, $Department)
 
-            # Формируем красивый путь вида N:\NagimovaEA
+            # Формируем путь вида N:\Логин
             $folderName = Split-Path -Path $Path -Leaf
             $displayPath = "N:\$folderName"
 
@@ -198,15 +197,12 @@ try {
                             
                             Write-Host "[$completed / $total] $($res.Name) -> $($res.TotalGB) GB" -ForegroundColor Green
                         }
-                    } catch {
-                        Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
-                    }
+                    } catch { }
                 }
             }
             Start-Sleep -Milliseconds 150
         }
 
-        # Добиваем остатки
         foreach ($job in $Jobs) {
             if (-not $job.Checked) {
                 $job.Checked = $true
@@ -227,7 +223,7 @@ try {
     }
 
     # ==============================================================================
-    # ШАГ 4: СБОРКА ИТОГОВОГО EXCEL
+    # ШАГ 4: ИНТЕЛЛЕКТУАЛЬНАЯ ЗАПИСЬ В СУЩЕСТВУЮЩИЙ EXCEL
     # ==============================================================================
     Write-Host "`nГенерация финального Excel-файла..." -ForegroundColor Cyan
 
@@ -238,11 +234,31 @@ try {
     $excel.DisplayAlerts = $false
 
     try {
-        $wb = $excel.Workbooks.Add()
-        $ws = $wb.Worksheets.Item(1)
-        
-        # Переименовали лист
-        $ws.Name = "Диск N"
+        $wb = $null
+        $ws = $null
+
+        # Если файл уже есть - открываем его и ищем вкладку
+        if (Test-Path $FinalExcelPath) {
+            $wb = $excel.Workbooks.Open($FinalExcelPath)
+            for ($i = 1; $i -le $wb.Worksheets.Count; $i++) {
+                if ($wb.Worksheets.Item($i).Name -eq "Диск N") {
+                    $ws = $wb.Worksheets.Item($i)
+                    break
+                }
+            }
+            # Если вкладки нет - создаем её в конце
+            if ($null -eq $ws) {
+                $ws = $wb.Worksheets.Add([System.Reflection.Missing]::Value, $wb.Worksheets.Item($wb.Worksheets.Count))
+                $ws.Name = "Диск N"
+            } else {
+                $ws.Cells.Clear() # Очищаем старые данные на листе
+            }
+        } else {
+            # Если файла нет вообще - создаем новый
+            $wb = $excel.Workbooks.Add()
+            $ws = $wb.Worksheets.Item(1)
+            $ws.Name = "Диск N"
+        }
 
         $ws.Cells.Item(1, 1).Value2 = "Блок бизнеса"
         $ws.Cells.Item(1, 2).Value2 = "ФИО (AD)"
@@ -265,12 +281,16 @@ try {
 
         [void]$ws.Columns.AutoFit()
 
-        if (Test-Path $FinalExcelPath) { Remove-Item $FinalExcelPath -Force }
-        $wb.SaveAs($FinalExcelPath)
+        # Корректное сохранение существующего или нового файла
+        if (Test-Path $FinalExcelPath) {
+            $wb.Save()
+        } else {
+            $wb.SaveAs($FinalExcelPath)
+        }
         $wb.Close($true)
 
-        Write-Host "ФИНАЛЬНЫЙ ОТЧЕТ СОЗДАН: $FinalExcelPath" -ForegroundColor Green
-        Write-Log "Успешно сформирован отчет Excel: $FinalExcelPath"
+        Write-Host "ФИНАЛЬНЫЙ ОТЧЕТ УСПЕШНО ДОБАВЛЕН/ОБНОВЛЕН: $FinalExcelPath" -ForegroundColor Green
+        Write-Log "Успешно обновлен отчет Excel: $FinalExcelPath"
     }
     catch {
         Write-Error "Ошибка при сохранении Excel: $_"
