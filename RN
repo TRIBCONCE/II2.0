@@ -7,13 +7,10 @@ $time = Get-Date -Format "dd.MM.yyyy HH:mm"
 # ==============================================================================
 # НАСТРОЙКИ
 # ==============================================================================
-# УКАЖИ ЗДЕСЬ ПУТЬ К ТВОЕМУ ФАЙЛУ С "ДИСКОМ R"
-$FinalExcelPath = "C:\Users\z-BorodinES\Desktop\Sizing_Report_AD.xlsx" 
-
-# Изменил имя CSV на v2, чтобы не подхватило старые кривые колонки
-$TempCsvPath    = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\PersonalDisks_Progress_v2.csv"
-$LogPath        = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\PersonalDisks_LOG.log"
-$MaxThreads     = 6
+$FinalExcelPath = "C:\Users\z-BorodinES\Desktop\Сайзинг RN.xlsx"
+$TempCsvPath    = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\PersonalDisks_AllUsers_Buffer.csv"
+$LogPath        = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\PersonalDisks_AllUsers_LOG.log"
+$MaxThreads     = 8  # Увеличиваем потоки для быстрого обхода массива пользователей
 
 $ScriptStatus = "SUCCESS"
 
@@ -24,8 +21,8 @@ function Write-Log {
 }
 
 try {
-    Write-Log "--- ЗАПУСК СБОРА РАЗМЕРА ЛИЧНЫХ ДИСКОВ (ТЕСТ НА 10 ПОЛЬЗОВАТЕЛЕЙ) ---"
-    Write-Host "Авторизация и получение пользователей из AD..." -ForegroundColor Cyan
+    Write-Log "--- ЗАПУСК ПОЛНОГО СБОРА РАЗМЕРА ЛИЧНЫХ ДИСКОВ N (ВСЕ ПОЛЬЗОВАТЕЛИ AD) ---"
+    Write-Host "Авторизация и получение ВСЕХ пользователей из AD..." -ForegroundColor Cyan
 
     $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
     $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
@@ -33,42 +30,24 @@ try {
     $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
     $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
 
+    # Запрашиваем абсолютно всех пользователей домена без фильтров
     $AllUsersOn = Get-ADUser `
-        -Filter { enabled -eq $true } `
+        -Filter * `
         -Credential $ab_creds `
-        -Properties division, samaccountname, DistinguishedName, name, whenCreated, employeeType, title, department, HomeDirectory
+        -Properties division, name, title, department, HomeDirectory
 
-    $LimitDate = (Get-Date).AddDays(-3)
-    $ExcludedCount = 0
+    Write-Host "Всего объектов пользователей в AD получено: $($AllUsersOn.Count)" -ForegroundColor Green
+    Write-Log "Всего пользователей получено: $($AllUsersOn.Count)"
+
+    # ==============================================================================
+    # ШАГ 1: ОТБОР ПОЛЬЗОВАТЕЛЕЙ С ЗАПОЛНЕННЫМ ДИСКОМ N
+    # ==============================================================================
     $ValidUsers = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    # ==============================================================================
-    # ШАГ 1: ФИЛЬТРАЦИЯ ПОЛЬЗОВАТЕЛЕЙ
-    # ==============================================================================
     foreach ($User in $AllUsersOn) {
-        $sam = $User.samaccountname
-        $name = $User.name
-        $dn = $User.DistinguishedName
-
-        if (
-            $User.whenCreated -gt $LimitDate -or
-            $User.employeeType -eq "service" -or
-            $sam -like "Health*" -or
-            $sam -like "audit*" -or
-            $sam -like "esas*" -or
-            $sam -like "a-*" -or
-            $sam -like "z-*" -or
-            $name -like "*`$*" -or
-            $name -like "*Администратор*" -or
-            $name -like "*Тестовая*" -or
-            $dn -like "*Отключенные пользователи*" -or
-            $dn -like "*сторон*"
-        ) {
-            $ExcludedCount++
-            continue
-        }
-
         $personalPath = $User.HomeDirectory
+        
+        # Если путь не задан — пропускаем, так как диска N физически нет
         if ([string]::IsNullOrWhiteSpace($personalPath)) {
             continue
         }
@@ -76,40 +55,41 @@ try {
         $ValidUsers.Add([PSCustomObject]@{
             Name       = $User.name
             Division   = if ($User.division) { $User.division } else { "(не указано)" }
-            Title      = $User.title
-            Department = $User.department
+            Title      = if ($User.title) { $User.title } else { "(не указано)" }
+            Department = if ($User.department) { $User.department } else { "(не указано)" }
             Path       = $personalPath.TrimEnd('\')
         })
     }
 
-    Write-Host "Найдено целевых пользователей с диском N: $($ValidUsers.Count)" -ForegroundColor Yellow
-    
-    # --------------------------------------------------------------------------
-    $ValidUsers = $ValidUsers | Select-Object -First 10 # ТЕСТОВЫЙ ЛИМИТ НА 10
-    # --------------------------------------------------------------------------
+    Write-Host "Найдено пользователей с назначенным Диском N: $($ValidUsers.Count)" -ForegroundColor Yellow
+    Write-Log "Пользователей с HomeDirectory: $($ValidUsers.Count)"
 
-    Write-Host "В работу взято: $($ValidUsers.Count) пользователей (ТЕСТОВЫЙ ЛИМИТ)" -ForegroundColor Magenta
+    if ($ValidUsers.Count -eq 0) {
+        Write-Host "Нет данных для обработки. Завершение." -ForegroundColor Yellow
+        return
+    }
 
     # ==============================================================================
-    # ШАГ 2: БУФЕР ПРОГРЕССА (CSV)
+    # ШАГ 2: БУФЕР ПРОГРЕССА (CSV) ДЛЯ НЕУБИВАЕМОСТИ
     # ==============================================================================
     $processedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     if (Test-Path $TempCsvPath) {
         $existing = Import-Csv -Path $TempCsvPath -Delimiter ";" -Encoding UTF8
         foreach ($row in $existing) { [void]$processedPaths.Add($row.UNCPath) }
-        Write-Host "Найдено в кэше: $($processedPaths.Count) путей." -ForegroundColor Green
+        Write-Host "Уже посчитано ранее в кэше: $($processedPaths.Count) пользователей." -ForegroundColor Green
     } else {
         "Division;Name;Title;Department;DisplayPath;TotalGB;UNCPath" | Out-File -FilePath $TempCsvPath -Encoding UTF8
     }
 
     $tasksToRun = $ValidUsers | Where-Object { -not $processedPaths.Contains($_.Path) }
+    Write-Host "Осталось обработать: $($tasksToRun.Count) пользователей" -ForegroundColor Cyan
 
     # ==============================================================================
-    # ШАГ 3: МНОГОПОТОЧНЫЙ СБОР РАЗМЕРОВ
+    # ШАГ 3: МНОГОПОТОЧНЫЙ СБОР РАЗМЕРОВ ЧЕРЕЗ ROBOCOPY
     # ==============================================================================
     if ($tasksToRun.Count -gt 0) {
-        Write-Host "`nЗапуск сканирования ($MaxThreads потоков)..." -ForegroundColor Cyan
+        Write-Host "`nЗапуск сканирования ($MaxThreads потоков)..." -ForegroundColor Yellow
 
         $RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
         $RunspacePool.Open()
@@ -118,10 +98,10 @@ try {
         $ScriptBlock = {
             param($Path, $Name, $Division, $Title, $Department)
 
-            # Формируем путь вида N:\Логин
             $folderName = Split-Path -Path $Path -Leaf
             $displayPath = "N:\$folderName"
 
+            # Быстрая проверка доступности сетевой папки
             if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
                 return [PSCustomObject]@{
                     Division = $Division; Name = $Name; Title = $Title; 
@@ -197,12 +177,15 @@ try {
                             
                             Write-Host "[$completed / $total] $($res.Name) -> $($res.TotalGB) GB" -ForegroundColor Green
                         }
-                    } catch { }
+                    } catch {
+                        Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
+                    }
                 }
             }
             Start-Sleep -Milliseconds 150
         }
 
+        # Сбор оставшихся потоков
         foreach ($job in $Jobs) {
             if (-not $job.Checked) {
                 $job.Checked = $true
@@ -223,9 +206,9 @@ try {
     }
 
     # ==============================================================================
-    # ШАГ 4: ИНТЕЛЛЕКТУАЛЬНАЯ ЗАПИСЬ В СУЩЕСТВУЮЩИЙ EXCEL
+    # ШАГ 4: СОХРАНЕНИЕ ТОЛЬКО В ЛИСТ "ДИСК N" (НЕ ТРОГАЯ "ДИСК R")
     # ==============================================================================
-    Write-Host "`nГенерация финального Excel-файла..." -ForegroundColor Cyan
+    Write-Host "`nСохранение в книгу Excel (лист 'Диск N')..." -ForegroundColor Cyan
 
     $finalData = Import-Csv -Path $TempCsvPath -Delimiter ";" -Encoding UTF8
 
@@ -237,29 +220,31 @@ try {
         $wb = $null
         $ws = $null
 
-        # Если файл уже есть - открываем его и ищем вкладку
         if (Test-Path $FinalExcelPath) {
             $wb = $excel.Workbooks.Open($FinalExcelPath)
+            
+            # Ищем существующий лист "Диск N"
             for ($i = 1; $i -le $wb.Worksheets.Count; $i++) {
                 if ($wb.Worksheets.Item($i).Name -eq "Диск N") {
                     $ws = $wb.Worksheets.Item($i)
                     break
                 }
             }
-            # Если вкладки нет - создаем её в конце
+            
+            # Если нет — создаем его вторым/следующим листом
             if ($null -eq $ws) {
                 $ws = $wb.Worksheets.Add([System.Reflection.Missing]::Value, $wb.Worksheets.Item($wb.Worksheets.Count))
                 $ws.Name = "Диск N"
             } else {
-                $ws.Cells.Clear() # Очищаем старые данные на листе
+                $ws.Cells.Clear()
             }
         } else {
-            # Если файла нет вообще - создаем новый
             $wb = $excel.Workbooks.Add()
             $ws = $wb.Worksheets.Item(1)
             $ws.Name = "Диск N"
         }
 
+        # Заголовки таблицы
         $ws.Cells.Item(1, 1).Value2 = "Блок бизнеса"
         $ws.Cells.Item(1, 2).Value2 = "ФИО (AD)"
         $ws.Cells.Item(1, 3).Value2 = "Должность"
@@ -268,6 +253,7 @@ try {
         $ws.Cells.Item(1, 6).Value2 = "Диск N, всего в Gb"
         $ws.Range("A1:F1").Font.Bold = $true
 
+        # Заполнение строк
         $row = 2
         foreach ($item in $finalData) {
             $ws.Cells.Item($row, 1).Value2 = "$($item.Division)"
@@ -281,7 +267,6 @@ try {
 
         [void]$ws.Columns.AutoFit()
 
-        # Корректное сохранение существующего или нового файла
         if (Test-Path $FinalExcelPath) {
             $wb.Save()
         } else {
@@ -289,11 +274,11 @@ try {
         }
         $wb.Close($true)
 
-        Write-Host "ФИНАЛЬНЫЙ ОТЧЕТ УСПЕШНО ДОБАВЛЕН/ОБНОВЛЕН: $FinalExcelPath" -ForegroundColor Green
-        Write-Log "Успешно обновлен отчет Excel: $FinalExcelPath"
+        Write-Host "ОТЧЕТ ОБНОВЛЕН: Лист 'Диск N' сохранен в $FinalExcelPath" -ForegroundColor Green
+        Write-Log "Успешно обновлен лист 'Диск N' в файле: $FinalExcelPath"
     }
     catch {
-        Write-Error "Ошибка при сохранении Excel: $_"
+        Write-Error "Ошибка Excel: $_"
         Write-Log "Ошибка Excel: $($_.Exception.Message)"
     }
     finally {
@@ -308,6 +293,7 @@ try {
     $timestop = Get-Date
     $TimeSum = $timestop - $timestart
     Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+    Write-Log "Полное время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
 }
 catch {
     $ScriptStatus = "ERROR"
