@@ -1,0 +1,176 @@
+Import-Module ActiveDirectory
+
+$FilePath = "C:\Путь\К\Файлу\Сотрудники.xlsx"
+
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+
+try {
+    Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($FilePath)
+    $ws = $wb.Sheets.Item("Лист1") 
+    
+    $lastRow = $ws.UsedRange.Rows.Count
+    
+    $emailCol = 0
+    $lastCol = $ws.UsedRange.Columns.Count
+    for ($c = 1; $c -le $lastCol; $c++) {
+        if ($ws.Cells.Item(1, $c).Text -eq "Значение") {
+            $emailCol = $c
+            break
+        }
+    }
+    
+    if ($emailCol -eq 0) {
+        Write-Host "[!] Столбец 'Значение' не найден! Берем 4-й столбец (D)." -ForegroundColor Yellow
+        $emailCol = 4 
+    }
+    
+    $ws.Cells.Item(1, 5).Value2 = "Статус в AD"
+
+    Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
+
+    for ($row = 2; $row -le $lastRow; $row++) {
+        $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
+        
+        if ([string]::IsNullOrWhiteSpace($email)) {
+            continue
+        }
+        
+        # Получаем ВСЕ учетные записи с этой почтой и запрашиваем атрибут msExchMailboxGuid
+        $adUsers = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchMailboxGuid -ErrorAction SilentlyContinue)
+        
+        if ($adUsers.Count -gt 0) {
+            $isActive = $false
+            $hasMailbox = $false
+            
+            # Проверяем все найденные учетки
+            foreach ($u in $adUsers) {
+                if ($u.Enabled) {
+                    $isActive = $true
+                }
+                if ($null -ne $u.msExchMailboxGuid) {
+                    $hasMailbox = $true
+                }
+            }
+            
+            # Применяем логику статусов
+            if ($isActive) {
+                $status = "активный"
+            } elseif ($hasMailbox) {
+                $status = "учётная запись не активна но почтовый ящик существует"
+            } else {
+                $status = "не активен"
+            }
+        } else {
+            $status = "не найден"
+        }
+        
+        $ws.Cells.Item($row, 5).Value2 = $status
+        Write-Host "Строка $row: $email -> $status"
+    }
+
+    $wb.Save()
+    Write-Host "`n[+] Готово! Файл успешно обновлен и сохранен." -ForegroundColor Green
+}
+catch {
+    Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
+}
+finally {
+    if ($null -ne $wb) { $wb.Close($false) }
+    $excel.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+}
+
+
+
+
+Import-Module ActiveDirectory
+
+$FilePath = "C:\Путь\К\Файлу\Новый_файл.xlsx"
+
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+
+try {
+    Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($FilePath)
+    $ws = $wb.Sheets.Item("Sheet1") 
+    
+    $lastRow = $ws.UsedRange.Rows.Count
+    
+    $emailCol = 0
+    $lastCol = $ws.UsedRange.Columns.Count
+    for ($c = 1; $c -le $lastCol; $c++) {
+        if ($ws.Cells.Item(1, $c).Text -eq "user_email") {
+            $emailCol = $c
+            break
+        }
+    }
+    
+    if ($emailCol -eq 0) {
+        Write-Host "[!] Столбец 'user_email' не найден! Скрипт остановлен." -ForegroundColor Red
+        return
+    }
+    
+    $ws.Cells.Item(1, 10).Value2 = "Статус в AD"
+
+    Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
+
+    for ($row = 2; $row -le $lastRow; $row++) {
+        $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
+        
+        if ([string]::IsNullOrWhiteSpace($email)) {
+            continue
+        }
+        
+        # Получаем ВСЕ учетные записи с этой почтой
+        $adUsers = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchMailboxGuid -ErrorAction SilentlyContinue)
+        
+        if ($adUsers.Count -gt 0) {
+            $isActive = $false
+            $hasMailbox = $false
+            
+            # Проверяем все найденные учетки
+            foreach ($u in $adUsers) {
+                if ($u.Enabled) {
+                    $isActive = $true
+                }
+                if ($null -ne $u.msExchMailboxGuid) {
+                    $hasMailbox = $true
+                }
+            }
+            
+            # Применяем логику статусов
+            if ($isActive) {
+                $status = "активный"
+            } elseif ($hasMailbox) {
+                $status = "учётная запись не активна но почтовый ящик существует"
+            } else {
+                $status = "не активен"
+            }
+        } else {
+            $status = "не найден"
+        }
+        
+        $ws.Cells.Item($row, 10).Value2 = $status
+        Write-Host "Строка $row: $email -> $status"
+    }
+
+    $wb.Save()
+    Write-Host "`n[+] Готово! Статусы успешно записаны в столбец J." -ForegroundColor Green
+}
+catch {
+    Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
+}
+finally {
+    if ($null -ne $wb) { $wb.Close($false) }
+    $excel.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+}
