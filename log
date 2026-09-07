@@ -1,2 +1,6 @@
-Смотри Демартамент это атрибут department в эктив директори, так же давай убёрём столбец  Отдел (Street) а реальный путь давай писть не так - \\P-fsglo-gl08.abb-win.akbars.ru\PersonalDisks$\ABB-WIN\NagimovaEA а вот такого формата N:\NagimovaEA
-и ещё давай записывать файл xlsx в котором лист назвается Дисл N
+At line:72 char:28
++         Write-Host "Строка $row: $email -> $status"
++                            ~~~~~
+Variable reference is not valid. ':' was not followed by a valid variable name character. Consider using ${} to delimit the name.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : InvalidVariableReferenceWithDrive
