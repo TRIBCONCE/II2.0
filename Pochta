@@ -1,96 +1,7 @@
 Import-Module ActiveDirectory
 
-$FilePath = "C:\Путь\К\Файлу\Сотрудники.xlsx"
-
-$excel = New-Object -ComObject Excel.Application
-$excel.Visible = $false
-$excel.DisplayAlerts = $false
-
-try {
-    Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
-    $wb = $excel.Workbooks.Open($FilePath)
-    $ws = $wb.Sheets.Item("Лист1") 
-    
-    $lastRow = $ws.UsedRange.Rows.Count
-    
-    $emailCol = 0
-    $lastCol = $ws.UsedRange.Columns.Count
-    for ($c = 1; $c -le $lastCol; $c++) {
-        if ($ws.Cells.Item(1, $c).Text -eq "Значение") {
-            $emailCol = $c
-            break
-        }
-    }
-    
-    if ($emailCol -eq 0) {
-        Write-Host "[!] Столбец 'Значение' не найден! Берем 4-й столбец (D)." -ForegroundColor Yellow
-        $emailCol = 4 
-    }
-    
-    $ws.Cells.Item(1, 5).Value2 = "Статус в AD"
-
-    Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
-
-    for ($row = 2; $row -le $lastRow; $row++) {
-        $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
-        
-        if ([string]::IsNullOrWhiteSpace($email)) {
-            continue
-        }
-        
-        # Получаем ВСЕ учетные записи с этой почтой и запрашиваем атрибут msExchMailboxGuid
-        $adUsers = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchMailboxGuid -ErrorAction SilentlyContinue)
-        
-        if ($adUsers.Count -gt 0) {
-            $isActive = $false
-            $hasMailbox = $false
-            
-            # Проверяем все найденные учетки
-            foreach ($u in $adUsers) {
-                if ($u.Enabled) {
-                    $isActive = $true
-                }
-                if ($null -ne $u.msExchMailboxGuid) {
-                    $hasMailbox = $true
-                }
-            }
-            
-            # Применяем логику статусов
-            if ($isActive) {
-                $status = "активный"
-            } elseif ($hasMailbox) {
-                $status = "учётная запись не активна но почтовый ящик существует"
-            } else {
-                $status = "не активен"
-            }
-        } else {
-            $status = "не найден"
-        }
-        
-        $ws.Cells.Item($row, 5).Value2 = $status
-        Write-Host "Строка $row: $email -> $status"
-    }
-
-    $wb.Save()
-    Write-Host "`n[+] Готово! Файл успешно обновлен и сохранен." -ForegroundColor Green
-}
-catch {
-    Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
-}
-finally {
-    if ($null -ne $wb) { $wb.Close($false) }
-    $excel.Quit()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
-}
-
-
-
-
-Import-Module ActiveDirectory
-
-$FilePath = "C:\Путь\К\Файлу\Новый_файл.xlsx"
+# Путь к твоему файлу Excel
+$FilePath = "C:\Users\z-BorodinES\Desktop\Qlik_Отчеты с Рассылками_14.08.26..xlsx"
 
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
@@ -103,66 +14,113 @@ try {
     
     $lastRow = $ws.UsedRange.Rows.Count
     
+    # Ищем нужные столбцы: email и Имя
     $emailCol = 0
+    $nameCol = 0
     $lastCol = $ws.UsedRange.Columns.Count
     for ($c = 1; $c -le $lastCol; $c++) {
-        if ($ws.Cells.Item(1, $c).Text -eq "user_email") {
-            $emailCol = $c
-            break
-        }
+        $headerName = $ws.Cells.Item(1, $c).Text.Trim()
+        if ($headerName -eq "user_email") { $emailCol = $c }
+        if ($headerName -eq "user_name")  { $nameCol = $c }
     }
     
-    if ($emailCol -eq 0) {
-        Write-Host "[!] Столбец 'user_email' не найден! Скрипт остановлен." -ForegroundColor Red
+    if ($emailCol -eq 0 -or $nameCol -eq 0) {
+        Write-Host "[!] Не найдены столбцы 'user_email' или 'user_name'! Скрипт остановлен." -ForegroundColor Red
         return
     }
     
+    # Ставим заголовки в столбцы J(10) и K(11)
     $ws.Cells.Item(1, 10).Value2 = "Статус в AD"
+    $ws.Cells.Item(1, 11).Value2 = "Почта из AD (если другая)"
 
-    Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
+    Write-Host "Начинаем проверку пользователей..." -ForegroundColor Cyan
 
     for ($row = 2; $row -le $lastRow; $row++) {
         $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
+        $name  = $ws.Cells.Item($row, $nameCol).Text.Trim()
         
-        if ([string]::IsNullOrWhiteSpace($email)) {
-            continue
+        $status = ""
+        $newEmail = "" # Для столбца K
+        
+        # ЭТАП 1: Ищем по Email
+        $adUsersByEmail = @()
+        if (-not [string]::IsNullOrWhiteSpace($email)) {
+            # Запрашиваем атрибут msExchHideFromAddressLists для проверки адресной книги
+            $adUsersByEmail = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchHideFromAddressLists -ErrorAction SilentlyContinue)
         }
         
-        # Получаем ВСЕ учетные записи с этой почтой
-        $adUsers = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchMailboxGuid -ErrorAction SilentlyContinue)
-        
-        if ($adUsers.Count -gt 0) {
+        if ($adUsersByEmail.Count -gt 0) {
             $isActive = $false
-            $hasMailbox = $false
+            $isHidden = $true # По умолчанию считаем скрытым, пока не докажем обратное
             
-            # Проверяем все найденные учетки
-            foreach ($u in $adUsers) {
-                if ($u.Enabled) {
-                    $isActive = $true
+            foreach ($u in $adUsersByEmail) {
+                if ($u.Enabled) { 
+                    $isActive = $true 
                 }
-                if ($null -ne $u.msExchMailboxGuid) {
-                    $hasMailbox = $true
+                # Если атрибут пустой ($null) или False, значит человек ЕСТЬ в адресной книге
+                if ($null -eq $u.msExchHideFromAddressLists -or $u.msExchHideFromAddressLists -eq $false) {
+                    $isHidden = $false
                 }
             }
             
-            # Применяем логику статусов
+            # Логика статусов при поиске по ПОЧТЕ
             if ($isActive) {
                 $status = "активный"
-            } elseif ($hasMailbox) {
-                $status = "учётная запись не активна но почтовый ящик существует"
             } else {
-                $status = "не активен"
+                if (-not $isHidden) {
+                    $status = "пользователь отключён но есть в адресной книге"
+                } else {
+                    $status = "не активен"
+                }
             }
-        } else {
+        } 
+        # ЭТАП 2: Если по почте не нашли, ищем по ФИО (user_name)
+        elseif (-not [string]::IsNullOrWhiteSpace($name)) {
+            $adUsersByName = @(Get-ADUser -Filter "DisplayName -eq '$name'" -Properties Enabled, mail, msExchHideFromAddressLists -ErrorAction SilentlyContinue)
+            
+            if ($adUsersByName.Count -gt 0) {
+                # Если учёток с таким ФИО несколько, ищем активную. Если нет активных — берем первую.
+                $targetUser = $adUsersByName | Where-Object { $_.Enabled } | Select-Object -First 1
+                if ($null -eq $targetUser) { $targetUser = $adUsersByName[0] }
+                
+                # Заполняем столбец K (Почта из AD)
+                if ([string]::IsNullOrWhiteSpace($targetUser.mail)) {
+                    $newEmail = "почта не указана"
+                } else {
+                    $newEmail = $targetUser.mail
+                }
+                
+                # Логика статусов при поиске по ФИО
+                if ($targetUser.Enabled) {
+                    $status = "учётная запись активна, но у пользователя другая почта"
+                } else {
+                    # Проверяем адресную книгу для отключенного
+                    $isHidden = ($targetUser.msExchHideFromAddressLists -eq $true)
+                    if (-not $isHidden) {
+                        $status = "неактивна, есть в адресной книге, почта другая"
+                    } else {
+                        $status = "неактивна, нет в адресной книге, почта другая"
+                    }
+                }
+            } else {
+                # Не нашли ни по почте, ни по имени
+                $status = "не найден"
+            }
+        }
+        else {
+            # Если и почта, и имя в Excel пустые
             $status = "не найден"
         }
         
+        # Записываем результаты в Excel
         $ws.Cells.Item($row, 10).Value2 = $status
-        Write-Host "Строка $row: $email -> $status"
+        $ws.Cells.Item($row, 11).Value2 = $newEmail
+        
+        Write-Host "Строка ${row}: $email / $name -> $status"
     }
 
     $wb.Save()
-    Write-Host "`n[+] Готово! Статусы успешно записаны в столбец J." -ForegroundColor Green
+    Write-Host "`n[+] Готово! Статусы записаны в столбцы J и K." -ForegroundColor Green
 }
 catch {
     Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
