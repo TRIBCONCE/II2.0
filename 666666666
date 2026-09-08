@@ -1,11 +1,7 @@
-Гипер ответственная задача, нужно переделать мой первоначальный скрипт под новую логику, мне так же коллега скинул свою версию но она по логике не правильная я тебе всё объясню что надо сделать
-
-Вот мой скрипт:
-
 cls
 Import-Module ActiveDirectory
 
-$FilePath = "C:\Users\z-BorodinES\Desktop\Qlik_Отчеты с Рассылками_14.08.26..xlsx"
+$FilePath = "C:\Users\z-BorodinES\Desktop\Reports_Отчеты с подписками_построчно.xlsx"
 
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
@@ -14,25 +10,25 @@ $excel.DisplayAlerts = $false
 try {
     Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
     $wb = $excel.Workbooks.Open($FilePath)
-    $ws = $wb.Sheets.Item("Sheet1") 
+    $ws = $wb.Sheets.Item("Лист1") 
     
     $lastRow = $ws.UsedRange.Rows.Count
     
     $emailCol = 0
     $lastCol = $ws.UsedRange.Columns.Count
     for ($c = 1; $c -le $lastCol; $c++) {
-        if ($ws.Cells.Item(1, $c).Text -eq "user_email") {
+        if ($ws.Cells.Item(1, $c).Text -eq "Значение") {
             $emailCol = $c
             break
         }
     }
     
     if ($emailCol -eq 0) {
-        Write-Host "[!] Столбец 'user_email' не найден! Скрипт остановлен." -ForegroundColor Red
-        return
+        Write-Host "[!] Столбец 'Значение' не найден! Берем 4-й столбец (D)." -ForegroundColor Yellow
+        $emailCol = 4 
     }
     
-    $ws.Cells.Item(1, 10).Value2 = "Статус в AD"
+    $ws.Cells.Item(1, 5).Value2 = "Статус в AD"
 
     Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
 
@@ -43,7 +39,7 @@ try {
             continue
         }
         
-        # Получаем ВСЕ учетные записи с этой почтой
+        # Получаем ВСЕ учетные записи с этой почтой и запрашиваем атрибут msExchMailboxGuid
         $adUsers = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchMailboxGuid -ErrorAction SilentlyContinue)
         
         if ($adUsers.Count -gt 0) {
@@ -72,12 +68,12 @@ try {
             $status = "не найден"
         }
         
-        $ws.Cells.Item($row, 10).Value2 = $status
+        $ws.Cells.Item($row, 5).Value2 = $status
         Write-Host "Строка ${row}: $email -> $status"
     }
 
     $wb.Save()
-    Write-Host "`n[+] Готово! Статусы успешно записаны в столбец J." -ForegroundColor Green
+    Write-Host "`n[+] Готово! Файл успешно обновлен и сохранен." -ForegroundColor Green
 }
 catch {
     Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
@@ -88,75 +84,4 @@ finally {
     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
     [System.GC]::Collect()
     [System.GC]::WaitForPendingFinalizers()
-}
-
-Вот скрипт коллеги:
-
-
-$InputCsvPath = "C:\distr\Qlik_one.csv"
-$OutputCsvPath = "C:\distr\Qlik_res_v3.csv"
-
-
-
-$CsvData = Import-Csv -Path $InputCsvPath -Delimiter ";"
-
-$Results = foreach ($Row in $CsvData) {
-    $AdUser = $null
-    
-  
-    $FoundDisplayName       = ""
-    $AccountStatus          = ""
-    $HiddenFromAddressLists = ""
-    
-    # 1. Поиск по Email в AD (поле mail)
-    if (-not [string]::IsNullOrWhiteSpace($Row.user_email)) {
-        $AdUser = Get-ADUser -Filter "mail -eq '$($Row.user_email)'" -Properties DisplayName, UserPrincipalName
-    }
-    
-    # 2. Если по Email не нашли, ищем по user_name (поле DisplayName)
-    if ($null -eq $AdUser -and -not [string]::IsNullOrWhiteSpace($Row.user_name)) {
-        $AdUser = Get-ADUser -Filter "DisplayName -eq '$($Row.user_name)'" -Properties DisplayName, UserPrincipalName
-    }
-    
-    # Если пользователь найден в AD, заполняем новые поля данными
-    if ($null -ne $AdUser) {
-        $FoundDisplayName = $AdUser.DisplayName
-        
-        # Проверяем статус учетной записи (Включена/Отключена)
-        $AccountStatus = if ($AdUser.Enabled) { "Включена" } else { "Отключена" }
-        
-        # Получаем данные из Exchange 2019
-        try {
-            $Mailbox = Get-Mailbox -Identity $AdUser.UserPrincipalName -ErrorAction Stop
-            # HiddenFromAddressListEnabled = $true означает, что галочка "Не отображать" стоит
-            $HiddenFromAddressLists = if ($Mailbox.HiddenFromAddressListEnabled) { "Скрыт" } else { "Отображается" }
-        } catch {
-            $HiddenFromAddressLists = "Нет почтового ящика"
-        }
-    } else {
-        # Если УЗ вообще не найдена в AD, то согласно условию:
-        # Для найденного отображаемого имени пишем причину, а остальные поля оставляем пустыми
-        if (-not [string]::IsNullOrWhiteSpace($Row.user_email)) {
-            $FoundDisplayName = "Не найден по email"
-        } else {
-            $FoundDisplayName = "Не найден по user_name"
-        }
-    }
-    
-    # Добавляем к исходной строке 3 новых поля
-    $Row | Add-Member -NotePropertyMembers @{
-        "Найденое отображаемое имя"     = $FoundDisplayName
-        "УЗ заблокирована или нет"      = $AccountStatus
-        "Есть в адресной книге или нет" = $HiddenFromAddressLists
-    }
-    
-    # Возвращаем обновленную строку в массив результатов
-    $Row
-}
-
-$Results | Export-Csv -Path $OutputCsvPath -NoTypeInformation -Delimiter ";" -Encoding Unicode
-
-И так какая сейчас логика и задача стоит мы берём мой первоначальный файл xlsx и работает именно с ним ни каких csv не создаём мы так же берём user_email проверям в эктив директори есть ли включеные отключенные учётки как у меня в скрипте и если все выключены проверяем почтку в адресной книге у коллеги проверка идёт в exchange у меня доступа нет но он сказал что можно это проверить через эктив директори, если отключенный пользователь есть в адресной книге то тогда пишем в статусе пользователь откючён но есть в адрессной книге.
-Теперь следующая логика если по почте не удалось найти человека мы берём user_name это фио проверям существует ли учётная запись, если учётная запись существует и если она не заблокирована, в статус пишем учётная запись активна, но у пользователя другая почта и в столбец K пишем почту из эктив директори если есть, если нет пишем почта не указана
-Но если такая учётная запись заблокирована, то ищим человека так же пресутствие в адресной книге, в статусе пишем неактивна, есть или нет в адресной книге, а так же почта другая и в сталбце K пишем почту если она есть
-
+} давай таже логика только надо переделать вот этот скрипт Но тут всё иначе у этого списка нет фио по этому фио берём из эктив директори по почте но логика везде такая же дальше, только ещё статус пишется в столбце E а другие почты F
