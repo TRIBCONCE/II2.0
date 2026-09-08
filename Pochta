@@ -1,6 +1,5 @@
 Import-Module ActiveDirectory
 
-# Путь к твоему файлу Excel
 $FilePath = "C:\Users\z-BorodinES\Desktop\Qlik_Отчеты с Рассылками_14.08.26..xlsx"
 
 $excel = New-Object -ComObject Excel.Application
@@ -14,7 +13,6 @@ try {
     
     $lastRow = $ws.UsedRange.Rows.Count
     
-    # Ищем нужные столбцы: email и Имя
     $emailCol = 0
     $nameCol = 0
     $lastCol = $ws.UsedRange.Columns.Count
@@ -29,93 +27,110 @@ try {
         return
     }
     
-    # Ставим заголовки в столбцы J(10) и K(11)
     $ws.Cells.Item(1, 10).Value2 = "Статус в AD"
     $ws.Cells.Item(1, 11).Value2 = "Почта из AD (если другая)"
 
-    Write-Host "Начинаем проверку пользователей..." -ForegroundColor Cyan
+    Write-Host "Начинаем каскадную проверку пользователей..." -ForegroundColor Cyan
 
     for ($row = 2; $row -le $lastRow; $row++) {
         $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
         $name  = $ws.Cells.Item($row, $nameCol).Text.Trim()
         
-        $status = ""
-        $newEmail = "" # Для столбца K
+        $status = "не найден"
+        $newEmail = ""
         
-        # ЭТАП 1: Ищем по Email
-        $adUsersByEmail = @()
+        if ([string]::IsNullOrWhiteSpace($email) -and [string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        # === ЭТАП 1: Поиск по Email ===
+        $usersByEmail = @()
         if (-not [string]::IsNullOrWhiteSpace($email)) {
-            # Запрашиваем атрибут msExchHideFromAddressLists для проверки адресной книги
-            $adUsersByEmail = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchHideFromAddressLists -ErrorAction SilentlyContinue)
+            $usersByEmail = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchHideFromAddressLists, msExchMailboxGuid -ErrorAction SilentlyContinue)
         }
         
-        if ($adUsersByEmail.Count -gt 0) {
-            $isActive = $false
-            $isHidden = $true # По умолчанию считаем скрытым, пока не докажем обратное
-            
-            foreach ($u in $adUsersByEmail) {
-                if ($u.Enabled) { 
-                    $isActive = $true 
-                }
-                # Если атрибут пустой ($null) или False, значит человек ЕСТЬ в адресной книге
-                if ($null -eq $u.msExchHideFromAddressLists -or $u.msExchHideFromAddressLists -eq $false) {
-                    $isHidden = $false
-                }
-            }
-            
-            # Логика статусов при поиске по ПОЧТЕ
-            if ($isActive) {
-                $status = "активный"
-            } else {
-                if (-not $isHidden) {
-                    $status = "пользователь отключён но есть в адресной книге"
-                } else {
-                    $status = "не активен"
-                }
-            }
+        $emailActive = $false
+        $emailInAB = $false
+        $emailHasMb = $false
+        
+        foreach ($u in $usersByEmail) {
+            if ($u.Enabled) { $emailActive = $true }
+            if ($null -eq $u.msExchHideFromAddressLists -or $u.msExchHideFromAddressLists -eq $false) { $emailInAB = $true }
+            if ($null -ne $u.msExchMailboxGuid) { $emailHasMb = $true }
+        }
+
+        # Если по почте найден активный человек - дальше не ищем
+        if ($emailActive) {
+            $status = "активный"
         } 
-        # ЭТАП 2: Если по почте не нашли, ищем по ФИО (user_name)
-        elseif (-not [string]::IsNullOrWhiteSpace($name)) {
-            $adUsersByName = @(Get-ADUser -Filter "DisplayName -eq '$name'" -Properties Enabled, mail, msExchHideFromAddressLists -ErrorAction SilentlyContinue)
+        else {
+            # === ЭТАП 2: Поиск по ФИО (ищем активного "близнеца" или данные для неактивного) ===
+            $usersByName = @()
+            $activeTwin = $null
             
-            if ($adUsersByName.Count -gt 0) {
-                # Если учёток с таким ФИО несколько, ищем активную. Если нет активных — берем первую.
-                $targetUser = $adUsersByName | Where-Object { $_.Enabled } | Select-Object -First 1
-                if ($null -eq $targetUser) { $targetUser = $adUsersByName[0] }
-                
-                # Заполняем столбец K (Почта из AD)
-                if ([string]::IsNullOrWhiteSpace($targetUser.mail)) {
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                $usersByName = @(Get-ADUser -Filter "DisplayName -eq '$name'" -Properties Enabled, mail, msExchHideFromAddressLists, msExchMailboxGuid -ErrorAction SilentlyContinue)
+                # Пытаемся найти активную учетку среди тех, что нашлись по ФИО
+                $activeTwin = $usersByName | Where-Object { $_.Enabled } | Select-Object -First 1
+            }
+
+            # Если мы нашли активного двойника по ФИО
+            if ($activeTwin) {
+                $status = "учётная запись активна, но у пользователя другая почта"
+                if (-not [string]::IsNullOrWhiteSpace($activeTwin.mail)) {
+                    $newEmail = $activeTwin.mail
+                } else {
                     $newEmail = "почта не указана"
-                } else {
-                    $newEmail = $targetUser.mail
                 }
+            } 
+            else {
+                # === ЭТАП 3: Активных нет вообще. Разбираем неактивные учётки ===
                 
-                # Логика статусов при поиске по ФИО
-                if ($targetUser.Enabled) {
-                    $status = "учётная запись активна, но у пользователя другая почта"
-                } else {
-                    # Проверяем адресную книгу для отключенного
-                    $isHidden = ($targetUser.msExchHideFromAddressLists -eq $true)
-                    if (-not $isHidden) {
+                if ($usersByEmail.Count -gt 0) {
+                    # Сценарий А: Пользователь найден по старой почте, но он мертв
+                    if ($emailInAB) {
+                        $status = "пользователь отключён но есть в адресной книге"
+                    } elseif ($emailHasMb) {
+                        $status = "учётная запись не активна, нет в адресной книге, но почтовый ящик существует"
+                    } else {
+                        $status = "не активен"
+                    }
+                } 
+                elseif ($usersByName.Count -gt 0) {
+                    # Сценарий Б: По почте вообще пусто, но нашли мертвую учетку по ФИО
+                    $nameInAB = $false
+                    $nameHasMb = $false
+                    
+                    foreach ($u in $usersByName) {
+                        if ($null -eq $u.msExchHideFromAddressLists -or $u.msExchHideFromAddressLists -eq $false) { $nameInAB = $true }
+                        if ($null -ne $u.msExchMailboxGuid) { $nameHasMb = $true }
+                    }
+                    
+                    # Берем почту первой попавшейся неактивной учетки
+                    $target = $usersByName[0]
+                    if (-not [string]::IsNullOrWhiteSpace($target.mail)) {
+                        $newEmail = $target.mail
+                    } else {
+                        $newEmail = "почта не указана"
+                    }
+                    
+                    if ($nameInAB) {
                         $status = "неактивна, есть в адресной книге, почта другая"
+                    } elseif ($nameHasMb) {
+                        $status = "неактивна, нет в адресной книге, но почтовый ящик существует, почта другая"
                     } else {
                         $status = "неактивна, нет в адресной книге, почта другая"
                     }
+                } 
+                else {
+                    # Сценарий В: Вообще никого не нашли
+                    $status = "не найден"
                 }
-            } else {
-                # Не нашли ни по почте, ни по имени
-                $status = "не найден"
             }
         }
-        else {
-            # Если и почта, и имя в Excel пустые
-            $status = "не найден"
-        }
         
-        # Записываем результаты в Excel
         $ws.Cells.Item($row, 10).Value2 = $status
         $ws.Cells.Item($row, 11).Value2 = $newEmail
-        
         Write-Host "Строка ${row}: $email / $name -> $status"
     }
 
