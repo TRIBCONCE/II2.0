@@ -1,290 +1,162 @@
+Гипер ответственная задача, нужно переделать мой первоначальный скрипт под новую логику, мне так же коллега скинул свою версию но она по логике не правильная я тебе всё объясню что надо сделать
+
+Вот мой скрипт:
+
 cls
+Import-Module ActiveDirectory
 
-$timestart = Get-Date
-$today = Get-Date -Format dd.MM.yyyy
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+$FilePath = "C:\Users\z-BorodinES\Desktop\Qlik_Отчеты с Рассылками_14.08.26..xlsx"
 
-# ==============================================================================
-# НАСТРОЙКИ
-# ==============================================================================
-$LogPath     = "C:\Users\z-BorodinES\Desktop\LOGZabbixRN.txt"
-$OutputPath  = "C:\Users\z-BorodinES\Desktop\ZabbixRN.txt"
-$TempCsvPath = "C:\Users\z-BorodinES\Desktop\Zabbix_Progress_Buffer.csv" # ФАЙЛ КЭША
-$SearchBase  = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
-$MaxThreads  = 8
-
-$ScriptStatus = "SUCCESS"
-
-function Write-Log {
-    param([string]$Message)
-    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
-    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
-}
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
 
 try {
-    Write-Log "--- ЗАПУСК СКРИПТА СБОРА РАЗМЕРОВ ПАПОК ДЛЯ ZABBIX ---"
-    Write-Host "Получение групп из Active Directory..." -ForegroundColor Cyan
-
-    $allGroups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties department, info
+    Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($FilePath)
+    $ws = $wb.Sheets.Item("Sheet1") 
     
-    $UniquePaths = @{}
-
-    foreach ($g in $allGroups) {
-        if (-not [string]::IsNullOrWhiteSpace($g.department) -and -not [string]::IsNullOrWhiteSpace($g.info)) {
-            $cleanPath = ($g.info -replace "[\r\n]", " ").Trim()
-            if ($cleanPath -match '(\\\\.*)') {
-                $normPath = $matches[1].TrimEnd('\')
-                $dept = $g.department.Trim()
-                
-                if (-not $UniquePaths.ContainsKey($normPath)) {
-                    $UniquePaths[$normPath] = $dept
-                }
-            }
-        }
-    }
-
-    Write-Host "Всего уникальных папок в AD: $($UniquePaths.Count)" -ForegroundColor Cyan
-    Write-Log "Собрано уникальных путей в AD: $($UniquePaths.Count)"
-
-    # ==============================================================================
-    # ПРОВЕРКА КЭША / ПРОДОЛЖЕНИЕ РАБОТЫ
-    # ==============================================================================
-    $processedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $DivisionCount = @{}
-
-    if (Test-Path $TempCsvPath) {
-        Write-Host "Найден промежуточный буфер! Загрузка ранее посчитанных данных..." -ForegroundColor Yellow
-        $existing = Import-Csv -Path $TempCsvPath -Delimiter ";" -Encoding UTF8
-        foreach ($row in $existing) {
-            [void]$processedPaths.Add($row.Path)
-            
-            $div = $row.Department
-            if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
-            $DivisionCount[$div] += [double]$row.TotalGB
-        }
-        Write-Host "Уже готово: $($processedPaths.Count) папок. Они будут пропущены." -ForegroundColor Green
-    } else {
-        "Department;Path;TotalGB" | Out-File -FilePath $TempCsvPath -Encoding UTF8
-    }
-
-    # Фильтруем пути: оставляем только те, которых нет в кэше
-    $tasksToRun = @{}
-    foreach ($entry in $UniquePaths.GetEnumerator()) {
-        if (-not $processedPaths.Contains($entry.Key)) {
-            $tasksToRun[$entry.Key] = $entry.Value
+    $lastRow = $ws.UsedRange.Rows.Count
+    
+    $emailCol = 0
+    $lastCol = $ws.UsedRange.Columns.Count
+    for ($c = 1; $c -le $lastCol; $c++) {
+        if ($ws.Cells.Item(1, $c).Text -eq "user_email") {
+            $emailCol = $c
+            break
         }
     }
     
-    Write-Host "Осталось обработать: $($tasksToRun.Count) папок" -ForegroundColor Green
+    if ($emailCol -eq 0) {
+        Write-Host "[!] Столбец 'user_email' не найден! Скрипт остановлен." -ForegroundColor Red
+        return
+    }
+    
+    $ws.Cells.Item(1, 10).Value2 = "Статус в AD"
 
-    # ==============================================================================
-    # МНОГОПОТОЧНЫЙ ПОДСЧЕТ
-    # ==============================================================================
-    if ($tasksToRun.Count -gt 0) {
-        Write-Host "`nЗапуск многопоточного сканирования Robocopy ($MaxThreads потоков)..." -ForegroundColor Yellow
+    Write-Host "Начинаем проверку почт в AD..." -ForegroundColor Cyan
+
+    for ($row = 2; $row -le $lastRow; $row++) {
+        $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
         
-        $RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
-        $RunspacePool.Open()
-        $Jobs = @()
-
-        $ScriptBlock = {
-            param($Path, $Department)
-
-            if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
-                return [PSCustomObject]@{ Department = $Department; Path = $Path; TotalGB = 0 }
-            }
-
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = "robocopy.exe"
-            $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP"
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
-            $psi.RedirectStandardOutput = $true
-            $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
-
-            $process = [System.Diagnostics.Process]::Start($psi)
-
-            $stdout = $process.StandardOutput.ReadToEnd()
-            $process.WaitForExit(180000) | Out-Null
-            if (-not $process.HasExited) { $process.Kill() }
-            $process.Dispose()
-
-            [long]$TotalBytes = 0
-            foreach ($line in ($stdout -split "`r?`n")) {
-                if ($line -match '^\s*Bytes\s*:\s*(\d+)') {
-                    $TotalBytes = [long]$matches[1]
-                    break
-                }
-            }
-
-            return [PSCustomObject]@{
-                Department = $Department
-                Path       = $Path
-                TotalGB    = [math]::Round($TotalBytes / 1GB, 2)
-            }
-        }
-
-        # Раздаем оставшиеся задачи
-        foreach ($entry in $tasksToRun.GetEnumerator()) {
-            $PowerShell = [powershell]::Create()
-            $PowerShell.RunspacePool = $RunspacePool
-            [void]$PowerShell.AddScript($ScriptBlock)
-            [void]$PowerShell.AddArgument($entry.Key)
-            [void]$PowerShell.AddArgument($entry.Value)
-            
-            $Jobs += [PSCustomObject]@{
-                Pipe    = $PowerShell
-                Result  = $PowerShell.BeginInvoke()
-                Checked = $false
-            }
-        }
-
-        # АГРЕГАЦИЯ И СОХРАНЕНИЕ В РЕАЛЬНОМ ВРЕМЕНИ
-        $completed = 0
-        $totalJobs = $Jobs.Count
-
-        while ($Jobs.Result.IsCompleted -contains $false) {
-            foreach ($job in $Jobs) {
-                if ($job.Result.IsCompleted -and -not $job.Checked) {
-                    $job.Checked = $true
-                    $completed++
-                    
-                    try {
-                        $res = $job.Pipe.EndInvoke($job.Result)
-                        if ($res) {
-                            $div = $res.Department
-                            if (-not $DivisionCount.ContainsKey($div)) {
-                                $DivisionCount[$div] = 0
-                            }
-                            $DivisionCount[$div] += $res.TotalGB
-                            
-                            # Мгновенное сохранение в буфер
-                            $csvLine = "$($res.Department);$($res.Path);$($res.TotalGB)"
-                            [System.IO.File]::AppendAllLines($TempCsvPath, [string[]]@($csvLine), [System.Text.Encoding]::UTF8)
-                            
-                            Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
-                        }
-                    } catch {
-                        Write-Host "[$completed / $totalJobs] Ошибка потока: $($_.Exception.Message)" -ForegroundColor Red
-                    }
-                }
-            }
-            Start-Sleep -Milliseconds 200
-        }
-
-        # Добираем последние потоки
-        foreach ($job in $Jobs) {
-            if (-not $job.Checked) {
-                $job.Checked = $true
-                try {
-                    $res = $job.Pipe.EndInvoke($job.Result)
-                    if ($res) {
-                        $div = $res.Department
-                        if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
-                        $DivisionCount[$div] += $res.TotalGB
-                        $completed++
-                        
-                        $csvLine = "$($res.Department);$($res.Path);$($res.TotalGB)"
-                        [System.IO.File]::AppendAllLines($TempCsvPath, [string[]]@($csvLine), [System.Text.Encoding]::UTF8)
-                        
-                        Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
-                    }
-                } catch { }
-            }
-            $job.Pipe.Dispose()
+        if ([string]::IsNullOrWhiteSpace($email)) {
+            continue
         }
         
-        $RunspacePool.Close()
-        $RunspacePool.Dispose()
-    }
-
-    # Считаем общий размер по всем блокам
-    $TotalEnterpriseGB = ($DivisionCount.Values | Measure-Object -Sum).Sum
-
-    # ==============================================================================
-    # ФОРМИРОВАНИЕ JSON ДЛЯ ZABBIX
-    # ==============================================================================
-    Write-Host "`nГенерация JSON-файла для Zabbix..." -ForegroundColor Cyan
-
-    $discovery = foreach ($k in $DivisionCount.Keys) {
-        @{ '{#DIVISION}' = $k }
-    }
-
-    $payload = [ordered]@{
-        discovery = @($discovery)
-        counts    = $DivisionCount
-        metadata  = @{
-            TotalFoldersScanned = $UniquePaths.Count
-            UniqueDivisions     = $DivisionCount.Count
-            TotalEnterpriseGB   = $TotalEnterpriseGB
-            GeneratedAt         = $time
-            ScriptDurationSec   = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+        # Получаем ВСЕ учетные записи с этой почтой
+        $adUsers = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchMailboxGuid -ErrorAction SilentlyContinue)
+        
+        if ($adUsers.Count -gt 0) {
+            $isActive = $false
+            $hasMailbox = $false
+            
+            # Проверяем все найденные учетки
+            foreach ($u in $adUsers) {
+                if ($u.Enabled) {
+                    $isActive = $true
+                }
+                if ($null -ne $u.msExchMailboxGuid) {
+                    $hasMailbox = $true
+                }
+            }
+            
+            # Применяем логику статусов
+            if ($isActive) {
+                $status = "активный"
+            } elseif ($hasMailbox) {
+                $status = "учётная запись не активна но почтовый ящик существует"
+            } else {
+                $status = "не активен"
+            }
+        } else {
+            $status = "не найден"
         }
+        
+        $ws.Cells.Item($row, 10).Value2 = $status
+        Write-Host "Строка ${row}: $email -> $status"
     }
 
-    $json = $payload | ConvertTo-Json -Depth 4
-
-    [System.IO.File]::WriteAllText(
-        $OutputPath,
-        $json,
-        [System.Text.UTF8Encoding]::new($false) 
-    )
-    
-    # ЕСЛИ ВСЕ ПРОШЛО УСПЕШНО - УДАЛЯЕМ КЭШ, ЧТОБЫ В СЛЕДУЮЩИЙ РАЗ НАЧАТЬ ЗАНОВО
-    if (Test-Path $TempCsvPath) {
-        Remove-Item $TempCsvPath -Force
-    }
-
-    # ==============================================================================
-    # ФИНАЛЬНЫЙ ВЫВОД И ЛОГИРОВАНИЕ
-    # ==============================================================================
-    Write-Log ""
-    Write-Log "СТАТУС: $ScriptStatus"
-    Write-Log "Подсчёт объемов по блокам бизнеса завершен."
-    Write-Log "Всего уникальных подразделений: $($DivisionCount.Count)"
-
-    Write-Host "`n=== ИТОГОВЫЙ ПОДСЧЕТ ПО БЛОКАМ (GB) ===" -ForegroundColor Green
-    Write-Host "Всего подразделений: $($DivisionCount.Count)`n"
-
-    $DivisionCount.GetEnumerator() |
-        Sort-Object Value -Descending |
-        ForEach-Object {
-            $percent = 0
-            if ($TotalEnterpriseGB -gt 0) { $percent = $_.Value / $TotalEnterpriseGB }
-            $percentStr = "{0:P2}" -f $percent
-            Write-Log ("{0,-60} {1,10} GB {2,8}" -f $_.Key, $_.Value, $percentStr)
-        }
-
-    $DivisionCount.GetEnumerator() |
-        Sort-Object Value -Descending |
-        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
-                     @{Label="Размер (GB)"; Expression={$_.Value}; Width=15},
-                     @{Label="% от общего"; Expression={
-                        if ($TotalEnterpriseGB -gt 0) { "{0:P2}" -f ($_.Value / $TotalEnterpriseGB) } else { "0.00 %" }
-                     }; Width=15} -AutoSize
-
-    Write-Host "Общий объем данных: $($TotalEnterpriseGB) GB" -ForegroundColor Yellow
-    Write-Log "Общий объем данных: $($TotalEnterpriseGB) GB"
-
-    $timestop = Get-Date
-    $TimeSum = $timestop - $timestart
-
-    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
-    Write-Host "JSON для Zabbix сохранён в: $OutputPath" -ForegroundColor Green
-
-    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
-    Write-Log "--- ЗАВЕРШЕНИЕ ---"
+    $wb.Save()
+    Write-Host "`n[+] Готово! Статусы успешно записаны в столбец J." -ForegroundColor Green
 }
 catch {
-    $ScriptStatus = "ERROR"
-    Write-Log ""
-    Write-Log "СТАТУС: ERROR"
-    Write-Log "Ошибка:"
-    Write-Log $_.Exception.Message
-    Write-Log "Полная информация:"
-    Write-Log $_
+    Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
+}
+finally {
+    if ($null -ne $wb) { $wb.Close($false) }
+    $excel.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+}
+
+Вот скрипт коллеги:
+
+
+$InputCsvPath = "C:\distr\Qlik_one.csv"
+$OutputCsvPath = "C:\distr\Qlik_res_v3.csv"
+
+
+
+$CsvData = Import-Csv -Path $InputCsvPath -Delimiter ";"
+
+$Results = foreach ($Row in $CsvData) {
+    $AdUser = $null
     
-    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+  
+    $FoundDisplayName       = ""
+    $AccountStatus          = ""
+    $HiddenFromAddressLists = ""
     
-    throw
-} Надеюсь ты помнишь этот скрипт давай такуюже тему только для всей логики диска N не забывай атрибут у пользователей по которым потом надо будет сумировать именно division
+    # 1. Поиск по Email в AD (поле mail)
+    if (-not [string]::IsNullOrWhiteSpace($Row.user_email)) {
+        $AdUser = Get-ADUser -Filter "mail -eq '$($Row.user_email)'" -Properties DisplayName, UserPrincipalName
+    }
+    
+    # 2. Если по Email не нашли, ищем по user_name (поле DisplayName)
+    if ($null -eq $AdUser -and -not [string]::IsNullOrWhiteSpace($Row.user_name)) {
+        $AdUser = Get-ADUser -Filter "DisplayName -eq '$($Row.user_name)'" -Properties DisplayName, UserPrincipalName
+    }
+    
+    # Если пользователь найден в AD, заполняем новые поля данными
+    if ($null -ne $AdUser) {
+        $FoundDisplayName = $AdUser.DisplayName
+        
+        # Проверяем статус учетной записи (Включена/Отключена)
+        $AccountStatus = if ($AdUser.Enabled) { "Включена" } else { "Отключена" }
+        
+        # Получаем данные из Exchange 2019
+        try {
+            $Mailbox = Get-Mailbox -Identity $AdUser.UserPrincipalName -ErrorAction Stop
+            # HiddenFromAddressListEnabled = $true означает, что галочка "Не отображать" стоит
+            $HiddenFromAddressLists = if ($Mailbox.HiddenFromAddressListEnabled) { "Скрыт" } else { "Отображается" }
+        } catch {
+            $HiddenFromAddressLists = "Нет почтового ящика"
+        }
+    } else {
+        # Если УЗ вообще не найдена в AD, то согласно условию:
+        # Для найденного отображаемого имени пишем причину, а остальные поля оставляем пустыми
+        if (-not [string]::IsNullOrWhiteSpace($Row.user_email)) {
+            $FoundDisplayName = "Не найден по email"
+        } else {
+            $FoundDisplayName = "Не найден по user_name"
+        }
+    }
+    
+    # Добавляем к исходной строке 3 новых поля
+    $Row | Add-Member -NotePropertyMembers @{
+        "Найденое отображаемое имя"     = $FoundDisplayName
+        "УЗ заблокирована или нет"      = $AccountStatus
+        "Есть в адресной книге или нет" = $HiddenFromAddressLists
+    }
+    
+    # Возвращаем обновленную строку в массив результатов
+    $Row
+}
+
+$Results | Export-Csv -Path $OutputCsvPath -NoTypeInformation -Delimiter ";" -Encoding Unicode
+
+И так какая сейчас логика и задача стоит мы берём мой первоначальный файл xlsx и работает именно с ним ни каких csv не создаём мы так же берём user_email проверям в эктив директори есть ли включеные отключенные учётки как у меня в скрипте и если все выключены проверяем почтку в адресной книге у коллеги проверка идёт в exchange у меня доступа нет но он сказал что можно это проверить через эктив директори, если отключенный пользователь есть в адресной книге то тогда пишем в статусе пользователь откючён но есть в адрессной книге.
+Теперь следующая логика если по почте не удалось найти человека мы берём user_name это фио проверям существует ли учётная запись, если учётная запись существует и если она не заблокирована, в статус пишем учётная запись активна, но у пользователя другая почта и в столбец K пишем почту из эктив директори если есть, если нет пишем почта не указана
+Но если такая учётная запись заблокирована, то ищим человека так же пресутствие в адресной книге, в статусе пишем неактивна, есть или нет в адресной книге, а так же почта другая и в сталбце K пишем почту если она есть
+
