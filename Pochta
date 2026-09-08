@@ -1,5 +1,131 @@
 Import-Module ActiveDirectory
 
+$FilePath = "C:\Users\z-BorodinES\Desktop\Reports_Отчеты с подписками_построчно.xlsx"
+
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+
+try {
+    Write-Host "Открываем файл $FilePath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($FilePath)
+    $ws = $wb.Sheets.Item("Лист1") 
+    
+    $lastRow = $ws.UsedRange.Rows.Count
+    
+    $emailCol = 0
+    $lastCol = $ws.UsedRange.Columns.Count
+    for ($c = 1; $c -le $lastCol; $c++) {
+        if ($ws.Cells.Item(1, $c).Text -eq "Значение") {
+            $emailCol = $c
+            break
+        }
+    }
+    
+    if ($emailCol -eq 0) {
+        Write-Host "[!] Столбец 'Значение' не найден! Берем 4-й столбец (D)." -ForegroundColor Yellow
+        $emailCol = 4 
+    }
+    
+    # Ставим заголовки в столбцы E (5) и F (6)
+    $ws.Cells.Item(1, 5).Value2 = "Статус в AD"
+    $ws.Cells.Item(1, 6).Value2 = "Почта из AD (если другая)"
+
+    Write-Host "Начинаем каскадную проверку почт в AD..." -ForegroundColor Cyan
+
+    for ($row = 2; $row -le $lastRow; $row++) {
+        $email = $ws.Cells.Item($row, $emailCol).Text.Trim()
+        
+        if ([string]::IsNullOrWhiteSpace($email)) {
+            continue
+        }
+        
+        $status = "не найден"
+        $newEmail = ""
+        
+        # 1. Ищем по Email и сразу забираем DisplayName (чтобы знать ФИО, если придется искать двойника)
+        $usersByEmail = @(Get-ADUser -Filter "mail -eq '$email'" -Properties Enabled, msExchHideFromAddressLists, msExchMailboxGuid, DisplayName -ErrorAction SilentlyContinue)
+        
+        if ($usersByEmail.Count -gt 0) {
+            $emailActive = $false
+            $emailInAB = $false
+            $emailHasMb = $false
+            $targetName = ""
+            
+            # Разбираем все учётки, привязанные к этой почте
+            foreach ($u in $usersByEmail) {
+                if ($u.Enabled) { $emailActive = $true }
+                if ($null -eq $u.msExchHideFromAddressLists -or $u.msExchHideFromAddressLists -eq $false) { $emailInAB = $true }
+                if ($null -ne $u.msExchMailboxGuid) { $emailHasMb = $true }
+                
+                # Запоминаем ФИО из первой попавшейся непустой учётки
+                if ([string]::IsNullOrWhiteSpace($targetName) -and -not [string]::IsNullOrWhiteSpace($u.DisplayName)) {
+                    $targetName = $u.DisplayName
+                }
+            }
+            
+            # Если хоть одна учётка по этой почте активна - всё супер
+            if ($emailActive) {
+                $status = "активный"
+            } 
+            else {
+                # 2. Почта мертва. Ищем активного "двойника" по вытащенному ФИО
+                $activeTwin = $null
+                
+                if (-not [string]::IsNullOrWhiteSpace($targetName)) {
+                    $usersByName = @(Get-ADUser -Filter "DisplayName -eq '$targetName'" -Properties Enabled, mail -ErrorAction SilentlyContinue)
+                    # Ищем среди них активного
+                    $activeTwin = $usersByName | Where-Object { $_.Enabled } | Select-Object -First 1
+                }
+                
+                if ($activeTwin) {
+                    # Нашли активного человека с таким же ФИО!
+                    $status = "учётная запись активна, но у пользователя другая почта"
+                    if (-not [string]::IsNullOrWhiteSpace($activeTwin.mail)) {
+                        $newEmail = $activeTwin.mail
+                    } else {
+                        $newEmail = "почта не указана"
+                    }
+                } 
+                else {
+                    # 3. Живых двойников нет. Применяем логику детализации для неактивного пользователя
+                    if ($emailInAB) {
+                        $status = "пользователь отключён но есть в адресной книге"
+                    } elseif ($emailHasMb) {
+                        $status = "учётная запись не активна, нет в адресной книге, но почтовый ящик существует"
+                    } else {
+                        $status = "не активен"
+                    }
+                }
+            }
+        }
+        
+        # Пишем в Excel (E и F)
+        $ws.Cells.Item($row, 5).Value2 = $status
+        $ws.Cells.Item($row, 6).Value2 = $newEmail
+        
+        Write-Host "Строка ${row}: $email -> $status"
+    }
+
+    $wb.Save()
+    Write-Host "`n[+] Готово! Файл успешно обновлен и сохранен." -ForegroundColor Green
+}
+catch {
+    Write-Host "[!] Произошла ошибка: $_" -ForegroundColor Red
+}
+finally {
+    if ($null -ne $wb) { $wb.Close($false) }
+    $excel.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+}
+
+
+
+
+Import-Module ActiveDirectory
+
 $FilePath = "C:\Users\z-BorodinES\Desktop\Qlik_Отчеты с Рассылками_14.08.26..xlsx"
 
 $excel = New-Object -ComObject Excel.Application
