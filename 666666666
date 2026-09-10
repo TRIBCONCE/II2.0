@@ -1,153 +1,120 @@
-cls
-Import-Module ActiveDirectory
+Смтори вот у нас есть скрипт который формирует заббикс файл по всем пользователям у которых есть диск N, но у меня появились новые вводные надо считать только по активным серверам 
+вот мне коолега предоставл скрипт с активными серверами 
 
-$OutputFile = "C:\Users\z-BorodinES\Desktop\Отчёт_по_группам_AD3.xlsx"
+$Servers = @(
+"\\p-fsdpt-dpt01f\PersonalDisks$",
+"\\p-fsdpt-dpt02f\PersonalDisks$",
+"\\p-fsdpt-dpt03f\PersonalDisks$",
+"\\p-fsdpt-dpt04f\PersonalDisks$",
+"\\p-fsdpt-dpt05f\PersonalDisks$",
+"\\p-fsdpt-dpt08f\PersonalDisks$",
+"\\p-fsdpt-dpt09f\PersonalDisks$",
+"\\p-fsdpt-dpt10f\PersonalDisks$",
+"\\P-FSFIL-FS03f\PersonalDisks$"
+)
 
-# Точный путь, скопированный из атрибутов AD
-$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+$ReportPath = "C:\distr\1\PersonalDisksReport11.csv"
 
-Write-Host "Получение списка групп из конкретной OU..." -ForegroundColor Cyan
 
-# Берем ВСЕ группы из указанной OU, запрашиваем info (Notes) и CanonicalName (Object)
-$groups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties info, CanonicalName
 
-Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей и прав доступа..." -ForegroundColor Cyan
 
-$ResultData = @()
+$GroupsToCheck = @(
+    "DiskN_Migration_Users_No_disk",
+    "DiskN_Migration_Users",
+    "Disk_FIL_DIT01F"
+)
 
-foreach ($group in $groups) {
-    $groupName = $group.Name
-    $objectPath = $group.CanonicalName
+
+$Results = @()
+
+
+foreach ($RootPath in $Servers) {
+    Write-Host "`n>>> Сканирование ресурса: $RootPath" -ForegroundColor Cyan
     
-    # Очищаем путь от переносов строк и обычных пробелов
-    if ($null -ne $group.info) {
-        $folderPath = $group.info -replace "[\r\n]", " "
-        $folderPath = $folderPath.Trim()
-    } else {
-        $folderPath = ""
+    if (-not (Test-Path $RootPath)) {
+        Write-Host "!!! Путь недоступен: $RootPath" -ForegroundColor Red
+        continue
     }
 
-    if ([string]::IsNullOrWhiteSpace($folderPath)) {
-        $status = "Путь не указан"
-    } 
-    else {
-        $workingPath = ""
-        $hasHiddenChar = $false
+    $UserFolders = Get-ChildItem -Path $RootPath -Directory
 
-        # Ищем начало UNC-пути \\ и забираем всё до конца строки
-        if ($folderPath -match '(\\\\.*)') {
-            $cleanUNC = $matches[1]
-            
-            # Если оригинальная строка отличается от чистого пути (есть скрытые спецсимволы в начале)
-            if ($folderPath -ne $cleanUNC) {
-                $hasHiddenChar = $true
+
+    foreach ($Folder in $UserFolders) {
+        $UserName = $Folder.Name
+        $FullPath = $Folder.FullName
+        Write-Host "Подключение к: $FullPath..." -NoNewline
+
+
+        $SizeValue = 0
+        $RoboOut = & robocopy "$FullPath" NULL /L /S /BYTES /XJ /NFL /NDL /NJH /R:0 /W:0
+        $StatLines = $RoboOut | Where-Object { $_ -match ':' }
+        if ($StatLines.Count -ge 3) {
+            if ($StatLines[2] -match ':\s+(\d+)') {
+                $SizeValue = $Matches[1]
             }
-            
-            # Проверяем доступность папки по чистому пути
-            if (Test-Path -LiteralPath $cleanUNC -ErrorAction SilentlyContinue) {
-                $workingPath = $cleanUNC
-            } else {
-                $status = "Не существует"
-            }
-        } 
-        else {
-            # Если в строке вообще нет \\
-            $status = "Некорректный формат пути"
         }
 
-        # Если путь существует, проверяем, назначена ли на него группа
-        if ($workingPath -ne "") {
-            try {
-                # Быстро читаем ACL папки
-                $acl = (Get-Item -LiteralPath $workingPath -Force -ErrorAction Stop).GetAccessControl('Access')
-                
-                # --- ЛОГИКА ДЛЯ ВЛОЖЕННЫХ ГРУПП ---
-                # Формируем имя родительской группы (если применимо)
-                $altGroupName = $null
-                if ($groupName -match "(?i) - изменение$") {
-                    $altGroupName = $groupName -ireplace "(?i) - изменение$", " - write"
-                } elseif ($groupName -match "(?i) - чтение$") {
-                    $altGroupName = $groupName -ireplace "(?i) - чтение$", " - read"
-                }
+        # Получение информации из AD
+        $ADUser = Get-ADUser -Filter "SamAccountName -eq '$UserName'" -Properties Name, Enabled, AccountExpirationDate, MemberOf, homeDrive, homeDirectory, department, division, extensionAttribute1, extensionAttribute9, info, distinguishedName, displayName, whenCreated, lastLogonDate -ErrorAction SilentlyContinue
 
-                # Экранируем имена для регулярного выражения
-                $escapedGroup = [regex]::Escape($groupName)
-                
-                # Ищем в ACL либо саму группу, либо её английского родителя
-                $hasGroup = $acl.Access | Where-Object { 
-                    $ruleName = $_.IdentityReference.Value
-                    ($ruleName -match "\\$escapedGroup$") -or ($null -ne $altGroupName -and $ruleName -match "\\$([regex]::Escape($altGroupName))$")
-                }
 
-                if ($hasGroup) {
-                    $status = if ($hasHiddenChar) { "Путь существует необходимо убрать символ в начале" } else { "Существует" }
+        $FolderInfo = Get-Item $FullPath
+
+     
+        $GroupMembership = @{}
+        if ($ADUser) {
+            foreach ($Group in $GroupsToCheck) {
+                $GroupDN = Get-ADGroup -Filter "Name -eq '$Group'" -ErrorAction SilentlyContinue
+                if ($GroupDN -and $ADUser.MemberOf -contains $GroupDN.DistinguishedName) {
+                    $GroupMembership[$Group] = "Да"
                 } else {
-                    $status = if ($hasHiddenChar) { "Путь существует (надо убрать символ), но группа не соответствует пути" } else { "Путь существует но группа не соответствует пути" }
+                    $GroupMembership[$Group] = "Нет"
                 }
-            } 
-            catch {
-                # Если у тебя (от чьего имени запущен скрипт) нет прав на чтение свойств безопасности этой папки
-                $status = if ($hasHiddenChar) { "Путь существует (надо убрать символ), но нет доступа для проверки прав" } else { "Путь существует, но нет доступа для проверки прав" }
             }
             
-            # Перезаписываем путь для Excel, чтобы туда попала чистая рабочая версия (без скрытых символов)
-            $folderPath = $workingPath
-        }
-    }
-
-    $ResultData += [PSCustomObject]@{
-        GroupName  = $groupName
-        Path       = $folderPath
-        Status     = $status
-        ObjectPath = $objectPath
-    }
-}
-
-if ($groups.Count -gt 0) {
-    Write-Host "Запись данных в Excel..." -ForegroundColor Cyan
-
-    $excel = New-Object -ComObject Excel.Application
-    $excel.Visible = $false
-    $excel.DisplayAlerts = $false
-
-    try {
-        $workbook = $excel.Workbooks.Add()
-        $worksheet = $workbook.Sheets.Item(1)
-
-        $worksheet.Cells.Item(1, 1).Value2 = "Имя группы"
-        $worksheet.Cells.Item(1, 2).Value2 = "Путь (из Notes)"
-        $worksheet.Cells.Item(1, 3).Value2 = "Статус пути"
-        $worksheet.Cells.Item(1, 4).Value2 = "Путь из Object"
-
-        $worksheet.Rows.Item(1).Font.Bold = $true
-
-        $row = 2
-        foreach ($item in $ResultData) {
-            $worksheet.Cells.Item($row, 1).Value2 = $item.GroupName
-            $worksheet.Cells.Item($row, 2).Value2 = $item.Path
-            $worksheet.Cells.Item($row, 3).Value2 = $item.Status
-            $worksheet.Cells.Item($row, 4).Value2 = $item.ObjectPath
-            $row++
+            # Определяем срок действия учётной записи
+            if ($ADUser.AccountExpirationDate) {
+                $ExpirationStatus = $ADUser.AccountExpirationDate
+            } else {
+                $ExpirationStatus = "Не установлен"
+            }
+        } else {
+            $ExpirationStatus = "N/A (пользователь не найден)"
+            foreach ($Group in $GroupsToCheck) {
+                $GroupMembership[$Group] = "N/A"
+            }
         }
 
-        [void]$worksheet.Columns.AutoFit()
+   
+        $Results += [PSCustomObject]@{
+            "Сервер" = $RootPath
+            "Логин" = $UserName
+            "ФИО" = if ($ADUser) { $ADUser.Name } else { "--- НЕ НАЙДЕН В AD ---" }
+            "Отображаемое имя" = if ($ADUser) { $ADUser.displayName } else { "" }
+            "Состояние УЗ" = if ($ADUser) { if ($ADUser.Enabled) { "Включена" } else { "Отключена" } } else { "N/A (папка есть, логина нет)" }
+            "Срок действия УЗ" = $ExpirationStatus
+            "В группе DiskN_Migration_Users_No_disk" = $GroupMembership["DiskN_Migration_Users_No_disk"]
+            "В группе DiskN_Migration_Users" = $GroupMembership["DiskN_Migration_Users"]
+            "В группе Disk_FIL_DIT01F" = $GroupMembership["Disk_FIL_DIT01F"]
+            "Размер (Байты)" = $SizeValue
+            "Размер (МБ)" = [math]::Round($SizeValue / 1MB, 2)
+            "Каталог по факту" = $FullPath
+            "Дата создания папки" = $FolderInfo.CreationTime
+            "Последнее изменение папки" = $FolderInfo.LastWriteTime
+            "homeDrive (AD)" = if ($ADUser) { $ADUser.homeDrive } else { "" }
+            "homeDirectory (AD)" = if ($ADUser) { $ADUser.homeDirectory } else { "" }
+            "department" = if ($ADUser) { $ADUser.department } else { "" }
+            "division" = if ($ADUser) { $ADUser.division } else { "" }
+            "extensionAttribute1" = if ($ADUser) { $ADUser.extensionAttribute1 } else { "" }
+            "extensionAttribute9" = if ($ADUser) { $ADUser.extensionAttribute9 } else { "" }
+            "info" = if ($ADUser) { $ADUser.info } else { "" }
+            "distinguishedName" = if ($ADUser) { $ADUser.distinguishedName } else { "" }
+            "Дата создания УЗ" = if ($ADUser) { $ADUser.whenCreated } else { "" }
+            "Последний вход" = if ($ADUser) { $ADUser.lastLogonDate } else { "" }
+        }
 
-        $workbook.SaveAs($OutputFile)
-        Write-Host "Файл успешно сохранен: $OutputFile" -ForegroundColor Green
+        $Color = if ($ADUser) { "Green" } else { "Yellow" }
+        Write-Host " OK ($SizeValue байт)" -ForegroundColor $Color
     }
-    catch {
-        Write-Host "[!] Произошла ошибка при работе с Excel: $_" -ForegroundColor Red
-    }
-    finally {
-        if ($null -ne $workbook) { $workbook.Close($false) }
-        $excel.Quit()
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
-    }
-
-    Invoke-Item $OutputFile
-} else {
-    Write-Host "Не найдено ни одной группы в указанной OU. Проверь путь SearchBase." -ForegroundColor Yellow
 }
-смотри давай добавим сюда столбец Блок бизнеса, и туда будем добовлять значение из department если значение вообще существует то всю строку окрашиваем в лёкгий голубой цвет
+Но он админ и его подход мне не нравится ибо если вдруг сервера будут меняться то это каждый раз надо будет в скрипт залазить и руками менять, но мне он сказал что можно смотреть в палитику и в политике уже есть актуальные сервера, в общем измени мне первоначальный скрипт под эти новые вводные,а ещё выведи пожалуйста в консоль все активные сервера из палитики
