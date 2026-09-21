@@ -1,65 +1,139 @@
-$ScriptBlock = {
-        param($Path, $GroupName, $Department)
+cls
 
-        # 1. Быстрая проверка доступности ПЕРЕД любыми вызовами
-        if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
-            return [PSCustomObject]@{
-                BusinessBlock = "$Department"
-                GroupName     = "$GroupName"
-                NotesPath     = "$Path"
-                TargetPath    = "НЕДОСТУПЕН"
-                TotalGB       = "0"
-                Old3YearsGB   = "0"
-                Old5YearsGB   = "0"
+# Путь к твоему сформированному файлу Excel
+$ExcelFilePath = "C:\Users\z-BorodinES\Desktop\Отчёт_по_группам_AD3.xlsx"
+
+Write-Host "1. Открытие файла Excel и чтение данных..." -ForegroundColor Cyan
+
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+
+try {
+    $wb = $excel.Workbooks.Open($ExcelFilePath)
+    $ws = $wb.Worksheets.Item(1)
+
+    $lastRow = $ws.Cells.SpecialCells(11).Row # 11 = xlCellTypeLastCell
+
+    $Data = @()
+    
+    # Читаем данные из Excel (со 2-й строки)
+    for ($i = 2; $i -le $lastRow; $i++) {
+        $groupName = $ws.Cells.Item($i, 1).Value2
+        $block     = $ws.Cells.Item($i, 2).Value2
+        $rawPath   = $ws.Cells.Item($i, 3).Value2
+        $status    = $ws.Cells.Item($i, 4).Value2
+
+        # Нас интересуют только существующие пути, у которых есть блок бизнеса
+        if ($status -match "Существует" -and -not [string]::IsNullOrWhiteSpace($rawPath)) {
+            
+            # Нормализуем путь: убираем слэши на конце, приводим к нижнему регистру для сравнения
+            $normPath = $rawPath.Trim().TrimEnd('\').ToLower()
+            $block    = if ($block) { $block.Trim() } else { "" }
+
+            $Data += [PSCustomObject]@{
+                RowIndex = $i
+                RawPath  = $rawPath
+                NormPath = $normPath
+                Block    = $block
+                IsRoot   = $false
             }
         }
+    }
 
-        # 2. Резолв DFS (только если путь доступен)
-        $targetPath = $Path
-        try {
-            $dfsResult = & dfsutil link $Path 2>$null
-            if ($dfsResult -match 'Target:\s+(\\\\.*)') {
-                $targetPath = $matches[1].Trim()
+    Write-Host "Считано валидных строк для анализа: $($Data.Count)" -ForegroundColor Yellow
+
+    # ==============================================================================
+    # АЛГОРИТМ ПОИСКА КОРНЕЙ (ИСКЛЮЧАЕМ СМЕШАННЫЕ ДЕРЕВЬЯ И ВЛОЖЕННОСТИ)
+    # ==============================================================================
+    Write-Host "2. Вычисление математических корней (учет смешанных деревьев)..." -ForegroundColor Cyan
+    
+    # Шаг 1: Находим "дисквалифицированные" пути.
+    # Если путь A является родителем пути B, но их Блоки Бизнеса РАЗНЫЕ -> путь A испорчен.
+    $TaintedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($parent in $Data) {
+        foreach ($child in $Data) {
+            # Проверяем, является ли child вложенной папкой parent (добавляем слэш, чтобы AppDS не совпало с AppDS_test)
+            if ($child.NormPath.StartsWith($parent.NormPath + "\") -and $child.NormPath.Length -gt $parent.NormPath.Length) {
+                if ($parent.Block -ne $child.Block) {
+                    [void]$TaintedPaths.Add($parent.NormPath)
+                    break # Родитель испорчен, дальше его детей проверять нет смысла
+                }
             }
-        } catch { }
+        }
+    }
 
-        # 3. Запуск robocopy через изолированный процесс без блокировки консоли
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = "robocopy.exe"
-        # КРИТИЧНО: /R:0 /W:0 (без зависаний на занятых файлах), /NFL /NDL /NJH (без вывода файлов)
-        $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP"
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
+    Write-Host "Найдено 'смешанных' родителей (дисквалифицированы): $($TaintedPaths.Count)" -ForegroundColor Magenta
 
-        $process = [System.Diagnostics.Process]::Start($psi)
+    # Шаг 2: Сортируем пути по длине от коротких к длинным.
+    # Это гарантирует, что мы сначала оцениваем родителей, а потом детей.
+    $SortedData = $Data | Sort-Object { $_.NormPath.Length }
+    
+    $ValidRoots = [System.Collections.Generic.List[string]]::new()
+    $RowsToColor = [System.Collections.Generic.List[int]]::new()
 
-        # Читаем только финальную таблицу итогов
-        $stdout = $process.StandardOutput.ReadToEnd()
+    foreach ($item in $SortedData) {
         
-        # Таймаут на всякий случай (максимум 3 минуты на папку)
-        $finished = $process.WaitForExit(180000)
-        if (-not $finished) {
-            $process.Kill()
+        # Правило 1: Если путь дисквалифицирован (смешанный), он НЕ корень. Его дети будут корнями.
+        if ($TaintedPaths.Contains($item.NormPath)) {
+            continue
         }
-        $process.Dispose()
 
-        [long]$TotalBytes = 0
-        foreach ($line in ($stdout -split "`r?`n")) {
-            if ($line -match '^\s*Bytes\s*:\s*(\d+)') {
-                $TotalBytes = [long]$matches[1]
+        # Правило 2: Если такой точный путь уже признан корнем (дубликат путей), пропускаем.
+        $isDuplicate = $false
+        foreach ($root in $ValidRoots) {
+            if ($item.NormPath -eq $root) {
+                $isDuplicate = $true
                 break
             }
         }
+        if ($isDuplicate) { continue }
 
-        return [PSCustomObject]@{
-            BusinessBlock = "$Department"
-            GroupName     = "$GroupName"
-            NotesPath     = "$Path"
-            TargetPath    = "$targetPath"
-            TotalGB       = "$([math]::Round($TotalBytes / 1GB, 2))"
-            Old3YearsGB   = "0"
-            Old5YearsGB   = "0"
+        # Правило 3: Если этот путь является ребенком УЖЕ СУЩЕСТВУЮЩЕГО чистого корня, пропускаем.
+        $isChildOfRoot = $false
+        foreach ($root in $ValidRoots) {
+            if ($item.NormPath.StartsWith($root + "\")) {
+                $isChildOfRoot = $true
+                break
+            }
         }
+        if ($isChildOfRoot) { continue }
+
+        # Если путь прошел все проверки — он объявляется независимым КОРНЕМ!
+        $ValidRoots.Add($item.NormPath)
+        $RowsToColor.Add($item.RowIndex)
     }
+
+    Write-Host "Вычислено итоговых корней для окрашивания: $($RowsToColor.Count)" -ForegroundColor Green
+
+    # ==============================================================================
+    # ПРИМЕНЕНИЕ ЦВЕТА В EXCEL
+    # ==============================================================================
+    Write-Host "3. Окрашивание строк в серый цвет..." -ForegroundColor Cyan
+
+    # Очищаем заливку со всех строк (на случай, если скрипт запускают повторно)
+    $ws.Range("A2:E$lastRow").Interior.ColorIndex = 0 # Убираем цвет (0 = No fill)
+
+    # Красим только целевые строки в светло-серый (RGB: 217, 217, 217)
+    # Формула цвета: B * 65536 + G * 256 + R -> 217 * 65536 + 217 * 256 + 217 = 14277081
+    $GrayColor = 14277081
+
+    foreach ($rowIndex in $RowsToColor) {
+        $ws.Range("A${rowIndex}:E${rowIndex}").Interior.Color = $GrayColor
+    }
+
+    $wb.Save()
+    Write-Host "`nВСЁ ГОТОВО! Файл сохранен." -ForegroundColor Green
+
+}
+catch {
+    Write-Host "[!] Ошибка: $_" -ForegroundColor Red
+}
+finally {
+    if ($null -ne $wb) { $wb.Close($false) }
+    $excel.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+}
