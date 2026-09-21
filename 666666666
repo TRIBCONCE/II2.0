@@ -1,120 +1,49 @@
-Смтори вот у нас есть скрипт который формирует заббикс файл по всем пользователям у которых есть диск N, но у меня появились новые вводные надо считать только по активным серверам 
-вот мне коолега предоставл скрипт с активными серверами 
+Очень важная задача и очень ответственная из за неё зависит дальнейший аудит диска R 
+Вот смотри у нас есть xlsx файл вот с такими столбцами Имя группы;	Блок бизнеса;	Путь (из Notes);	Статус пути;	Путь из Object;
 
-$Servers = @(
-"\\p-fsdpt-dpt01f\PersonalDisks$",
-"\\p-fsdpt-dpt02f\PersonalDisks$",
-"\\p-fsdpt-dpt03f\PersonalDisks$",
-"\\p-fsdpt-dpt04f\PersonalDisks$",
-"\\p-fsdpt-dpt05f\PersonalDisks$",
-"\\p-fsdpt-dpt08f\PersonalDisks$",
-"\\p-fsdpt-dpt09f\PersonalDisks$",
-"\\p-fsdpt-dpt10f\PersonalDisks$",
-"\\P-FSFIL-FS03f\PersonalDisks$"
-)
+Анализировать будем по столбцам Путь (из Notes) и Блок бизнеса
 
-$ReportPath = "C:\distr\1\PersonalDisksReport11.csv"
+какая главная суть нам надо пометить серым цветом все корневые не повторяющиеся элементы будем красить все строки, но надо учитывать очень важные нюансы смотри 
 
+пример один 
+FSGLO APPsFileExchange	Информационно-технологический блок	\\abb-win.akbars.ru\departments\AppDS	Существует	R:/APPsFileExchange/FSGLO APPsFileExchange
+FSGLO APPsFileExchange refused-deals - modify	Информационно-технологический блок	\\abb-win.akbars.ru\departments\AppDS	Путь существует но группа не соответствует пути	R:/APPsFileExchange/refused-deals/FSGLO APPsFileExchange refused-deals - modify
+Вот смотри Пути одинаковые но блоки одни и теже помечаем только оду строку AppDS является корнем 
 
+пример два 
+FSGLO APPsFileExchange	Информационно-технологический блок	\\abb-win.akbars.ru\departments\AppDS	Существует	R:/APPsFileExchange/FSGLO APPsFileExchange
+ОФ 577-П - ВалРынок - read	Информационно-технологический блок	\\abb-win.akbars.ru\departments\AppDS\577-П\ВУ\ВалРынок	Существует	R:/Users-APPsFileExchange/577-П/ВУ/ВалРынок/ОФ 577-П - ВалРынок - read
 
+Вот эту мы уже не помечаем - ОФ 577-П - ВалРынок - read	Информационно-технологический блок	\\abb-win.akbars.ru\departments\AppDS\577-П\ВУ\ВалРынок	Существует	R:/Users-APPsFileExchange/577-П/ВУ/ВалРынок/ОФ 577-П - ВалРынок - read 
+ибо она входит в \\abb-win.akbars.ru\departments\AppDS для аудита это крайне важно чтобы небыло лишних подсчётов AppDS тут корень 
 
-$GroupsToCheck = @(
-    "DiskN_Migration_Users_No_disk",
-    "DiskN_Migration_Users",
-    "Disk_FIL_DIT01F"
-)
+Но есть и очень сложная ситуация 
 
-
-$Results = @()
-
-
-foreach ($RootPath in $Servers) {
-    Write-Host "`n>>> Сканирование ресурса: $RootPath" -ForegroundColor Cyan
-    
-    if (-not (Test-Path $RootPath)) {
-        Write-Host "!!! Путь недоступен: $RootPath" -ForegroundColor Red
-        continue
-    }
-
-    $UserFolders = Get-ChildItem -Path $RootPath -Directory
-
-
-    foreach ($Folder in $UserFolders) {
-        $UserName = $Folder.Name
-        $FullPath = $Folder.FullName
-        Write-Host "Подключение к: $FullPath..." -NoNewline
+FSDPT Блок Риски	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\	Существует	R:/Блок Риски/FSDPT Блок Риски
+FSDPT ДАРКИБ	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\ДАРКИБ	Существует	R:/Блок Риски/ДАРКИБ/FSDPT ДАРКИБ
+FSDPT ДИР	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\ДИР	Существует	R:/Блок Риски/ДИР/FSDPT ДИР
+FSDPT ДИР Специальные Руководители ДИР	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\ДИР\Специальные\Руководители ДИР	Существует	R:/Блок Риски/ДИР/Специальные/Руководители ДИР/FSDPT ДИР Специальные Руководители ДИР
+FSDPT Центр валидации	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\ДИР\Центр валидации	Существует	R:/Блок Риски/ДИР/Центр валидации/FSDPT Центр валидации
+FSDPT ЦМИР	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\ДИР\ЦМИР	Существует	R:/Блок Риски/ДИР/ЦМИР/FSDPT ЦМИР
+FSDPT ЦОИР	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\ДИР\ЦОИР	Существует	R:/Блок Риски/ДИР/ЦОИР/FSDPT ЦОИР
+FSDPT Дирекция исследования развития компетенций и риск-технолог	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция исследования развития компетенций и риск-технологий	Существует	R:/Блок Риски/Дирекция исследования развития компетенций и риск-технологий/FSDPT Дирекция исследования развития компетенций и риск-технолог
+FSDPT Дирекция нефинансовых рисков и контроля	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция нефинансовых рисков и контроля	Существует	R:/Блок Риски/Дирекция нефинансовых рисков и контроля/FSDPT Дирекция нефинансовых рисков и контроля
+FSDPT ЦАМ	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция нефинансовых рисков и контроля\ЦАМ	Существует	R:/Блок Риски/Дирекция нефинансовых рисков и контроля/ЦАМ/FSDPT ЦАМ
+FSDPT ЦМНР	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция нефинансовых рисков и контроля\ЦМНР	Существует	R:/Блок Риски/Дирекция нефинансовых рисков и контроля/ЦМНР/FSDPT ЦМНР
+FSDPT ЦНМК	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция нефинансовых рисков и контроля\ЦНМК	Существует	R:/Блок Риски/Дирекция нефинансовых рисков и контроля/ЦНМК/FSDPT ЦНМК
+FSDPT Дирекция по контролю за операциями на финансовых рынках	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция по контролю за операциями на финансовых рынках Группы	Существует	R:/Блок Риски/Дирекция по контролю за операциями на финансовых рынках Группы/FSDPT Дирекция по контролю за операциями на финансовых рынках
+FSDPT ДКОФРГ Спец ДКОФРГ	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция по контролю за операциями на финансовых рынках Группы\Специальные\ДКОФРГ	Существует	R:/Блок Риски/Дирекция по контролю за операциями на финансовых рынках Группы/Специальные/ДКОФРГ/FSDPT ДКОФРГ Спец ДКОФРГ
+FSDPT Дирекция розничных кредитных рисков	Розничный бизнес	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция розничных кредитных рисков	Существует	R:/Блок Риски/Дирекция розничных кредитных рисков/FSDPT Дирекция розничных кредитных рисков
+FSDPT ДРКР Спец ImportQlik	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция розничных кредитных рисков\Специальные\ImportQlik	Существует	R:/Блок Риски/Дирекция розничных кредитных рисков/Специальные/ImportQlik/FSDPT ДРКР Спец ImportQlik
+FSDPT ЦМиКППР	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция розничных кредитных рисков\ЦМиКППР	Существует	R:/Блок Риски/Дирекция розничных кредитных рисков/ЦМиКППР/FSDPT ЦМиКППР
 
 
-        $SizeValue = 0
-        $RoboOut = & robocopy "$FullPath" NULL /L /S /BYTES /XJ /NFL /NDL /NJH /R:0 /W:0
-        $StatLines = $RoboOut | Where-Object { $_ -match ':' }
-        if ($StatLines.Count -ge 3) {
-            if ($StatLines[2] -match ':\s+(\d+)') {
-                $SizeValue = $Matches[1]
-            }
-        }
+Вот смотри вроде есть помеченный корень FSDPT Блок Риски	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\	Существует	R:/Блок Риски/FSDPT Блок Риски
 
-        # Получение информации из AD
-        $ADUser = Get-ADUser -Filter "SamAccountName -eq '$UserName'" -Properties Name, Enabled, AccountExpirationDate, MemberOf, homeDrive, homeDirectory, department, division, extensionAttribute1, extensionAttribute9, info, distinguishedName, displayName, whenCreated, lastLogonDate -ErrorAction SilentlyContinue
+Но тут на тебе FSDPT Дирекция розничных кредитных рисков	Розничный бизнес	\\abb-win.akbars.ru\departments\Блок Риски\Дирекция розничных кредитных рисков	Существует	R:/Блок Риски/Дирекция розничных кредитных рисков/FSDPT Дирекция розничных кредитных рисков 
 
+и что получается 
 
-        $FolderInfo = Get-Item $FullPath
+FSDPT Блок Риски	Блок риски	\\abb-win.akbars.ru\departments\Блок Риски\	Существует	R:/Блок Риски/FSDPT Блок Риски - это уже не корень а каждая внутренняя папка будет корнем ибо нам как уже говорю нужен точный подсчёт без повторений
 
-     
-        $GroupMembership = @{}
-        if ($ADUser) {
-            foreach ($Group in $GroupsToCheck) {
-                $GroupDN = Get-ADGroup -Filter "Name -eq '$Group'" -ErrorAction SilentlyContinue
-                if ($GroupDN -and $ADUser.MemberOf -contains $GroupDN.DistinguishedName) {
-                    $GroupMembership[$Group] = "Да"
-                } else {
-                    $GroupMembership[$Group] = "Нет"
-                }
-            }
-            
-            # Определяем срок действия учётной записи
-            if ($ADUser.AccountExpirationDate) {
-                $ExpirationStatus = $ADUser.AccountExpirationDate
-            } else {
-                $ExpirationStatus = "Не установлен"
-            }
-        } else {
-            $ExpirationStatus = "N/A (пользователь не найден)"
-            foreach ($Group in $GroupsToCheck) {
-                $GroupMembership[$Group] = "N/A"
-            }
-        }
-
-   
-        $Results += [PSCustomObject]@{
-            "Сервер" = $RootPath
-            "Логин" = $UserName
-            "ФИО" = if ($ADUser) { $ADUser.Name } else { "--- НЕ НАЙДЕН В AD ---" }
-            "Отображаемое имя" = if ($ADUser) { $ADUser.displayName } else { "" }
-            "Состояние УЗ" = if ($ADUser) { if ($ADUser.Enabled) { "Включена" } else { "Отключена" } } else { "N/A (папка есть, логина нет)" }
-            "Срок действия УЗ" = $ExpirationStatus
-            "В группе DiskN_Migration_Users_No_disk" = $GroupMembership["DiskN_Migration_Users_No_disk"]
-            "В группе DiskN_Migration_Users" = $GroupMembership["DiskN_Migration_Users"]
-            "В группе Disk_FIL_DIT01F" = $GroupMembership["Disk_FIL_DIT01F"]
-            "Размер (Байты)" = $SizeValue
-            "Размер (МБ)" = [math]::Round($SizeValue / 1MB, 2)
-            "Каталог по факту" = $FullPath
-            "Дата создания папки" = $FolderInfo.CreationTime
-            "Последнее изменение папки" = $FolderInfo.LastWriteTime
-            "homeDrive (AD)" = if ($ADUser) { $ADUser.homeDrive } else { "" }
-            "homeDirectory (AD)" = if ($ADUser) { $ADUser.homeDirectory } else { "" }
-            "department" = if ($ADUser) { $ADUser.department } else { "" }
-            "division" = if ($ADUser) { $ADUser.division } else { "" }
-            "extensionAttribute1" = if ($ADUser) { $ADUser.extensionAttribute1 } else { "" }
-            "extensionAttribute9" = if ($ADUser) { $ADUser.extensionAttribute9 } else { "" }
-            "info" = if ($ADUser) { $ADUser.info } else { "" }
-            "distinguishedName" = if ($ADUser) { $ADUser.distinguishedName } else { "" }
-            "Дата создания УЗ" = if ($ADUser) { $ADUser.whenCreated } else { "" }
-            "Последний вход" = if ($ADUser) { $ADUser.lastLogonDate } else { "" }
-        }
-
-        $Color = if ($ADUser) { "Green" } else { "Yellow" }
-        Write-Host " OK ($SizeValue байт)" -ForegroundColor $Color
-    }
-}
-Но он админ и его подход мне не нравится ибо если вдруг сервера будут меняться то это каждый раз надо будет в скрипт залазить и руками менять, но мне он сказал что можно смотреть в палитику и в политике уже есть актуальные сервера, в общем измени мне первоначальный скрипт под эти новые вводные,а ещё выведи пожалуйста в консоль все активные сервера из палитики
+Вот такая задача решить надо на повершел
