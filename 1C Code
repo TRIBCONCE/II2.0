@@ -1,88 +1,139 @@
-# ==============================================================================
-# ШАГ 4: ГЕНЕРАЦИЯ / ОБНОВЛЕНИЕ ЛИСТА "ДИСК R" В EXCEL
-# ==============================================================================
-Write-Host "`n3. Сохранение данных в Excel (лист 'Диск R')..." -ForegroundColor Cyan
+cls
 
-$finalData = Import-Csv -Path $TempCsvPath -Delimiter ";" -Encoding UTF8
+# Путь к твоему сформированному файлу Excel
+$ExcelFilePath = "C:\Users\z-BorodinES\Desktop\Задача Диск RN\Нахождение корневых групп безопасности\Копия Отчёт_по_группам_AD3 - Copy.xlsx"
+
+Write-Host "1. Открытие файла Excel и чтение данных..." -ForegroundColor Cyan
 
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
 
 try {
-    $wb = $null
-    $ws = $null
+    $wb = $excel.Workbooks.Open($ExcelFilePath)
+    $ws = $wb.Worksheets.Item(1)
 
-    # 1. Если файл уже существует — открываем его, а НЕ создаем с нуля
-    if (Test-Path $TargetExcelPath) {
-        $wb = $excel.Workbooks.Open($TargetExcelPath)
+    $lastRow = $ws.Cells.SpecialCells(11).Row # 11 = xlCellTypeLastCell
+
+    $Data = @()
+    
+    # Читаем данные из Excel (со 2-й строки)
+    for ($i = 2; $i -le $lastRow; $i++) {
+        $groupName = $ws.Cells.Item($i, 1).Value2
+        $block     = $ws.Cells.Item($i, 2).Value2
+        $rawPath   = $ws.Cells.Item($i, 3).Value2
+        $status    = $ws.Cells.Item($i, 4).Value2
+
+        # Нас интересуют только существующие пути, у которых есть блок бизнеса
+        if ($status -match "Существует" -and -not [string]::IsNullOrWhiteSpace($rawPath)) {
+            
+            # Нормализуем путь: убираем слэши на конце, приводим к нижнему регистру для сравнения
+            $normPath = $rawPath.Trim().TrimEnd('\').ToLower()
+            $block    = if ($block) { $block.Trim() } else { "" }
+
+            $Data += [PSCustomObject]@{
+                RowIndex = $i
+                RawPath  = $rawPath
+                NormPath = $normPath
+                Block    = $block
+                IsRoot   = $false
+            }
+        }
+    }
+
+    Write-Host "Считано валидных строк для анализа: $($Data.Count)" -ForegroundColor Yellow
+
+    # ==============================================================================
+    # АЛГОРИТМ ПОИСКА КОРНЕЙ (ИСКЛЮЧАЕМ СМЕШАННЫЕ ДЕРЕВЬЯ И ВЛОЖЕННОСТИ)
+    # ==============================================================================
+    Write-Host "2. Вычисление математических корней (учет смешанных деревьев)..." -ForegroundColor Cyan
+    
+    # Шаг 1: Находим "дисквалифицированные" пути.
+    # Если путь A является родителем пути B, но их Блоки Бизнеса РАЗНЫЕ -> путь A испорчен.
+    $TaintedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($parent in $Data) {
+        foreach ($child in $Data) {
+            # Проверяем, является ли child вложенной папкой parent (добавляем слэш, чтобы AppDS не совпало с AppDS_test)
+            if ($child.NormPath.StartsWith($parent.NormPath + "\") -and $child.NormPath.Length -gt $parent.NormPath.Length) {
+                if ($parent.Block -ne $child.Block) {
+                    [void]$TaintedPaths.Add($parent.NormPath)
+                    break # Родитель испорчен, дальше его детей проверять нет смысла
+                }
+            }
+        }
+    }
+
+    Write-Host "Найдено 'смешанных' родителей (дисквалифицированы): $($TaintedPaths.Count)" -ForegroundColor Magenta
+
+    # Шаг 2: Сортируем пути по длине от коротких к длинным.
+    # Это гарантирует, что мы сначала оцениваем родителей, а потом детей.
+    $SortedData = $Data | Sort-Object { $_.NormPath.Length }
+    
+    $ValidRoots = [System.Collections.Generic.List[string]]::new()
+    $RowsToColor = [System.Collections.Generic.List[int]]::new()
+
+    foreach ($item in $SortedData) {
         
-        # Ищем лист "Диск R" среди существующих
-        for ($i = 1; $i -le $wb.Worksheets.Count; $i++) {
-            if ($wb.Worksheets.Item($i).Name -eq "Диск R") {
-                $ws = $wb.Worksheets.Item($i)
+        # Правило 1: Если путь дисквалифицирован (смешанный), он НЕ корень. Его дети будут корнями.
+        if ($TaintedPaths.Contains($item.NormPath)) {
+            continue
+        }
+
+        # Правило 2: Если такой точный путь уже признан корнем (дубликат путей), пропускаем.
+        $isDuplicate = $false
+        foreach ($root in $ValidRoots) {
+            if ($item.NormPath -eq $root) {
+                $isDuplicate = $true
                 break
             }
         }
-        
-        # Если такого листа нет — добавляем его первым
-        if ($null -eq $ws) {
-            $ws = $wb.Worksheets.Add($wb.Worksheets.Item(1))
-            $ws.Name = "Диск R"
-        } else {
-            # Очищаем только этот лист от старых данных перед перезаписью
-            $ws.Cells.Clear()
+        if ($isDuplicate) { continue }
+
+        # Правило 3: Если этот путь является ребенком УЖЕ СУЩЕСТВУЮЩЕГО чистого корня, пропускаем.
+        $isChildOfRoot = $false
+        foreach ($root in $ValidRoots) {
+            if ($item.NormPath.StartsWith($root + "\")) {
+                $isChildOfRoot = $true
+                break
+            }
         }
-    } else {
-        # Если файла нет вообще — создаем новую книгу
-        $wb = $excel.Workbooks.Add()
-        $ws = $wb.Worksheets.Item(1)
-        $ws.Name = "Диск R"
+        if ($isChildOfRoot) { continue }
+
+        # Если путь прошел все проверки — он объявляется независимым КОРНЕМ!
+        $ValidRoots.Add($item.NormPath)
+        $RowsToColor.Add($item.RowIndex)
     }
 
-    # 2. Заголовки таблицы
-    $ws.Cells.Item(1, 1).Value2 = "Блок бизнеса"
-    $ws.Cells.Item(1, 2).Value2 = "Имя группы"
-    $ws.Cells.Item(1, 3).Value2 = "Путь(Notes)"
-    $ws.Cells.Item(1, 4).Value2 = "TargetPath"
-    $ws.Cells.Item(1, 5).Value2 = "Общий размер папки, в Gb"
-    $ws.Cells.Item(1, 6).Value2 = "Файлы старше 3х лет, в Gb"
-    $ws.Cells.Item(1, 7).Value2 = "Файлы старше 5 лет, в Gb"
-    $ws.Range("A1:G1").Font.Bold = $true
+    Write-Host "Вычислено итоговых корней для окрашивания: $($RowsToColor.Count)" -ForegroundColor Green
 
-    # 3. Заполнение строк
-    $row = 2
-    foreach ($item in $finalData) {
-        $ws.Cells.Item($row, 1).Value2 = "$($item.BusinessBlock)"
-        $ws.Cells.Item($row, 2).Value2 = "$($item.GroupName)"
-        $ws.Cells.Item($row, 3).Value2 = "$($item.NotesPath)"
-        $ws.Cells.Item($row, 4).Value2 = "$($item.TargetPath)"
-        $ws.Cells.Item($row, 5).Value2 = "$($item.TotalGB)"
-        $ws.Cells.Item($row, 6).Value2 = "$($item.Old3YearsGB)"
-        $ws.Cells.Item($row, 7).Value2 = "$($item.Old5YearsGB)"
-        $row++
+    # ==============================================================================
+    # ПРИМЕНЕНИЕ ЦВЕТА В EXCEL
+    # ==============================================================================
+    Write-Host "3. Окрашивание строк в серый цвет..." -ForegroundColor Cyan
+
+    # Очищаем заливку со всех строк (на случай, если скрипт запускают повторно)
+    $ws.Range("A2:E$lastRow").Interior.ColorIndex = 0 # Убираем цвет (0 = No fill)
+
+    # Красим только целевые строки в светло-серый (RGB: 217, 217, 217)
+    # Формула цвета: B * 65536 + G * 256 + R -> 217 * 65536 + 217 * 256 + 217 = 14277081
+    $GrayColor = 14277081
+
+    foreach ($rowIndex in $RowsToColor) {
+        $ws.Range("A${rowIndex}:E${rowIndex}").Interior.Color = $GrayColor
     }
 
-    [void]$ws.Columns.AutoFit()
+    $wb.Save()
+    Write-Host "`nВСЁ ГОТОВО! Файл сохранен." -ForegroundColor Green
 
-    # 4. Сохраняем без перезаписи и удаления файла
-    if (Test-Path $TargetExcelPath) {
-        $wb.Save()
-    } else {
-        $wb.SaveAs($TargetExcelPath)
-    }
-    $wb.Close($true)
-
-    Write-Host "`nВСЁ ГОТОВО! Лист 'Диск R' успешно обновлен в файле: $TargetExcelPath" -ForegroundColor Green
 }
 catch {
-    Write-Error "Ошибка при сохранении Excel: $_"
+    Write-Host "[!] Ошибка: $_" -ForegroundColor Red
 }
 finally {
-    if ($null -ne $excel) {
-        $excel.Quit()
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
-    }
-}
+    if ($null -ne $wb) { $wb.Close($false) }
+    $excel.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+} Смотри зачем мы в начале прям открываем файл пусть без открытия обрабатываем и окрашиваем строки
