@@ -1,82 +1,596 @@
-[523 / 1046697] УСПЕХ: Группе 'FSDPT Служба внутреннего контроля' записан департамент 'Служба внутреннего контроля'
-[524 / 1046697] УСПЕХ: Группе 'FSDPT СОТ' записан департамент 'Административно-хозяйственный блок'
-[525 / 1046697] УСПЕХ: Группе 'FSDPT УИТДО' записан департамент 'Информационно-технологический блок'
-[526 / 1046697] УСПЕХ: Группе 'FSDPT УППА' записан департамент 'Блок стратегического управления'
-[527 / 1046697] УСПЕХ: Группе 'FSDPT УПС' записан департамент 'Блок стратегического управления'
-[528 / 1046697] УСПЕХ: Группе 'FSDPT УРПАЮЛ' записан департамент 'Проблемные активы'
-[529 / 1046697] УСПЕХ: Группе 'FSDPT УРПЗФЛ' записан департамент 'Блок риски'
-[530 / 1046697] УСПЕХ: Группе 'FSDPT УРР' записан департамент 'Розничный бизнес'
-[531 / 1046697] УСПЕХ: Группе 'Все филиалы - Аудиторы' записан департамент 'Розничный бизнес'
-[532 / 1046697] УСПЕХ: Группе 'FSDPT Финансовый департамент' записан департамент 'Финансовый блок'
-[533 / 1046697] УСПЕХ: Группе 'FSDPT Центр Инноваций' записан департамент 'Блок стратегического управления'
-
-и длальше код виснит во мервым почему так много 1046697 у меня в файле так раз 533 группы
-
 cls
 Import-Module ActiveDirectory
+Import-Module GroupPolicy # Модуль для чтения политик
+
+$timestart = Get-Date
+$today = Get-Date -Format dd.MM.yyyy
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
 
 # ==============================================================================
 # НАСТРОЙКИ
 # ==============================================================================
-$ExcelPath = "C:\Users\z-BorodinES\Desktop\Задача Диск RN\Добавление атрибута department\Группы для добавления.xlsx" # Укажи свой путь к файлу
 
-Write-Host "Запуск Excel..." -ForegroundColor Cyan
-$excel = New-Object -ComObject Excel.Application
-$excel.Visible = $false
-$excel.DisplayAlerts = $false
+$GpoName     = "Users Net Use N Personal Disk New" 
+
+$LogPath     = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\Zabbix_DiskN_LOG.txt"
+$OutputPath  = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ZabbixDiskN.txt"
+$TempCsvPath = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\Zabbix_DiskN_Progress_Buffer.csv"
+$MaxThreads  = 8
+
+$ScriptStatus = "SUCCESS"
+
+function Write-Log {
+    param([string]$Message)
+    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
+}
 
 try {
-    Write-Host "Чтение файла $ExcelPath..." -ForegroundColor Cyan
-    $wb = $excel.Workbooks.Open($ExcelPath)
-    $ws = $wb.Worksheets.Item(1)
-    $lastRow = $ws.Cells.SpecialCells(11).Row 
+    Write-Log "--- ЗАПУСК СКРИПТА СБОРА РАЗМЕРОВ ДИСКОВ N ДЛЯ ZABBIX ---"
+    
+    # ==============================================================================
+    # ШАГ 1: ПОЛУЧЕНИЕ АКТИВНЫХ СЕРВЕРОВ ИЗ GPO
+    # ==============================================================================
+    Write-Host "Получение списка активных серверов из политики [$GpoName]..." -ForegroundColor Cyan
+    Write-Log "Чтение GPO: $GpoName"
 
-    Write-Host "Начинаем обновление атрибута Department в Active Directory..." -ForegroundColor Yellow
+    try {
+        # Получаем XML-отчет о политике
+        $xmlReport = Get-GPOReport -Name $GpoName -ReportType Xml
+    } catch {
+        Write-Host "ОШИБКА: Политика '$GpoName' не найдена или нет прав на чтение!" -ForegroundColor Red
+        throw $_
+    }
 
-    for ($i = 2; $i -le $lastRow; $i++) {
-        $groupName     = $ws.Cells.Item($i, 1).Text
-        $businessBlock = $ws.Cells.Item($i, 2).Text
+    $ActiveServers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-        if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
+    # Ищем в XML все пути вида \\server\share, которые прописаны в политике
+    $matches = [regex]::Matches($xmlReport, '(?i)path="(\\\\[^"\\]+\\[^"\\]+)')
+    foreach ($m in $matches) {
+        [void]$ActiveServers.Add($m.Groups[1].Value.TrimEnd('\'))
+    }
 
-        $cleanGroup = $groupName.Trim()
-        $cleanBlock = $businessBlock.Trim()
+    if ($ActiveServers.Count -eq 0) {
+        Write-Host "В политике $GpoName не найдено ни одного сетевого пути!" -ForegroundColor Red
+        throw "Список серверов пуст."
+    }
 
-        try {
-            # Ищем группу в AD (Filter {...} безопаснее обрабатывает спецсимволы в именах)
-            $adGroup = Get-ADGroup -Filter {Name -eq $cleanGroup} -ErrorAction Stop
+    Write-Host "`n=== Активные серверы из политики ===" -ForegroundColor Green
+    foreach ($srv in $ActiveServers) {
+        Write-Host " -> $srv" -ForegroundColor White
+        Write-Log "Активный сервер GPO: $srv"
+    }
+    Write-Host "====================================`n" -ForegroundColor Green
 
-            if ($null -ne $adGroup) {
-                if (-not [string]::IsNullOrWhiteSpace($cleanBlock)) {
-                    # Записываем значение в атрибут department
-                    Set-ADGroup -Identity $adGroup -Replace @{department=$cleanBlock} -ErrorAction Stop
-                    Write-Host "[$i / $lastRow] УСПЕХ: Группе '$cleanGroup' записан департамент '$cleanBlock'" -ForegroundColor Green
-                } 
-                else {
-                    # Если ячейка пустая, очищаем атрибут
-                    Set-ADGroup -Identity $adGroup -Clear department -ErrorAction Stop
-                    Write-Host "[$i / $lastRow] ОЧИЩЕНО: У группы '$cleanGroup' удален атрибут department (пустая ячейка)" -ForegroundColor DarkYellow
+    # ==============================================================================
+    # ШАГ 2: ПОЛУЧЕНИЕ И ФИЛЬТРАЦИЯ ПОЛЬЗОВАТЕЛЕЙ AD
+    # ==============================================================================
+    Write-Host "Авторизация и получение ВСЕХ пользователей из Active Directory..." -ForegroundColor Cyan
+
+    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+
+    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+
+    $AllUsersOn = Get-ADUser -Filter * -Credential $ab_creds -Properties division, HomeDirectory
+    
+    $UniquePaths = @{}
+
+    # Отбираем только тех, чей HomeDirectory указывает на один из АКТИВНЫХ серверов
+    foreach ($User in $AllUsersOn) {
+        $personalPath = $User.HomeDirectory
+        if (-not [string]::IsNullOrWhiteSpace($personalPath)) {
+            
+            # Извлекаем корень пути, например: \\p-fsdpt-dpt01f\PersonalDisks$
+            $basePath = ""
+            if ($personalPath -match '^(\\\\[^\\]+\\[^\\]+)') {
+                $basePath = $matches[1]
+            }
+
+            # Сверяем корень пути пользователя со списком из GPO
+            if ($ActiveServers.Contains($basePath)) {
+                $normPath = $personalPath.TrimEnd('\')
+                $div = if ($User.division) { $User.division.Trim() } else { "(не указано)" }
+                
+                if (-not $UniquePaths.ContainsKey($normPath)) {
+                    $UniquePaths[$normPath] = $div
                 }
-            } 
-            else {
-                Write-Host "[$i / $lastRow] НЕ НАЙДЕНО: Группа '$cleanGroup' не существует в AD" -ForegroundColor Red
             }
         }
-        catch {
-            Write-Host "[$i / $lastRow] ОШИБКА AD: Не удалось обработать '$cleanGroup' ($($_.Exception.Message))" -ForegroundColor Red
+    }
+
+    Write-Host "Отобрано личных дисков на активных серверах: $($UniquePaths.Count)" -ForegroundColor Cyan
+    Write-Log "Целевых путей для сканирования: $($UniquePaths.Count)"
+
+    # ==============================================================================
+    # ШАГ 3: ПРОВЕРКА КЭША И БУФЕРИЗАЦИЯ
+    # ==============================================================================
+    $processedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $DivisionCount = @{}
+
+    if (Test-Path $TempCsvPath) {
+        Write-Host "Найден буфер! Загрузка ранее посчитанных данных..." -ForegroundColor Yellow
+        $existing = Import-Csv -Path $TempCsvPath -Delimiter ";" -Encoding UTF8
+        foreach ($row in $existing) {
+            [void]$processedPaths.Add($row.Path)
+            
+            $div = $row.Division
+            if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
+            $DivisionCount[$div] += [double]$row.TotalGB
+        }
+        Write-Host "Уже готово: $($processedPaths.Count) папок. Пропускаем." -ForegroundColor Green
+    } else {
+        "Division;Path;TotalGB" | Out-File -FilePath $TempCsvPath -Encoding UTF8
+    }
+
+    $tasksToRun = @{}
+    foreach ($entry in $UniquePaths.GetEnumerator()) {
+        if (-not $processedPaths.Contains($entry.Key)) {
+            $tasksToRun[$entry.Key] = $entry.Value
         }
     }
+    
+    Write-Host "Осталось обработать: $($tasksToRun.Count) папок" -ForegroundColor Green
+
+    # ==============================================================================
+    # ШАГ 4: МНОГОПОТОЧНЫЙ ПОДСЧЕТ ЧЕРЕЗ ROBOCOPY
+    # ==============================================================================
+    if ($tasksToRun.Count -gt 0) {
+        Write-Host "`nЗапуск многопоточного сканирования ($MaxThreads потоков)..." -ForegroundColor Yellow
+        
+        $RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
+        $RunspacePool.Open()
+        $Jobs = @()
+
+        $ScriptBlock = {
+            param($Path, $Division)
+
+            if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+                return [PSCustomObject]@{ Division = $Division; Path = $Path; TotalGB = 0 }
+            }
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "robocopy.exe"
+            $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP"
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
+
+            $process = [System.Diagnostics.Process]::Start($psi)
+            $stdout = $process.StandardOutput.ReadToEnd()
+            $process.WaitForExit(180000) | Out-Null
+            if (-not $process.HasExited) { $process.Kill() }
+            $process.Dispose()
+
+            [long]$TotalBytes = 0
+            foreach ($line in ($stdout -split "`r?`n")) {
+                if ($line -match '^\s*Bytes\s*:\s*(\d+)') {
+                    $TotalBytes = [long]$matches[1]
+                    break
+                }
+            }
+
+            return [PSCustomObject]@{
+                Division = $Division
+                Path       = $Path
+                TotalGB    = [math]::Round($TotalBytes / 1GB, 2)
+            }
+        }
+
+        foreach ($entry in $tasksToRun.GetEnumerator()) {
+            $PowerShell = [powershell]::Create()
+            $PowerShell.RunspacePool = $RunspacePool
+            [void]$PowerShell.AddScript($ScriptBlock)
+            [void]$PowerShell.AddArgument($entry.Key)
+            [void]$PowerShell.AddArgument($entry.Value)
+            
+            $Jobs += [PSCustomObject]@{
+                Pipe    = $PowerShell
+                Result  = $PowerShell.BeginInvoke()
+                Checked = $false
+            }
+        }
+
+        $completed = 0
+        $totalJobs = $Jobs.Count
+
+        while ($Jobs.Result.IsCompleted -contains $false) {
+            foreach ($job in $Jobs) {
+                if ($job.Result.IsCompleted -and -not $job.Checked) {
+                    $job.Checked = $true
+                    $completed++
+                    
+                    try {
+                        $res = $job.Pipe.EndInvoke($job.Result)
+                        if ($res) {
+                            $div = $res.Division
+                            if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
+                            $DivisionCount[$div] += $res.TotalGB
+                            
+                            $csvLine = "$($res.Division);$($res.Path);$($res.TotalGB)"
+                            [System.IO.File]::AppendAllLines($TempCsvPath, [string[]]@($csvLine), [System.Text.Encoding]::UTF8)
+                            
+                            Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB" -ForegroundColor Green
+                        }
+                    } catch { }
+                }
+            }
+            Start-Sleep -Milliseconds 150
+        }
+
+        foreach ($job in $Jobs) {
+            if (-not $job.Checked) {
+                $job.Checked = $true
+                try {
+                    $res = $job.Pipe.EndInvoke($job.Result)
+                    if ($res) {
+                        $div = $res.Division
+                        if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
+                        $DivisionCount[$div] += $res.TotalGB
+                        
+                        $csvLine = "$($res.Division);$($res.Path);$($res.TotalGB)"
+                        [System.IO.File]::AppendAllLines($TempCsvPath, [string[]]@($csvLine), [System.Text.Encoding]::UTF8)
+                    }
+                } catch { }
+            }
+            $job.Pipe.Dispose()
+        }
+        $RunspacePool.Close()
+        $RunspacePool.Dispose()
+    }
+
+    $TotalEnterpriseGB = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+    # ==============================================================================
+    # ШАГ 5: ФОРМИРОВАНИЕ JSON ДЛЯ ZABBIX
+    # ==============================================================================
+    Write-Host "`nГенерация JSON-файла для Zabbix..." -ForegroundColor Cyan
+
+    $discovery = foreach ($k in $DivisionCount.Keys) {
+        @{ '{#DIVISION}' = $k }
+    }
+
+    $payload = [ordered]@{
+        discovery = @($discovery)
+        counts    = $DivisionCount
+        metadata  = @{
+            TotalPersonalDisksScanned = $UniquePaths.Count
+            UniqueDivisions           = $DivisionCount.Count
+            TotalEnterpriseGB         = $TotalEnterpriseGB
+            ActiveServersCount        = $ActiveServers.Count
+            GeneratedAt               = $time
+            ScriptDurationSec         = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+        }
+    }
+
+    $json = $payload | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($OutputPath, $json, [System.Text.UTF8Encoding]::new($false))
+    
+    if (Test-Path $TempCsvPath) { Remove-Item $TempCsvPath -Force }
+
+    # ==============================================================================
+    # ФИНАЛЬНЫЙ ВЫВОД И ЛОГИРОВАНИЕ
+    # ==============================================================================
+    Write-Log ""
+    Write-Log "СТАТУС: $ScriptStatus"
+    Write-Log "Подсчёт объемов Диска N по подразделениям (division) завершен."
+
+    Write-Host "`n=== ИТОГОВЫЙ ПОДСЧЕТ ПО ПОДРАЗДЕЛЕНИЯМ (GB) ===" -ForegroundColor Green
+    
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Format-Table @{Label="Подразделение (division)"; Expression={$_.Key}; Width=50},
+                     @{Label="Размер (GB)"; Expression={$_.Value}; Width=15},
+                     @{Label="% от общего"; Expression={
+                        if ($TotalEnterpriseGB -gt 0) { "{0:P2}" -f ($_.Value / $TotalEnterpriseGB) } else { "0.00 %" }
+                     }; Width=15} -AutoSize
+
+    Write-Host "Общий объем данных Диска N: $($TotalEnterpriseGB) GB" -ForegroundColor Yellow
+    
+    $timestop = Get-Date
+    $TimeSum = $timestop - $timestart
+    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
+    Write-Log "--- ЗАВЕРШЕНИЕ ---"
 }
 catch {
-    Write-Error "Произошла глобальная ошибка: $_"
+    $ScriptStatus = "ERROR"
+    Write-Log "СТАТУС: ERROR. Ошибка: $($_.Exception.Message)"
+    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+    throw
 }
-finally {
-    if ($null -ne $wb) { $wb.Close($false) }
-    if ($null -ne $excel) {
-        $excel.Quit()
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
+
+cls
+
+$timestart = Get-Date
+$today = Get-Date -Format dd.MM.yyyy
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+
+# ==============================================================================
+# НАСТРОЙКИ
+# ==============================================================================
+$LogPath     = "C:\Users\z-BorodinES\Desktop\LOGZabbixRN.txt"
+$OutputPath  = "C:\Users\z-BorodinES\Desktop\ZabbixRN.txt"
+$TempCsvPath = "C:\Users\z-BorodinES\Desktop\Zabbix_Progress_Buffer.csv" # ФАЙЛ КЭША
+$SearchBase  = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
+$MaxThreads  = 8
+
+$ScriptStatus = "SUCCESS"
+
+function Write-Log {
+    param([string]$Message)
+    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
+}
+
+try {
+    Write-Log "--- ЗАПУСК СКРИПТА СБОРА РАЗМЕРОВ ПАПОК ДЛЯ ZABBIX ---"
+    Write-Host "Получение групп из Active Directory..." -ForegroundColor Cyan
+
+    $allGroups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties department, info
+    
+    $UniquePaths = @{}
+
+    foreach ($g in $allGroups) {
+        if (-not [string]::IsNullOrWhiteSpace($g.department) -and -not [string]::IsNullOrWhiteSpace($g.info)) {
+            $cleanPath = ($g.info -replace "[\r\n]", " ").Trim()
+            if ($cleanPath -match '(\\\\.*)') {
+                $normPath = $matches[1].TrimEnd('\')
+                $dept = $g.department.Trim()
+                
+                if (-not $UniquePaths.ContainsKey($normPath)) {
+                    $UniquePaths[$normPath] = $dept
+                }
+            }
+        }
     }
-    Write-Host "Работа скрипта завершена." -ForegroundColor Cyan
+
+    Write-Host "Всего уникальных папок в AD: $($UniquePaths.Count)" -ForegroundColor Cyan
+    Write-Log "Собрано уникальных путей в AD: $($UniquePaths.Count)"
+
+    # ==============================================================================
+    # ПРОВЕРКА КЭША / ПРОДОЛЖЕНИЕ РАБОТЫ
+    # ==============================================================================
+    $processedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $DivisionCount = @{}
+
+    if (Test-Path $TempCsvPath) {
+        Write-Host "Найден промежуточный буфер! Загрузка ранее посчитанных данных..." -ForegroundColor Yellow
+        $existing = Import-Csv -Path $TempCsvPath -Delimiter ";" -Encoding UTF8
+        foreach ($row in $existing) {
+            [void]$processedPaths.Add($row.Path)
+            
+            $div = $row.Department
+            if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
+            $DivisionCount[$div] += [double]$row.TotalGB
+        }
+        Write-Host "Уже готово: $($processedPaths.Count) папок. Они будут пропущены." -ForegroundColor Green
+    } else {
+        "Department;Path;TotalGB" | Out-File -FilePath $TempCsvPath -Encoding UTF8
+    }
+
+    # Фильтруем пути: оставляем только те, которых нет в кэше
+    $tasksToRun = @{}
+    foreach ($entry in $UniquePaths.GetEnumerator()) {
+        if (-not $processedPaths.Contains($entry.Key)) {
+            $tasksToRun[$entry.Key] = $entry.Value
+        }
+    }
+    
+    Write-Host "Осталось обработать: $($tasksToRun.Count) папок" -ForegroundColor Green
+
+    # ==============================================================================
+    # МНОГОПОТОЧНЫЙ ПОДСЧЕТ
+    # ==============================================================================
+    if ($tasksToRun.Count -gt 0) {
+        Write-Host "`nЗапуск многопоточного сканирования Robocopy ($MaxThreads потоков)..." -ForegroundColor Yellow
+        
+        $RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
+        $RunspacePool.Open()
+        $Jobs = @()
+
+        $ScriptBlock = {
+            param($Path, $Department)
+
+            if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+                return [PSCustomObject]@{ Department = $Department; Path = $Path; TotalGB = 0 }
+            }
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "robocopy.exe"
+            $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP"
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
+
+            $process = [System.Diagnostics.Process]::Start($psi)
+
+            $stdout = $process.StandardOutput.ReadToEnd()
+            $process.WaitForExit(180000) | Out-Null
+            if (-not $process.HasExited) { $process.Kill() }
+            $process.Dispose()
+
+            [long]$TotalBytes = 0
+            foreach ($line in ($stdout -split "`r?`n")) {
+                if ($line -match '^\s*Bytes\s*:\s*(\d+)') {
+                    $TotalBytes = [long]$matches[1]
+                    break
+                }
+            }
+
+            return [PSCustomObject]@{
+                Department = $Department
+                Path       = $Path
+                TotalGB    = [math]::Round($TotalBytes / 1GB, 2)
+            }
+        }
+
+        # Раздаем оставшиеся задачи
+        foreach ($entry in $tasksToRun.GetEnumerator()) {
+            $PowerShell = [powershell]::Create()
+            $PowerShell.RunspacePool = $RunspacePool
+            [void]$PowerShell.AddScript($ScriptBlock)
+            [void]$PowerShell.AddArgument($entry.Key)
+            [void]$PowerShell.AddArgument($entry.Value)
+            
+            $Jobs += [PSCustomObject]@{
+                Pipe    = $PowerShell
+                Result  = $PowerShell.BeginInvoke()
+                Checked = $false
+            }
+        }
+
+        # АГРЕГАЦИЯ И СОХРАНЕНИЕ В РЕАЛЬНОМ ВРЕМЕНИ
+        $completed = 0
+        $totalJobs = $Jobs.Count
+
+        while ($Jobs.Result.IsCompleted -contains $false) {
+            foreach ($job in $Jobs) {
+                if ($job.Result.IsCompleted -and -not $job.Checked) {
+                    $job.Checked = $true
+                    $completed++
+                    
+                    try {
+                        $res = $job.Pipe.EndInvoke($job.Result)
+                        if ($res) {
+                            $div = $res.Department
+                            if (-not $DivisionCount.ContainsKey($div)) {
+                                $DivisionCount[$div] = 0
+                            }
+                            $DivisionCount[$div] += $res.TotalGB
+                            
+                            # Мгновенное сохранение в буфер
+                            $csvLine = "$($res.Department);$($res.Path);$($res.TotalGB)"
+                            [System.IO.File]::AppendAllLines($TempCsvPath, [string[]]@($csvLine), [System.Text.Encoding]::UTF8)
+                            
+                            Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
+                        }
+                    } catch {
+                        Write-Host "[$completed / $totalJobs] Ошибка потока: $($_.Exception.Message)" -ForegroundColor Red
+                    }
+                }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+
+        # Добираем последние потоки
+        foreach ($job in $Jobs) {
+            if (-not $job.Checked) {
+                $job.Checked = $true
+                try {
+                    $res = $job.Pipe.EndInvoke($job.Result)
+                    if ($res) {
+                        $div = $res.Department
+                        if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
+                        $DivisionCount[$div] += $res.TotalGB
+                        $completed++
+                        
+                        $csvLine = "$($res.Department);$($res.Path);$($res.TotalGB)"
+                        [System.IO.File]::AppendAllLines($TempCsvPath, [string[]]@($csvLine), [System.Text.Encoding]::UTF8)
+                        
+                        Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
+                    }
+                } catch { }
+            }
+            $job.Pipe.Dispose()
+        }
+        
+        $RunspacePool.Close()
+        $RunspacePool.Dispose()
+    }
+
+    # Считаем общий размер по всем блокам
+    $TotalEnterpriseGB = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+    # ==============================================================================
+    # ФОРМИРОВАНИЕ JSON ДЛЯ ZABBIX
+    # ==============================================================================
+    Write-Host "`nГенерация JSON-файла для Zabbix..." -ForegroundColor Cyan
+
+    $discovery = foreach ($k in $DivisionCount.Keys) {
+        @{ '{#DIVISION}' = $k }
+    }
+
+    $payload = [ordered]@{
+        discovery = @($discovery)
+        counts    = $DivisionCount
+        metadata  = @{
+            TotalFoldersScanned = $UniquePaths.Count
+            UniqueDivisions     = $DivisionCount.Count
+            TotalEnterpriseGB   = $TotalEnterpriseGB
+            GeneratedAt         = $time
+            ScriptDurationSec   = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+        }
+    }
+
+    $json = $payload | ConvertTo-Json -Depth 4
+
+    [System.IO.File]::WriteAllText(
+        $OutputPath,
+        $json,
+        [System.Text.UTF8Encoding]::new($false) 
+    )
+    
+    # ЕСЛИ ВСЕ ПРОШЛО УСПЕШНО - УДАЛЯЕМ КЭШ, ЧТОБЫ В СЛЕДУЮЩИЙ РАЗ НАЧАТЬ ЗАНОВО
+    if (Test-Path $TempCsvPath) {
+        Remove-Item $TempCsvPath -Force
+    }
+
+    # ==============================================================================
+    # ФИНАЛЬНЫЙ ВЫВОД И ЛОГИРОВАНИЕ
+    # ==============================================================================
+    Write-Log ""
+    Write-Log "СТАТУС: $ScriptStatus"
+    Write-Log "Подсчёт объемов по блокам бизнеса завершен."
+    Write-Log "Всего уникальных подразделений: $($DivisionCount.Count)"
+
+    Write-Host "`n=== ИТОГОВЫЙ ПОДСЧЕТ ПО БЛОКАМ (GB) ===" -ForegroundColor Green
+    Write-Host "Всего подразделений: $($DivisionCount.Count)`n"
+
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        ForEach-Object {
+            $percent = 0
+            if ($TotalEnterpriseGB -gt 0) { $percent = $_.Value / $TotalEnterpriseGB }
+            $percentStr = "{0:P2}" -f $percent
+            Write-Log ("{0,-60} {1,10} GB {2,8}" -f $_.Key, $_.Value, $percentStr)
+        }
+
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
+                     @{Label="Размер (GB)"; Expression={$_.Value}; Width=15},
+                     @{Label="% от общего"; Expression={
+                        if ($TotalEnterpriseGB -gt 0) { "{0:P2}" -f ($_.Value / $TotalEnterpriseGB) } else { "0.00 %" }
+                     }; Width=15} -AutoSize
+
+    Write-Host "Общий объем данных: $($TotalEnterpriseGB) GB" -ForegroundColor Yellow
+    Write-Log "Общий объем данных: $($TotalEnterpriseGB) GB"
+
+    $timestop = Get-Date
+    $TimeSum = $timestop - $timestart
+
+    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+    Write-Host "JSON для Zabbix сохранён в: $OutputPath" -ForegroundColor Green
+
+    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
+    Write-Log "--- ЗАВЕРШЕНИЕ ---"
 }
+catch {
+    $ScriptStatus = "ERROR"
+    Write-Log ""
+    Write-Log "СТАТУС: ERROR"
+    Write-Log "Ошибка:"
+    Write-Log $_.Exception.Message
+    Write-Log "Полная информация:"
+    Write-Log $_
+    
+    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+    
+    throw
+}
+
+Вот у этих двух кодов надо надо убрать упомненание $TempCsvPath файлов кэша ибо они пойдут в планировщик на сервере
