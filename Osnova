@@ -1,248 +1,157 @@
 cls
-
-$timestart = Get-Date
-$today = Get-Date -Format dd.MM.yyyy
-$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+Import-Module ActiveDirectory
 
 # ==============================================================================
 # НАСТРОЙКИ
 # ==============================================================================
-$LogPath     = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\Sizing_Blocks_Discovery_LOG.log"
-$OutputPath  = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ADData_FoldersSizeBlocks_Discovery.txt"
-$SearchBase  = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
-$MaxThreads  = 6
+$OutputFile = "C:\Users\z-BorodinES\Desktop\Задача Диск RN\Код создания отчёта по группа безопасности\Отчёт_по_группам_AD3.xlsx"
+$SearchBase = "OU=R: Departments,OU=Department FS Access Groups,OU=Файловые серверы ABCloud,OU=ABCloud,OU=Серверы и ресурсы,OU=Головной офис,DC=abb-win,DC=akbars,DC=ru"
 
-$ScriptStatus = "SUCCESS"
+Write-Host "1. Получение списка групп из AD..." -ForegroundColor Cyan
+$groups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties info, CanonicalName
 
-function Write-Log {
-    param([string]$Message)
-    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
-    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
-}
+Write-Host "Найдено групп: $($groups.Count). Начинается проверка путей, прав и дат..." -ForegroundColor Cyan
 
-try {
-    Write-Log "--- ЗАПУСК СКРИПТА СБОРА РАЗМЕРОВ ПАПОК ДЛЯ ZABBIX ---"
-    Write-Host "Получение групп из Active Directory..." -ForegroundColor Cyan
+$ResultData = @()
+$counter = 0
+$total = $groups.Count
 
-    $allGroups = Get-ADGroup -Filter * -SearchBase $SearchBase -Properties department, info
+foreach ($group in $groups) {
+    $counter++
+    $groupName = $group.Name
+    $objectPath = $group.CanonicalName
+    $folderDate = "-"
     
-    $UniquePaths = @{}
+    # Очищаем путь от переносов строк и лишних пробелов
+    if ($null -ne $group.info) {
+        $folderPath = ($group.info -replace "[\r\n]", " ").Trim()
+    } else {
+        $folderPath = ""
+    }
 
-    foreach ($g in $allGroups) {
-        if (-not [string]::IsNullOrWhiteSpace($g.department) -and -not [string]::IsNullOrWhiteSpace($g.info)) {
-            $cleanPath = ($g.info -replace "[\r\n]", " ").Trim()
-            if ($cleanPath -match '(\\\\.*)') {
-                $normPath = $matches[1].TrimEnd('\')
-                $dept = $g.department.Trim()
-                
-                if (-not $UniquePaths.ContainsKey($normPath)) {
-                    $UniquePaths[$normPath] = $dept
-                }
+    if ([string]::IsNullOrWhiteSpace($folderPath)) {
+        $status = "Путь не указан"
+    } 
+    else {
+        $workingPath = ""
+        $hasHiddenChar = $false
+
+        if ($folderPath -match '(\\\\.*)') {
+            $cleanUNC = $matches[1].TrimEnd('\')
+            
+            if ($folderPath -ne $cleanUNC) {
+                $hasHiddenChar = $true
             }
-        }
-    }
-
-    Write-Host "Уникальных папок для сканирования: $($UniquePaths.Count)" -ForegroundColor Green
-    Write-Log "Собрано уникальных путей: $($UniquePaths.Count)"
-
-    # ==============================================================================
-    # МНОГОПОТОЧНЫЙ ПОДСЧЕТ
-    # ==============================================================================
-    Write-Host "`nЗапуск многопоточного сканирования Robocopy ($MaxThreads потоков)..." -ForegroundColor Yellow
-    
-    $RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
-    $RunspacePool.Open()
-    $Jobs = @()
-
-    $ScriptBlock = {
-        param($Path, $Department)
-
-        if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
-            return [PSCustomObject]@{ Department = $Department; Path = $Path; TotalGB = 0 }
-        }
-
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = "robocopy.exe"
-        $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP"
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
-
-        $process = [System.Diagnostics.Process]::Start($psi)
-
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $process.WaitForExit(180000) | Out-Null
-        if (-not $process.HasExited) { $process.Kill() }
-        $process.Dispose()
-
-        [long]$TotalBytes = 0
-        foreach ($line in ($stdout -split "`r?`n")) {
-            if ($line -match '^\s*Bytes\s*:\s*(\d+)') {
-                $TotalBytes = [long]$matches[1]
-                break
+            
+            if (Test-Path -LiteralPath $cleanUNC -ErrorAction SilentlyContinue) {
+                $workingPath = $cleanUNC
+            } else {
+                $status = "Не существует"
             }
+        } else {
+            $status = "Некорректный формат пути"
         }
 
-        return [PSCustomObject]@{
-            Department = $Department
-            Path       = $Path
-            TotalGB    = [math]::Round($TotalBytes / 1GB, 2)
-        }
-    }
-
-    # Раздаем задачи (ИСПРАВЛЕНА ОШИБКА С CHECKED)
-    foreach ($entry in $UniquePaths.GetEnumerator()) {
-        $PowerShell = [powershell]::Create()
-        $PowerShell.RunspacePool = $RunspacePool
-        [void]$PowerShell.AddScript($ScriptBlock)
-        [void]$PowerShell.AddArgument($entry.Key)
-        [void]$PowerShell.AddArgument($entry.Value)
-        
-        $Jobs += [PSCustomObject]@{
-            Pipe    = $PowerShell
-            Result  = $PowerShell.BeginInvoke()
-            Checked = $false
-        }
-    }
-
-    # ==============================================================================
-    # АГРЕГАЦИЯ И ВЫВОД В РЕАЛЬНОМ ВРЕМЕНИ
-    # ==============================================================================
-    $DivisionCount = @{}
-    $completed = 0
-    $totalJobs = $Jobs.Count
-
-    while ($Jobs.Result.IsCompleted -contains $false) {
-        foreach ($job in $Jobs) {
-            if ($job.Result.IsCompleted -and -not $job.Checked) {
-                $job.Checked = $true
-                $completed++
-                
-                try {
-                    $res = $job.Pipe.EndInvoke($job.Result)
-                    if ($res) {
-                        $div = $res.Department
-                        if (-not $DivisionCount.ContainsKey($div)) {
-                            $DivisionCount[$div] = 0
-                        }
-                        
-                        $DivisionCount[$div] += $res.TotalGB
-                        
-                        # ВЫВОД КАЖДОЙ ПАПКИ В КОНСОЛЬ
-                        Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
-                    }
-                } catch {
-                    Write-Host "[$completed / $totalJobs] Ошибка потока: $($_.Exception.Message)" -ForegroundColor Red
-                }
-            }
-        }
-        Start-Sleep -Milliseconds 200
-    }
-
-    # Добираем то, что могло успеть выполниться в последнюю секунду
-    foreach ($job in $Jobs) {
-        if (-not $job.Checked) {
-            $job.Checked = $true
+        # Если путь существует — берем дату изменения папки и проверяем ACL
+        if ($workingPath -ne "") {
             try {
-                $res = $job.Pipe.EndInvoke($job.Result)
-                if ($res) {
-                    $div = $res.Department
-                    if (-not $DivisionCount.ContainsKey($div)) { $DivisionCount[$div] = 0 }
-                    $DivisionCount[$div] += $res.TotalGB
-                    $completed++
-                    Write-Host "[$completed / $totalJobs] Готово: $($res.Path) -> $($res.TotalGB) GB ($div)" -ForegroundColor Green
+                $dirInfo = Get-Item -LiteralPath $workingPath -Force -ErrorAction Stop
+                
+                # Дата изменения самой папки
+                $folderDate = $dirInfo.LastWriteTime.ToString("dd.MM.yyyy HH:mm:ss")
+
+                # Проверяем назначение группы в ACL
+                $acl = $dirInfo.GetAccessControl('Access')
+                
+                $altGroupName = $null
+                if ($groupName -match "(?i) - изменение$") {
+                    $altGroupName = $groupName -ireplace "(?i) - изменение$", " - write"
+                } elseif ($groupName -match "(?i) - чтение$") {
+                    $altGroupName = $groupName -ireplace "(?i) - чтение$", " - read"
                 }
-            } catch { }
-        }
-        $job.Pipe.Dispose()
-    }
-    
-    $RunspacePool.Close()
-    $RunspacePool.Dispose()
 
-    # Считаем общий размер по всем блокам
-    $TotalEnterpriseGB = ($DivisionCount.Values | Measure-Object -Sum).Sum
+                $escapedGroup = [regex]::Escape($groupName)
+                
+                $hasGroup = $acl.Access | Where-Object { 
+                    $ruleName = $_.IdentityReference.Value
+                    ($ruleName -match "\\$escapedGroup$") -or ($null -ne $altGroupName -and $ruleName -match "\\$([regex]::Escape($altGroupName))$")
+                }
 
-    # ==============================================================================
-    # ФОРМИРОВАНИЕ JSON ДЛЯ ZABBIX
-    # ==============================================================================
-    Write-Host "`nГенерация JSON-файла для Zabbix..." -ForegroundColor Cyan
-
-    $discovery = foreach ($k in $DivisionCount.Keys) {
-        @{ '{#DIVISION}' = $k }
-    }
-
-    $payload = [ordered]@{
-        discovery = @($discovery)
-        counts    = $DivisionCount
-        metadata  = @{
-            TotalFoldersScanned = $UniquePaths.Count
-            UniqueDivisions     = $DivisionCount.Count
-            TotalEnterpriseGB   = $TotalEnterpriseGB
-            GeneratedAt         = $time
-            ScriptDurationSec   = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
+                if ($hasGroup) {
+                    $status = if ($hasHiddenChar) { "Путь существует необходимо убрать символ в начале" } else { "Существует" }
+                } else {
+                    $status = if ($hasHiddenChar) { "Путь существует (надо убрать символ), но группа не соответствует пути" } else { "Путь существует но группа не соответствует пути" }
+                }
+            } 
+            catch {
+                $status = if ($hasHiddenChar) { "Путь существует (надо убрать символ), но нет доступа для проверки прав" } else { "Путь существует, но нет доступа для проверки прав" }
+            }
+            
+            $folderPath = $workingPath
         }
     }
 
-    $json = $payload | ConvertTo-Json -Depth 4
+    Write-Host "[$counter / $total] $groupName | $folderDate" -ForegroundColor Gray
 
-    [System.IO.File]::WriteAllText(
-        $OutputPath,
-        $json,
-        [System.Text.UTF8Encoding]::new($false) 
-    )
-
-    # ==============================================================================
-    # ФИНАЛЬНЫЙ ВЫВОД И ЛОГИРОВАНИЕ
-    # ==============================================================================
-    Write-Log ""
-    Write-Log "СТАТУС: $ScriptStatus"
-    Write-Log "Подсчёт объемов по блокам бизнеса завершен."
-    Write-Log "Всего уникальных подразделений: $($DivisionCount.Count)"
-
-    Write-Host "`n=== ИТОГОВЫЙ ПОДСЧЕТ ПО БЛОКАМ (GB) ===" -ForegroundColor Green
-    Write-Host "Всего подразделений: $($DivisionCount.Count)`n"
-
-    $DivisionCount.GetEnumerator() |
-        Sort-Object Value -Descending |
-        ForEach-Object {
-            $percent = 0
-            if ($TotalEnterpriseGB -gt 0) { $percent = $_.Value / $TotalEnterpriseGB }
-            $percentStr = "{0:P2}" -f $percent
-            Write-Log ("{0,-60} {1,10} GB {2,8}" -f $_.Key, $_.Value, $percentStr)
-        }
-
-    $DivisionCount.GetEnumerator() |
-        Sort-Object Value -Descending |
-        Format-Table @{Label="Подразделение"; Expression={$_.Key}; Width=50},
-                     @{Label="Размер (GB)"; Expression={$_.Value}; Width=15},
-                     @{Label="% от общего"; Expression={
-                        if ($TotalEnterpriseGB -gt 0) { "{0:P2}" -f ($_.Value / $TotalEnterpriseGB) } else { "0.00 %" }
-                     }; Width=15} -AutoSize
-
-    Write-Host "Общий объем данных: $($TotalEnterpriseGB) GB" -ForegroundColor Yellow
-    Write-Log "Общий объем данных: $($TotalEnterpriseGB) GB"
-
-    $timestop = Get-Date
-    $TimeSum = $timestop - $timestart
-
-    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
-    Write-Host "JSON для Zabbix сохранён в: $OutputPath" -ForegroundColor Green
-
-    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
-    Write-Log "--- ЗАВЕРШЕНИЕ ---"
+    $ResultData += [PSCustomObject]@{
+        GroupName    = $groupName
+        Path         = $folderPath
+        Status       = $status
+        FolderDate   = $folderDate
+        ObjectPath   = $objectPath
+    }
 }
-catch {
-    $ScriptStatus = "ERROR"
-    Write-Log ""
-    Write-Log "СТАТУС: ERROR"
-    Write-Log "Ошибка:"
-    Write-Log $_.Exception.Message
-    Write-Log "Полная информация:"
-    Write-Log $_
-    
-    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
-    
-    throw
+
+# ==============================================================================
+# ЗАПИСЬ В EXCEL
+# ==============================================================================
+if ($groups.Count -gt 0) {
+    Write-Host "`nЗапись данных в Excel..." -ForegroundColor Cyan
+
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
+
+    try {
+        $workbook = $excel.Workbooks.Add()
+        $worksheet = $workbook.Sheets.Item(1)
+
+        $worksheet.Cells.Item(1, 1).Value2 = "Имя группы"
+        $worksheet.Cells.Item(1, 2).Value2 = "Путь (из Notes)"
+        $worksheet.Cells.Item(1, 3).Value2 = "Статус пути"
+        $worksheet.Cells.Item(1, 4).Value2 = "Последнее изменение папки"
+        $worksheet.Cells.Item(1, 5).Value2 = "Путь из Object"
+
+        $worksheet.Rows.Item(1).Font.Bold = $true
+
+        $row = 2
+        foreach ($item in $ResultData) {
+            $worksheet.Cells.Item($row, 1).Value2 = $item.GroupName
+            $worksheet.Cells.Item($row, 2).Value2 = $item.Path
+            $worksheet.Cells.Item($row, 3).Value2 = $item.Status
+            $worksheet.Cells.Item($row, 4).Value2 = $item.FolderDate
+            $worksheet.Cells.Item($row, 5).Value2 = $item.ObjectPath
+            $row++
+        }
+
+        [void]$worksheet.Columns.AutoFit()
+
+        if (Test-Path $OutputFile) { Remove-Item $OutputFile -Force }
+        $workbook.SaveAs($OutputFile)
+        Write-Host "Файл успешно сохранен: $OutputFile" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "[!] Произошла ошибка при работе с Excel: $_" -ForegroundColor Red
+    }
+    finally {
+        if ($null -ne $workbook) { $workbook.Close($false) }
+        $excel.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
+
+    Invoke-Item $OutputFile
+} else {
+    Write-Host "Не найдено ни одной группы в указанной OU. Проверь путь SearchBase." -ForegroundColor Yellow
 }
