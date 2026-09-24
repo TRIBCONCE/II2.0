@@ -1,46 +1,242 @@
-Write-Host "Чтение файла $ExcelPath..." -ForegroundColor Cyan
-    $wb = $excel.Workbooks.Open($ExcelPath)
-    $ws = $wb.Worksheets.Item(1)
+cls
+Import-Module ActiveDirectory
+Import-Module GroupPolicy
+
+$timestart = Get-Date
+$today = Get-Date -Format dd.MM.yyyy
+$time = Get-Date -Format "dd.MM.yyyy HH:mm"
+
+# ==============================================================================
+# НАСТРОЙКИ
+# ==============================================================================
+$GpoName     = "Users Net Use N Personal Disk New" 
+$LogPath     = "C:\Users\z-BorodinES\Desktop\ZabbixZadacha\Zabbix_DiskN_LOG.txt"
+$OutputPath  = "\\p-rpait-syn01\c$\Program Files\Zabbix Agent\scripts\AD\ZabbixDiskN.txt"
+$MaxThreads  = 8
+
+$ScriptStatus = "SUCCESS"
+
+function Write-Log {
+    param([string]$Message)
+    $TimeStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    Add-Content -Path $LogPath -Value "[$TimeStamp] $Message" -Encoding UTF8
+}
+
+try {
+    Write-Log "--- ЗАПУСК СКРИПТА СБОРА РАЗМЕРОВ ДИСКОВ N ДЛЯ ZABBIX ---"
     
-    # 1. ПРАВИЛЬНЫЙ ПОИСК ПОСЛЕДНЕЙ СТРОКИ (эмуляция Ctrl + Вверх из самого низа)
-    # -4162 это системный код xlUp в Excel
-    $lastRow = $ws.Cells.Item($ws.Rows.Count, 1).End(-4162).Row 
+    # ==============================================================================
+    # ШАГ 1: ПОЛУЧЕНИЕ АКТИВНЫХ СЕРВЕРОВ ИЗ GPO
+    # ==============================================================================
+    Write-Host "Получение списка активных серверов из политики [$GpoName]..." -ForegroundColor Cyan
+    Write-Log "Чтение GPO: $GpoName"
 
-    Write-Host "Реальных строк с данными: $lastRow" -ForegroundColor Yellow
-    Write-Host "Начинаем обновление атрибута Department в Active Directory..." -ForegroundColor Yellow
+    try {
+        $xmlReport = Get-GPOReport -Name $GpoName -ReportType Xml
+    } catch {
+        Write-Host "ОШИБКА: Политика '$GpoName' не найдена или нет прав на чтение!" -ForegroundColor Red
+        throw $_
+    }
 
-    for ($i = 2; $i -le $lastRow; $i++) {
-        $groupName     = $ws.Cells.Item($i, 1).Text
-        $businessBlock = $ws.Cells.Item($i, 2).Text
+    $ActiveServers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-        # 2. ЖЕСТКАЯ ОСТАНОВКА ПРИ ПУСТОЙ СТРОКЕ
-        if ([string]::IsNullOrWhiteSpace($groupName)) { 
-            Write-Host "Встречена пустая строка на позиции $i. Завершаем обход." -ForegroundColor Cyan
-            break 
-        }
+    $matches = [regex]::Matches($xmlReport, '(?i)path="(\\\\[^"\\]+\\[^"\\]+)')
+    foreach ($m in $matches) {
+        [void]$ActiveServers.Add($m.Groups[1].Value.TrimEnd('\'))
+    }
 
-        $cleanGroup = $groupName.Trim()
-        $cleanBlock = $businessBlock.Trim()
+    if ($ActiveServers.Count -eq 0) {
+        Write-Host "В политике $GpoName не найдено ни одного сетевого пути!" -ForegroundColor Red
+        throw "Список серверов пуст."
+    }
 
-        try {
-            # Ищем группу в AD
-            $adGroup = Get-ADGroup -Filter {Name -eq $cleanGroup} -ErrorAction Stop
+    Write-Host "`n=== Активные серверы из политики ===" -ForegroundColor Green
+    foreach ($srv in$ActiveServers) {
+        Write-Host " -> $srv" -ForegroundColor White
+        Write-Log "Активный сервер GPO: $srv"
+    }
+    Write-Host "====================================`n" -ForegroundColor Green
 
-            if ($null -ne $adGroup) {
-                if (-not [string]::IsNullOrWhiteSpace($cleanBlock)) {
-                    Set-ADGroup -Identity $adGroup -Replace @{department=$cleanBlock} -ErrorAction Stop
-                    Write-Host "[$i / $lastRow] УСПЕХ: Группе '$cleanGroup' записан департамент '$cleanBlock'" -ForegroundColor Green
-                } 
-                else {
-                    Set-ADGroup -Identity $adGroup -Clear department -ErrorAction Stop
-                    Write-Host "[$i / $lastRow] ОЧИЩЕНО: У группы '$cleanGroup' удален атрибут department" -ForegroundColor DarkYellow
+    # ==============================================================================
+    # ШАГ 2: ПОЛУЧЕНИЕ И ФИЛЬТРАЦИЯ ПОЛЬЗОВАТЕЛЕЙ AD
+    # ==============================================================================
+    Write-Host "Авторизация и получение ВСЕХ пользователей из Active Directory..." -ForegroundColor Cyan
+
+    $key_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\aes.key"
+    $ab_pwd_path = "\\p-rpait-syn01\c$\Scripts\cyph_keys\pwd_abw.txt"
+
+    $ab_password = Get-Content $ab_pwd_path | ConvertTo-SecureString -Key (Get-Content $key_path)
+    $ab_creds = New-Object System.Management.Automation.PSCredential("ABB-WIN\s-ad-expertise", $ab_password)
+
+    $AllUsersOn = Get-ADUser -Filter * -Credential $ab_creds -Properties division, HomeDirectory
+    
+    $UniquePaths = @{}
+
+    foreach ($User in $AllUsersOn) {
+        $personalPath = $User.HomeDirectory
+        if (-not [string]::IsNullOrWhiteSpace($personalPath)) {
+            $basePath = ""
+            if ($personalPath -match '^(\\\\[^\\]+\\[^\\]+)') {
+                $basePath = $matches[1]
+            }
+
+            if ($ActiveServers.Contains($basePath)) {
+                $normPath = $personalPath.TrimEnd('\')
+                $div = if ($User.division) { $User.division.Trim() } else { "(не указано)" }
+                
+                if (-not $UniquePaths.ContainsKey($normPath)) {
+                    $UniquePaths[$normPath] = $div
                 }
-            } 
-            else {
-                Write-Host "[$i / $lastRow] НЕ НАЙДЕНО: Группа '$cleanGroup' не существует в AD" -ForegroundColor Red
             }
         }
-        catch {
-            Write-Host "[$i / $lastRow] ОШИБКА AD: Не удалось обработать '$cleanGroup' ($($_.Exception.Message))" -ForegroundColor Red
+    }
+
+    Write-Host "Отобрано личных дисков на активных серверах: $($UniquePaths.Count)" -ForegroundColor Cyan
+    Write-Log "Целевых путей для сканирования: $($UniquePaths.Count)"
+
+    # ==============================================================================
+    # ШАГ 3: МНОГОПОТОЧНЫЙ ПОДСЧЕТ ЧЕРЕЗ ROBOCOPY
+    # ==============================================================================
+    $DivisionCount = @{}
+
+    if ($UniquePaths.Count -gt 0) {
+        Write-Host "`nЗапуск многопоточного сканирования ($MaxThreads потоков)..." -ForegroundColor Yellow
+        
+        $RunspacePool = [runspacefactory]::CreateRunspacePool(1,$MaxThreads)
+        $RunspacePool.Open()$Jobs = @()
+
+        $ScriptBlock = {
+            param($Path,$Division)
+
+            if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+                return [PSCustomObject]@{ Division = $Division; Path =$Path; TotalGB = 0 }
+            }
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "robocopy.exe"
+            $psi.Arguments = "`"$Path`" NUL /L /E /XJ /BYTES /NFL /NDL /NJH /R:0 /W:0 /NP"
+            $psi.UseShellExecute = $false$psi.CreateNoWindow = $true$psi.RedirectStandardOutput = $true$psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(866)
+
+            $process = [System.Diagnostics.Process]::Start($psi)$stdout = $process.StandardOutput.ReadToEnd()$process.WaitForExit(180000) | Out-Null
+            if (-not $process.HasExited) { $process.Kill() }$process.Dispose()
+
+            [long]$TotalBytes = 0
+            foreach ($line in ($stdout -split "`r?`n")) {
+                if ($line -match '^\s*Bytes\s*:\s*(\d+)') {
+                    $TotalBytes = [long]$matches[1]
+                    break
+                }
+            }
+
+            return [PSCustomObject]@{
+                Division   = $Division
+                Path       = $Path
+                TotalGB    = [math]::Round($TotalBytes / 1GB, 2)
+            }
+        }
+
+        foreach ($entry in $UniquePaths.GetEnumerator()) {$PowerShell = [powershell]::Create()
+            $PowerShell.RunspacePool =$RunspacePool
+            [void]$PowerShell.AddScript($ScriptBlock)
+            [void]$PowerShell.AddArgument($entry.Key)
+            [void]$PowerShell.AddArgument($entry.Value)$Jobs += [PSCustomObject]@{
+                Pipe    = $PowerShell
+                Result  = $PowerShell.BeginInvoke()
+                Checked = $false
+            }
+        }
+
+        $completed = 0
+        $totalJobs =$Jobs.Count
+
+        while ($Jobs.Result.IsCompleted -contains$false) {
+            foreach ($job in$Jobs) {
+                if ($job.Result.IsCompleted -and -not $job.Checked) {$job.Checked = $true$completed++
+                    
+                    try {
+                        $res = $job.Pipe.EndInvoke($job.Result)
+                        if ($res) {
+                            $div =$res.Division
+                            if (-not $DivisionCount.ContainsKey($div)) {$DivisionCount[$div] = 0 }$DivisionCount[$div] +=$res.TotalGB
+                            
+                            Write-Host "[$completed / $totalJobs] Готово: $($res.Path) ->$($res.TotalGB) GB ($div)" -ForegroundColor Green
+                        }
+                    } catch { }
+                }
+            }
+            Start-Sleep -Milliseconds 150
+        }
+
+        foreach ($job in$Jobs) {
+            if (-not $job.Checked) {
+                $job.Checked =$true
+                try {
+                    $res = $job.Pipe.EndInvoke($job.Result)
+                    if ($res) {
+                        $div =$res.Division
+                        if (-not $DivisionCount.ContainsKey($div)) {$DivisionCount[$div] = 0 }$DivisionCount[$div] +=$res.TotalGB
+                    }
+                } catch { }
+            }
+            $job.Pipe.Dispose()
+        }
+        $RunspacePool.Close()$RunspacePool.Dispose()
+    }
+
+    $TotalEnterpriseGB = ($DivisionCount.Values | Measure-Object -Sum).Sum
+
+    # ==============================================================================
+    # ШАГ 4: ФОРМИРОВАНИЕ JSON ДЛЯ ZABBIX
+    # ==============================================================================
+    Write-Host "`nГенерация JSON-файла для Zabbix..." -ForegroundColor Cyan
+
+    $discovery = foreach ($k in $DivisionCount.Keys) {
+        @{ '{#DIVISION}' = $k }
+    }
+
+    $payload = [ordered]@{
+        discovery = @($discovery)
+        counts    = $DivisionCount
+        metadata  = @{
+            TotalPersonalDisksScanned = $UniquePaths.Count
+            UniqueDivisions           = $DivisionCount.Count
+            TotalEnterpriseGB         = $TotalEnterpriseGB
+            ActiveServersCount        = $ActiveServers.Count
+            GeneratedAt               = $time
+            ScriptDurationSec         = [math]::Round(((Get-Date) - $timestart).TotalSeconds, 2)
         }
     }
+
+    $json = $payload | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($OutputPath, $json, [System.Text.UTF8Encoding]::new($false))
+
+    # ==============================================================================
+    # ФИНАЛЬНЫЙ ВЫВОД И ЛОГИРОВАНИЕ
+    # ==============================================================================
+    Write-Log ""
+    Write-Log "СТАТУС: $ScriptStatus"
+    Write-Log "Подсчёт объемов Диска N по подразделениям (division) завершен."
+
+    Write-Host "`n=== ИТОГОВЫЙ ПОДСЧЕТ ПО ПОДРАЗДЕЛЕНИЯМ (GB) ===" -ForegroundColor Green
+    
+    $DivisionCount.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Format-Table @{Label="Подразделение (division)"; Expression={$_.Key}; Width=50},
+                     @{Label="Размер (GB)"; Expression={$_.Value}; Width=15},
+                     @{Label="% от общего"; Expression={
+                        if ($TotalEnterpriseGB -gt 0) { "{0:P2}" -f ($_.Value / $TotalEnterpriseGB) } else { "0.00 %" }
+                     }; Width=15} -AutoSize
+
+    Write-Host "Общий объем данных Диска N: $($TotalEnterpriseGB) GB" -ForegroundColor Yellow
+    
+    $timestop = Get-Date$TimeSum = $timestop -$timestart
+    Write-Host "`nВремя выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с" -ForegroundColor Cyan
+    Write-Log "Время выполнения: $($TimeSum.Hours)ч $($TimeSum.Minutes)м $($TimeSum.Seconds)с"
+    Write-Log "--- ЗАВЕРШЕНИЕ ---"
+}
+catch {
+    $ScriptStatus = "ERROR"
+    Write-Log "СТАТУС: ERROR. Ошибка: $($_.Exception.Message)"
+    Write-Host "`nОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+    throw
+}
