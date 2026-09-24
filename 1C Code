@@ -1,139 +1,82 @@
+[523 / 1046697] УСПЕХ: Группе 'FSDPT Служба внутреннего контроля' записан департамент 'Служба внутреннего контроля'
+[524 / 1046697] УСПЕХ: Группе 'FSDPT СОТ' записан департамент 'Административно-хозяйственный блок'
+[525 / 1046697] УСПЕХ: Группе 'FSDPT УИТДО' записан департамент 'Информационно-технологический блок'
+[526 / 1046697] УСПЕХ: Группе 'FSDPT УППА' записан департамент 'Блок стратегического управления'
+[527 / 1046697] УСПЕХ: Группе 'FSDPT УПС' записан департамент 'Блок стратегического управления'
+[528 / 1046697] УСПЕХ: Группе 'FSDPT УРПАЮЛ' записан департамент 'Проблемные активы'
+[529 / 1046697] УСПЕХ: Группе 'FSDPT УРПЗФЛ' записан департамент 'Блок риски'
+[530 / 1046697] УСПЕХ: Группе 'FSDPT УРР' записан департамент 'Розничный бизнес'
+[531 / 1046697] УСПЕХ: Группе 'Все филиалы - Аудиторы' записан департамент 'Розничный бизнес'
+[532 / 1046697] УСПЕХ: Группе 'FSDPT Финансовый департамент' записан департамент 'Финансовый блок'
+[533 / 1046697] УСПЕХ: Группе 'FSDPT Центр Инноваций' записан департамент 'Блок стратегического управления'
+
+и длальше код виснит во мервым почему так много 1046697 у меня в файле так раз 533 группы
+
 cls
+Import-Module ActiveDirectory
 
-# Путь к твоему сформированному файлу Excel
-$ExcelFilePath = "C:\Users\z-BorodinES\Desktop\Задача Диск RN\Нахождение корневых групп безопасности\Копия Отчёт_по_группам_AD3 - Copy.xlsx"
+# ==============================================================================
+# НАСТРОЙКИ
+# ==============================================================================
+$ExcelPath = "C:\Users\z-BorodinES\Desktop\Задача Диск RN\Добавление атрибута department\Группы для добавления.xlsx" # Укажи свой путь к файлу
 
-Write-Host "1. Открытие файла Excel и чтение данных..." -ForegroundColor Cyan
-
+Write-Host "Запуск Excel..." -ForegroundColor Cyan
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
 
 try {
-    $wb = $excel.Workbooks.Open($ExcelFilePath)
+    Write-Host "Чтение файла $ExcelPath..." -ForegroundColor Cyan
+    $wb = $excel.Workbooks.Open($ExcelPath)
     $ws = $wb.Worksheets.Item(1)
+    $lastRow = $ws.Cells.SpecialCells(11).Row 
 
-    $lastRow = $ws.Cells.SpecialCells(11).Row # 11 = xlCellTypeLastCell
+    Write-Host "Начинаем обновление атрибута Department в Active Directory..." -ForegroundColor Yellow
 
-    $Data = @()
-    
-    # Читаем данные из Excel (со 2-й строки)
     for ($i = 2; $i -le $lastRow; $i++) {
-        $groupName = $ws.Cells.Item($i, 1).Value2
-        $block     = $ws.Cells.Item($i, 2).Value2
-        $rawPath   = $ws.Cells.Item($i, 3).Value2
-        $status    = $ws.Cells.Item($i, 4).Value2
+        $groupName     = $ws.Cells.Item($i, 1).Text
+        $businessBlock = $ws.Cells.Item($i, 2).Text
 
-        # Нас интересуют только существующие пути, у которых есть блок бизнеса
-        if ($status -match "Существует" -and -not [string]::IsNullOrWhiteSpace($rawPath)) {
-            
-            # Нормализуем путь: убираем слэши на конце, приводим к нижнему регистру для сравнения
-            $normPath = $rawPath.Trim().TrimEnd('\').ToLower()
-            $block    = if ($block) { $block.Trim() } else { "" }
+        if ([string]::IsNullOrWhiteSpace($groupName)) { continue }
 
-            $Data += [PSCustomObject]@{
-                RowIndex = $i
-                RawPath  = $rawPath
-                NormPath = $normPath
-                Block    = $block
-                IsRoot   = $false
-            }
-        }
-    }
+        $cleanGroup = $groupName.Trim()
+        $cleanBlock = $businessBlock.Trim()
 
-    Write-Host "Считано валидных строк для анализа: $($Data.Count)" -ForegroundColor Yellow
+        try {
+            # Ищем группу в AD (Filter {...} безопаснее обрабатывает спецсимволы в именах)
+            $adGroup = Get-ADGroup -Filter {Name -eq $cleanGroup} -ErrorAction Stop
 
-    # ==============================================================================
-    # АЛГОРИТМ ПОИСКА КОРНЕЙ (ИСКЛЮЧАЕМ СМЕШАННЫЕ ДЕРЕВЬЯ И ВЛОЖЕННОСТИ)
-    # ==============================================================================
-    Write-Host "2. Вычисление математических корней (учет смешанных деревьев)..." -ForegroundColor Cyan
-    
-    # Шаг 1: Находим "дисквалифицированные" пути.
-    # Если путь A является родителем пути B, но их Блоки Бизнеса РАЗНЫЕ -> путь A испорчен.
-    $TaintedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-
-    foreach ($parent in $Data) {
-        foreach ($child in $Data) {
-            # Проверяем, является ли child вложенной папкой parent (добавляем слэш, чтобы AppDS не совпало с AppDS_test)
-            if ($child.NormPath.StartsWith($parent.NormPath + "\") -and $child.NormPath.Length -gt $parent.NormPath.Length) {
-                if ($parent.Block -ne $child.Block) {
-                    [void]$TaintedPaths.Add($parent.NormPath)
-                    break # Родитель испорчен, дальше его детей проверять нет смысла
+            if ($null -ne $adGroup) {
+                if (-not [string]::IsNullOrWhiteSpace($cleanBlock)) {
+                    # Записываем значение в атрибут department
+                    Set-ADGroup -Identity $adGroup -Replace @{department=$cleanBlock} -ErrorAction Stop
+                    Write-Host "[$i / $lastRow] УСПЕХ: Группе '$cleanGroup' записан департамент '$cleanBlock'" -ForegroundColor Green
+                } 
+                else {
+                    # Если ячейка пустая, очищаем атрибут
+                    Set-ADGroup -Identity $adGroup -Clear department -ErrorAction Stop
+                    Write-Host "[$i / $lastRow] ОЧИЩЕНО: У группы '$cleanGroup' удален атрибут department (пустая ячейка)" -ForegroundColor DarkYellow
                 }
+            } 
+            else {
+                Write-Host "[$i / $lastRow] НЕ НАЙДЕНО: Группа '$cleanGroup' не существует в AD" -ForegroundColor Red
             }
         }
-    }
-
-    Write-Host "Найдено 'смешанных' родителей (дисквалифицированы): $($TaintedPaths.Count)" -ForegroundColor Magenta
-
-    # Шаг 2: Сортируем пути по длине от коротких к длинным.
-    # Это гарантирует, что мы сначала оцениваем родителей, а потом детей.
-    $SortedData = $Data | Sort-Object { $_.NormPath.Length }
-    
-    $ValidRoots = [System.Collections.Generic.List[string]]::new()
-    $RowsToColor = [System.Collections.Generic.List[int]]::new()
-
-    foreach ($item in $SortedData) {
-        
-        # Правило 1: Если путь дисквалифицирован (смешанный), он НЕ корень. Его дети будут корнями.
-        if ($TaintedPaths.Contains($item.NormPath)) {
-            continue
+        catch {
+            Write-Host "[$i / $lastRow] ОШИБКА AD: Не удалось обработать '$cleanGroup' ($($_.Exception.Message))" -ForegroundColor Red
         }
-
-        # Правило 2: Если такой точный путь уже признан корнем (дубликат путей), пропускаем.
-        $isDuplicate = $false
-        foreach ($root in $ValidRoots) {
-            if ($item.NormPath -eq $root) {
-                $isDuplicate = $true
-                break
-            }
-        }
-        if ($isDuplicate) { continue }
-
-        # Правило 3: Если этот путь является ребенком УЖЕ СУЩЕСТВУЮЩЕГО чистого корня, пропускаем.
-        $isChildOfRoot = $false
-        foreach ($root in $ValidRoots) {
-            if ($item.NormPath.StartsWith($root + "\")) {
-                $isChildOfRoot = $true
-                break
-            }
-        }
-        if ($isChildOfRoot) { continue }
-
-        # Если путь прошел все проверки — он объявляется независимым КОРНЕМ!
-        $ValidRoots.Add($item.NormPath)
-        $RowsToColor.Add($item.RowIndex)
     }
-
-    Write-Host "Вычислено итоговых корней для окрашивания: $($RowsToColor.Count)" -ForegroundColor Green
-
-    # ==============================================================================
-    # ПРИМЕНЕНИЕ ЦВЕТА В EXCEL
-    # ==============================================================================
-    Write-Host "3. Окрашивание строк в серый цвет..." -ForegroundColor Cyan
-
-    # Очищаем заливку со всех строк (на случай, если скрипт запускают повторно)
-    $ws.Range("A2:E$lastRow").Interior.ColorIndex = 0 # Убираем цвет (0 = No fill)
-
-    # Красим только целевые строки в светло-серый (RGB: 217, 217, 217)
-    # Формула цвета: B * 65536 + G * 256 + R -> 217 * 65536 + 217 * 256 + 217 = 14277081
-    $GrayColor = 14277081
-
-    foreach ($rowIndex in $RowsToColor) {
-        $ws.Range("A${rowIndex}:E${rowIndex}").Interior.Color = $GrayColor
-    }
-
-    $wb.Save()
-    Write-Host "`nВСЁ ГОТОВО! Файл сохранен." -ForegroundColor Green
-
 }
 catch {
-    Write-Host "[!] Ошибка: $_" -ForegroundColor Red
+    Write-Error "Произошла глобальная ошибка: $_"
 }
 finally {
     if ($null -ne $wb) { $wb.Close($false) }
-    $excel.Quit()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
-} Смотри зачем мы в начале прям открываем файл пусть без открытия обрабатываем и окрашиваем строки
+    if ($null -ne $excel) {
+        $excel.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
+    Write-Host "Работа скрипта завершена." -ForegroundColor Cyan
+}
